@@ -40,9 +40,10 @@ export function storeInKeychain(password: string): boolean {
       // Doesn't exist yet, fine
     }
 
+    // Use -w - to read password from stdin (avoids exposing in `ps` output)
     execSync(
-      `security add-generic-password -s "${SERVICE_NAME}" -a "${ACCOUNT_NAME}" -w "${password.replace(/"/g, '\\"')}" -T "" -j "Vaultly master password"`,
-      { stdio: "ignore" }
+      `security add-generic-password -s "${SERVICE_NAME}" -a "${ACCOUNT_NAME}" -w - -T "" -j "Vaultly master password"`,
+      { input: password, stdio: ["pipe", "ignore", "ignore"] }
     );
     return true;
   } catch {

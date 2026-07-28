@@ -57,9 +57,9 @@ export function scrubOutput(output: string, secretValues: string[]): string {
     if (value.length > 20) {
       const prefix = escapeRegex(value.slice(0, 8));
       const suffix = escapeRegex(value.slice(-8));
-      // Match prefix...suffix with anything in between
+      // Match prefix...suffix with limited gap (non-greedy, bounded)
       scrubbed = scrubbed.replace(
-        new RegExp(`${prefix}[\\S]{0,200}${suffix}`, "g"),
+        new RegExp(`${prefix}.{0,200}?${suffix}`, "g"),
         REDACTED
       );
     }

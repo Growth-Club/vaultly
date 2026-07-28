@@ -80,7 +80,7 @@ export async function startMcpServer(): Promise<void> {
   console.error("✓ Vaultly MCP server ready\n");
 
   // ─── MCP Server ────────────────────────────────────────
-  const server = new McpServer({ name: "vaultly", version: "2.0.0" });
+  const server = new McpServer({ name: "vaultly", version: "1.0.0" });
 
   // Helper: wrap engine errors into MCP responses
   function ok(text: string) {

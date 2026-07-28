@@ -36,8 +36,13 @@ function vaultPath(name: string): string {
 }
 
 function audit(action: string, detail: string): void {
-  const line = `${new Date().toISOString()} | ${action} | ${detail}\n`;
-  fs.appendFileSync(AUDIT_LOG, line, { mode: 0o600 });
+  const entry = JSON.stringify({
+    ts: new Date().toISOString(),
+    action,
+    detail,
+    caller: "cli",
+  });
+  fs.appendFileSync(AUDIT_LOG, entry + "\n", { mode: 0o600 });
 }
 
 // ─── Config ────────────────────────────────────────────────
@@ -58,7 +63,7 @@ function saveConfig(config: VaultConfig): void {
 
 export function initVault(password: string): void {
   if (isInitialized()) {
-    throw new Error("Vaultly is already initialized. Use 'vaultly reset' to start over.");
+    throw new Error("Vaultly is already initialized. Delete ~/.vaultly to start over.");
   }
 
   ensureDirs();

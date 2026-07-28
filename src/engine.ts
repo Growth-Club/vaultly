@@ -7,7 +7,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, execSync } from "node:child_process";
 import * as vault from "./vault.js";
 import * as crypto from "./crypto.js";
 import { scrubOutput } from "./scrubber.js";
@@ -81,7 +81,6 @@ export class VaultEngine {
     this.lock();
     // Remove keychain entry if exists
     try {
-      const { execSync } = require("node:child_process");
       execSync(
         'security delete-generic-password -s "vaultly-master-key" 2>/dev/null || true',
         { stdio: "ignore" }

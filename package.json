@@ -1,1 +1,28 @@
-{"name":"vaultly","version":"1.0.0","description":"Personal encrypted credential vault with Cloudflare remote backup","type":"module","bin":{"vaultly":"./dist/index.js"},"scripts":{"build":"tsc","dev":"tsx src/index.ts","start":"node dist/index.js","link":"npm run build && npm link"},"dependencies":{"@modelcontextprotocol/sdk":"^1.30.0","chalk":"^5.3.0","commander":"^12.1.0"},"devDependencies":{"@types/node":"^22.0.0","tsx":"^4.19.0","typescript":"^5.6.0"}}
+{
+  "name": "vaultly",
+  "version": "1.0.0",
+  "description": "Agent-first encrypted credential manager with Cloudflare integration",
+  "type": "module",
+  "bin": {
+    "vaultly": "./dist/index.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "link": "npm run build && npm link"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "chalk": "^5.3.0",
+    "commander": "^12.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

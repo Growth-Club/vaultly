@@ -21,7 +21,7 @@ interface Env {
   BACKUP_TOKEN: string;
 }
 
-const BACKUP_KEY = "vaultly-backup-v1";
+const BACKUP_KEY = "vaultly-backup";
 const MAX_SIZE = 5 * 1024 * 1024; // 5MB limit
 
 export default {
