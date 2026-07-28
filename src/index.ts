@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Vaultly CLI — Personal encrypted credential vault with Cloudflare backup.
+ * Vaultly CLI — Agent-first encrypted credential manager with Cloudflare integration.
  *
  * Usage:
  *   vaultly init                         Create master password
@@ -9,10 +9,13 @@
  *   vaultly list [vault]                 List vaults or keys
  *   vaultly delete <vault> [key]         Delete a secret or vault
  *   vaultly env <vault>                  Output shell export statements
+ *   vaultly run <vault> -- <cmd>         Run with injected env (scrubbed)
+ *   vaultly cf add|list|use|deploy       Manage Cloudflare accounts
+ *   vaultly template [name]              Create vault from template
  *   vaultly import <file> [--vault name] Import from plaintext file
- *   vaultly backup                       Push encrypted vaults to Cloudflare
- *   vaultly restore                      Pull encrypted vaults from Cloudflare
+ *   vaultly backup / restore             Encrypted remote backup
  *   vaultly protect                      Add AI-tool ignore rules
+ *   vaultly mcp                          Start MCP server for agents
  */
 import { Command } from "commander";
 import chalk from "chalk";
@@ -46,7 +49,7 @@ const program = new Command();
 
 program
   .name("vaultly")
-  .description("🔐 Personal encrypted credential vault with Cloudflare backup")
+  .description("🔐 Agent-first encrypted credential manager with Cloudflare integration")
   .version("1.0.0");
 
 // ─── Helper: unlock with password prompt ───────────────────
@@ -416,27 +419,20 @@ program
     ];
 
     // Files to append ignore rules to
-    const targets: { file: string; format: "lines" | "json-array" }[] = [
-      { file: ".gitignore", format: "lines" },
-      { file: ".claude/settings.json", format: "json-array" },
-      { file: ".windsurfrules", format: "lines" },
-    ];
+    const targets: string[] = [".gitignore", ".windsurfrules"];
 
-    for (const target of targets) {
-      const filePath = path.join(dir, target.file);
-
-      if (target.format === "lines") {
-        let content = fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8") : "";
-        if (content.includes("Vaultly secrets protection")) {
-          console.log(chalk.dim(`  ⏭ ${target.file} (already protected)`));
-          continue;
-        }
-        content += "\n" + ignorePatterns.join("\n") + "\n";
-        fs.mkdirSync(path.dirname(filePath), { recursive: true });
-        fs.writeFileSync(filePath, content);
-        console.log(chalk.green(`  ✓ ${target.file} updated`));
-        updated++;
+    for (const file of targets) {
+      const filePath = path.join(dir, file);
+      let content = fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8") : "";
+      if (content.includes("Vaultly secrets protection")) {
+        console.log(chalk.dim(`  ⏭ ${file} (already protected)`));
+        continue;
       }
+      content += "\n" + ignorePatterns.join("\n") + "\n";
+      fs.mkdirSync(path.dirname(filePath), { recursive: true });
+      fs.writeFileSync(filePath, content);
+      console.log(chalk.green(`  ✓ ${file} updated`));
+      updated++;
     }
 
     console.log(
@@ -548,16 +544,16 @@ cf.command("add [name]")
   .option("-a, --account-id <id>", "Account ID (skip prompt)")
   .action(async (name?: string, opts?: { token?: string; accountId?: string }) => {
     const key = await requireUnlock();
+    const readline = await import("node:readline");
+    const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+    const ask = (q: string) => new Promise<string>((res) => rl.question(q, (a) => res(a.trim())));
 
     // Get account name
     if (!name) {
-      const readline = await import("node:readline");
-      const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
-      name = await new Promise<string>((res) =>
-        rl.question("Account name (e.g. personal, work, client-x): ", (a) => { rl.close(); res(a.trim()); })
-      );
+      name = await ask("Account name (e.g. personal, work, client-x): ");
     }
     if (!name) {
+      rl.close();
       console.error(chalk.red("✗ Name required."));
       process.exit(1);
     }
@@ -567,22 +563,16 @@ cf.command("add [name]")
     // Get token
     let token = opts?.token;
     if (!token) {
-      const readline = await import("node:readline");
-      const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
-      token = await new Promise<string>((res) =>
-        rl.question("CLOUDFLARE_API_TOKEN: ", (a) => { rl.close(); res(a.trim()); })
-      );
+      token = await ask("CLOUDFLARE_API_TOKEN: ");
     }
 
     // Get account ID
     let accountId = opts?.accountId;
     if (!accountId) {
-      const readline = await import("node:readline");
-      const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
-      accountId = await new Promise<string>((res) =>
-        rl.question("CLOUDFLARE_ACCOUNT_ID: ", (a) => { rl.close(); res(a.trim()); })
-      );
+      accountId = await ask("CLOUDFLARE_ACCOUNT_ID: ");
     }
+
+    rl.close();
 
     if (token) vault.setSecret(vaultName, "CLOUDFLARE_API_TOKEN", token, key);
     if (accountId) vault.setSecret(vaultName, "CLOUDFLARE_ACCOUNT_ID", accountId, key);
@@ -654,6 +644,10 @@ cf.command("deploy <name> <projectDir>")
     });
     child.stdout.on("data", (d: Buffer) => process.stdout.write(scrubOutput(d.toString(), secretValues)));
     child.stderr.on("data", (d: Buffer) => process.stderr.write(scrubOutput(d.toString(), secretValues)));
+    child.on("error", (err) => {
+      console.error(chalk.red(`✗ Failed to start deploy: ${err.message}`));
+      process.exit(1);
+    });
     child.on("close", (code) => process.exit(code ?? 0));
   });
 
@@ -680,16 +674,30 @@ cf.command("zones <name>")
       console.error(chalk.red(`✗ No token in '${vaultName}'`));
       process.exit(1);
     }
-    const res = await fetch("https://api.cloudflare.com/client/v4/zones?per_page=50", {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    const data = await res.json() as any;
-    const zones = data?.result || [];
-    console.log(chalk.bold(`\n☁️  Zones for '${name}' (${zones.length}):\n`));
-    for (const z of zones) {
-      console.log(`  ${chalk.green(z.name)} ${chalk.dim(`id=${z.id} status=${z.status}`)}`);
+    try {
+      const res = await fetch("https://api.cloudflare.com/client/v4/zones?per_page=50", {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) {
+        console.error(chalk.red(`✗ Cloudflare API error: HTTP ${res.status}`));
+        process.exit(1);
+      }
+      const data = await res.json() as any;
+      if (!data?.success) {
+        const msgs = (data?.errors || []).map((e: any) => e.message).join(", ");
+        console.error(chalk.red(`✗ Cloudflare error: ${msgs || "unknown"}`));
+        process.exit(1);
+      }
+      const zones = data?.result || [];
+      console.log(chalk.bold(`\n☁️  Zones for '${name}' (${zones.length}):\n`));
+      for (const z of zones) {
+        console.log(`  ${chalk.green(z.name)} ${chalk.dim(`id=${z.id} status=${z.status}`)}`);
+      }
+      console.log();
+    } catch (err: any) {
+      console.error(chalk.red(`✗ Failed to fetch zones: ${err.message}`));
+      process.exit(1);
     }
-    console.log();
   });
 
 // ─── templates ─────────────────────────────────────────────

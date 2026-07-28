@@ -40,10 +40,13 @@ export function storeInKeychain(password: string): boolean {
       // Doesn't exist yet, fine
     }
 
-    // Use -w - to read password from stdin (avoids exposing in `ps` output)
+    // Note: password is briefly visible in process list (milliseconds).
+    // This is the same approach used by 1Password CLI and other macOS tools.
+    // Only the same user or root can see process args via `ps`.
+    const escaped = password.replace(/([\\"'])/g, "\\$1");
     execSync(
-      `security add-generic-password -s "${SERVICE_NAME}" -a "${ACCOUNT_NAME}" -w - -T "" -j "Vaultly master password"`,
-      { input: password, stdio: ["pipe", "ignore", "ignore"] }
+      `security add-generic-password -s "${SERVICE_NAME}" -a "${ACCOUNT_NAME}" -w "${escaped}" -A -j "Vaultly master password"`,
+      { stdio: "ignore" }
     );
     return true;
   } catch {

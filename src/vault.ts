@@ -32,6 +32,9 @@ function ensureDirs(): void {
 function vaultPath(name: string): string {
   // Sanitize vault name to prevent path traversal
   const safe = name.replace(/[^a-zA-Z0-9_-]/g, "-");
+  if (!safe || safe === "-" || safe.length === 0) {
+    throw new Error("Invalid vault name. Use letters, numbers, hyphens, underscores.");
+  }
   return path.join(VAULTS_DIR, `${safe}.vault`);
 }
 
