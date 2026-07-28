@@ -1,0 +1,15 @@
+name = "vaultly-backup"
+main = "src/index.ts"
+compatibility_date = "2024-11-01"
+
+# KV namespace for encrypted vault storage
+# Create with: npx wrangler kv namespace create VAULTLY_KV
+# Then paste the binding ID below
+[[kv_namespaces]]
+binding = "VAULTLY_KV"
+id = "YOUR_KV_NAMESPACE_ID"
+
+[vars]
+# Set your backup API token as a secret instead:
+# npx wrangler secret put BACKUP_TOKEN
+# BACKUP_TOKEN = "set-as-secret-not-here"
