@@ -836,7 +836,7 @@ kc.command("store")
       console.error(chalk.red("✗ macOS Keychain not available (requires macOS)."));
       process.exit(1);
     }
-    const pw = await promptPassword("🔑 Master password to store in Keychain: ");
+    const pw = process.env.VAULTLY_MASTER_PASSWORD || await promptPassword("🔑 Master password to store in Keychain: ");
     try {
       vault.unlock(pw); // verify first
     } catch {
