@@ -162,6 +162,17 @@ vaultly kill               # 🚨 emergency lock
 vaultly status             # session info
 ```
 
+### 🖥️ Interactive TUI
+
+Forget the flags — just run `vaultly` (or `vaultly tui`) and pick from a menu:
+
+```bash
+vaultly          # → opens interactive menu
+vaultly tui      # same thing, explicit
+```
+
+Sections: **Secrets** (list/add/read/delete/run/template), **Cloudflare** (add account, zones, deploy, worker secrets), **System** (keychain, status, lock & exit). Human-only — refused in agent mode. All actions route through the same engine (audited, encrypted).
+
 ### Agent Mode
 
 ```bash
@@ -218,6 +229,7 @@ vaultly protect [dir]                     Add AI-tool ignore rules
 vaultly mcp                               Start MCP server
 vaultly kill                              Emergency lock
 vaultly status                            Session and vault info
+vaultly tui                               Interactive menu (no flags to remember)
 ```
 
 ## 🏗️ Architecture
@@ -225,7 +237,7 @@ vaultly status                            Session and vault info
 See [ARCHITECTURE.md](ARCHITECTURE.md) for full system diagrams.
 
 ```
-2,930 LOC · 9 modules · 3 dependencies · 0 vulnerabilities
+3,261 LOC · 11 modules · 4 dependencies · 0 vulnerabilities
 ```
 
 ---

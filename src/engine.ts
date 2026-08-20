@@ -138,6 +138,17 @@ export class VaultEngine {
     return deleted;
   }
 
+  /** Read a raw secret value. Human-only — agents are blocked by policy (read_value). */
+  getSecretValue(vaultName: string, secretKey: string, ctx?: CallerContext): string {
+    this.policy.check(ctx, "read_value", vaultName);
+    const secrets = this.getSecrets(vaultName);
+    if (!(secretKey in secrets)) {
+      throw new Error(`'${secretKey}' not found in '${vaultName}'.`);
+    }
+    this.audit("GET", `${vaultName}/${secretKey}`, ctx);
+    return secrets[secretKey];
+  }
+
   /** Import secrets from parsed entries */
   importSecrets(vaultName: string, entries: Record<string, string>, ctx?: CallerContext): number {
     this.policy.check(ctx, "write", vaultName);

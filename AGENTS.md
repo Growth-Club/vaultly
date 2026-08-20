@@ -118,6 +118,7 @@ vaultly list cf-personal
 # Agent CANNOT do this (blocked):
 vaultly get cf-personal CLOUDFLARE_API_TOKEN  # ✗ BLOCKED
 vaultly env cf-personal                        # ✗ BLOCKED
+vaultly tui                                    # ✗ BLOCKED (interactive menu is human-only)
 ```
 
 ---

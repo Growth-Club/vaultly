@@ -6,7 +6,7 @@
 │                    V A U L T L Y   v 2                                      │
 │              Agent-First Credential Manager                                 │
 │                                                                             │
-│         2,930 LOC · 9 modules · 3 deps · 0 vulnerabilities                 │
+│         3,261 LOC · 11 modules · 4 deps · 0 vulnerabilities                 │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 
@@ -28,11 +28,10 @@
 │                                                                             │
 │  🚪  INTERFACE LAYER                                                        │
 │                                                                             │
-│  ┌─────────────────────────────┐  ┌──────────────────────────────────────┐  │
-│  │  MCP SERVER                 │  │  CLI                                 │  │
-│  │  (mcp-server.ts)            │  │  (index.ts)                          │  │
+│  │  MCP SERVER                 │  │  CLI + TUI                           │  │
+│  │  (mcp-server.ts)            │  │  (index.ts + tui.ts)                 │  │
 │  │                             │  │                                      │  │
-│  │  17 tools:                  │  │  18 commands + 8 cf + 14 templates   │  │
+│  │  17 tools:                  │  │  19 commands + 8 cf + 14 templates   │  │
 │  │                             │  │                                      │  │
 │  │  ┌───────────────────────┐  │  │  ┌────────────────────────────────┐  │  │
 │  │  │ VAULT TOOLS           │  │  │  │ CORE                           │  │  │
@@ -40,7 +39,7 @@
 │  │  │  vault_keys           │  │  │  │  list     delete   env*        │  │  │
 │  │  │  vault_add (write-only│  │  │  │  import   run      mcp         │  │  │
 │  │  │  vault_delete         │  │  │  │  backup   restore  protect     │  │  │
-│  │  │  vault_run (scrubbed) │  │  │  │  status   kill                 │  │  │
+│  │  │  vault_run (scrubbed) │  │  │  │  status   kill     tui         │  │  │
 │  │  │  vault_status         │  │  │  ├────────────────────────────────┤  │  │
 │  │  │  vault_lock           │  │  │  │ CLOUDFLARE (vaultly cf ...)    │  │  │
 │  │  │  vault_unlock         │  │  │  │  cf add [name]                 │  │  │
@@ -311,7 +310,7 @@
   │   ├── keychain.ts        93 LOC   macOS Keychain integration
   │   └── scrubber.ts        74 LOC   Output secret redaction
   │                                  ─────────
-  │                          2,930 LOC total
+  │                          3,261 LOC total
   │
   ├── worker/
   │   ├── src/index.ts      Cloudflare Worker (zero-knowledge backup)

@@ -16,7 +16,16 @@ import { execSync } from "node:child_process";
 const SERVICE_NAME = "vaultly-master-key";
 const ACCOUNT_NAME = "vaultly";
 
+/**
+ * Test/CI isolation: when VAULTLY_DIR points somewhere other than ~/.vaultly
+ * (as test/setup.ts does), NEVER touch the real user keychain.
+ */
+function keychainInert(): boolean {
+  return Boolean(process.env.VAULTLY_DIR);
+}
+
 export function isKeychainAvailable(): boolean {
+  if (keychainInert()) return false;
   if (process.platform !== "darwin") return false;
   try {
     execSync("security -h", { stdio: "ignore" });
