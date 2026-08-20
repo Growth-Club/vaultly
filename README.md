@@ -53,15 +53,19 @@ vaultly add github -k GITHUB_TOKEN -v "ghp_xxx"
 
 ## ☁️ Cloudflare Management
 
-Manage **unlimited** Cloudflare accounts dynamically:
+Manage **unlimited** Cloudflare accounts dynamically — with **API tokens** (scoped, recommended) or **Global API keys** (email + key):
 
 ```bash
-vaultly cf add personal                          # add (prompts for token)
-vaultly cf add work -t "token" -a "account-id"   # or pass flags
+vaultly cf add personal                          # prompts: token or global key
+vaultly cf add work -t "token" -a "account-id"   # or pass flags (token auth)
+vaultly cf add legacy -e "you@mail.com" -k "key" -a "account-id"   # global key auth
 vaultly cf list                                  # list all accounts
 vaultly cf use work                              # switch active account
 vaultly cf deploy personal ~/my-project          # deploy a Worker
 vaultly cf zones personal                        # list domains
+vaultly cf secrets personal my-worker --list                    # Worker secret names
+vaultly cf secrets personal my-worker --set API_KEY --value sk-xxx  # set (write-only)
+vaultly cf secrets personal my-worker --delete API_KEY          # delete
 vaultly cf remove old-client                     # remove account
 ```
 
@@ -115,7 +119,7 @@ Add to your AI tool's MCP config:
 
 > 💡 With macOS Keychain (`vaultly keychain store`), no password needed in config.
 
-### 16 MCP Tools
+### 17 MCP Tools
 
 | Tool | Description |
 |------|-------------|
@@ -133,8 +137,9 @@ Add to your AI tool's MCP config:
 | 📡 `cf_dns_list` | List DNS records |
 | ✏️ `cf_dns_upsert` | Create/update DNS record |
 | ⚡ `cf_workers_list` | List deployed Workers |
+| 🔐 `cf_secrets` | Manage Worker secrets (list/set/delete, **write-only values**) |
 | 🚀 `cf_deploy` | Deploy a Worker project |
-| 💚 `cf_health` | Verify API token works |
+| 💚 `cf_health` | Verify API credentials (token **or** global key) |
 
 > 🚫 **No MCP tool ever returns a raw secret value.**
 
@@ -205,7 +210,7 @@ vaultly env <vault>                       Output shell export statements
 vaultly run <vault> -- <cmd>              Run with injected env (scrubbed)
 vaultly import <file> [--vault name]      Import from plaintext file
 vaultly template [name]                   Create vault from template
-vaultly cf add|list|use|deploy|remove|zones
+vaultly cf add|list|use|deploy|secrets|remove|zones
 vaultly keychain store|remove|status      macOS Keychain management
 vaultly backup -u URL -t TOKEN            Push encrypted backup
 vaultly restore -u URL -t TOKEN           Pull encrypted backup
@@ -220,7 +225,7 @@ vaultly status                            Session and vault info
 See [ARCHITECTURE.md](ARCHITECTURE.md) for full system diagrams.
 
 ```
-2,539 LOC · 9 modules · 3 dependencies · 0 vulnerabilities
+2,930 LOC · 9 modules · 3 dependencies · 0 vulnerabilities
 ```
 
 ---

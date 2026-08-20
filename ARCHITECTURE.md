@@ -6,7 +6,7 @@
 │                    V A U L T L Y   v 2                                      │
 │              Agent-First Credential Manager                                 │
 │                                                                             │
-│         2,539 LOC · 9 modules · 3 deps · 0 vulnerabilities                 │
+│         2,930 LOC · 9 modules · 3 deps · 0 vulnerabilities                 │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 
@@ -32,7 +32,7 @@
 │  │  MCP SERVER                 │  │  CLI                                 │  │
 │  │  (mcp-server.ts)            │  │  (index.ts)                          │  │
 │  │                             │  │                                      │  │
-│  │  16 tools:                  │  │  18 commands + 7 cf + 14 templates   │  │
+│  │  17 tools:                  │  │  18 commands + 8 cf + 14 templates   │  │
 │  │                             │  │                                      │  │
 │  │  ┌───────────────────────┐  │  │  ┌────────────────────────────────┐  │  │
 │  │  │ VAULT TOOLS           │  │  │  │ CORE                           │  │  │
@@ -52,10 +52,10 @@
 │  │  │  cf_dns_list          │  │  │  ├────────────────────────────────┤  │  │
 │  │  │  cf_dns_upsert        │  │  │  │ TEMPLATES (vaultly template)   │  │  │
 │  │  │  cf_workers_list      │  │  │  │  cloudflare  github   aws      │  │  │
-│  │  │  cf_deploy            │  │  │  │  gcp         vercel   stripe   │  │  │
-│  │  │  cf_health            │  │  │  │  database    openai   smtp     │  │  │
-│  │  └───────────────────────┘  │  │  │  docker      npm      ssh      │  │  │
-│  │                             │  │  │  social-media  custom          │  │  │
+│  │  │  cf_secrets           │  │  │  │  gcp         vercel   stripe   │  │  │
+│  │  │  cf_deploy            │  │  │  │  database    openai   smtp     │  │  │
+│  │  │  cf_health            │  │  │  │  docker      npm      ssh      │  │  │
+│  │  └───────────────────────┘  │  │  │  social-media  custom          │  │  │
 │  │  Unlock:                    │  │  ├────────────────────────────────┤  │  │
 │  │  1. macOS Keychain (auto)   │  │  │ KEYCHAIN                       │  │  │
 │  │  2. VAULTLY_MASTER_PASSWORD │  │  │  keychain store/remove/status  │  │  │
@@ -280,10 +280,12 @@
    cf_dns_list             ✅              ❌               ✅
    cf_dns_upsert           ✅              ❌               ✅
    cf_workers_list         ✅              ❌               ✅
+   cf_secrets              ✅              ❌               ✅
    cf_health               ✅              ❌               ✅
    cf add/list/use         ❌              ✅               ✅
    cf deploy (CLI)         ❌              ✅               ✅
    cf zones (CLI)          ❌              ✅               ✅
+   cf secrets (CLI)        ❌              ✅               ✅
    template                ❌              ❌               ✅
    get (raw value)         ❌ NEVER        ❌ BLOCKED       ✅
    env (export vars)       ❌ NEVER        ❌ BLOCKED       ✅
@@ -309,7 +311,7 @@
   │   ├── keychain.ts        93 LOC   macOS Keychain integration
   │   └── scrubber.ts        74 LOC   Output secret redaction
   │                                  ─────────
-  │                          2,539 LOC total
+  │                          2,930 LOC total
   │
   ├── worker/
   │   ├── src/index.ts      Cloudflare Worker (zero-knowledge backup)
@@ -329,7 +331,7 @@
 
   ~/.vaultly/vaults/
   │
-  ├── cf-personal.vault ─────── CLOUDFLARE_API_TOKEN
+  ├── cf-personal.vault ─────── CLOUDFLARE_API_TOKEN (or EMAIL+API_KEY)
   │                             CLOUDFLARE_ACCOUNT_ID
   │
   ├── cf-work.vault ─────────── CLOUDFLARE_API_TOKEN

@@ -20,6 +20,7 @@ and handle Cloudflare — all without ever seeing raw secret values.
 | `cf_dns_list` | List DNS records | ❌ No |
 | `cf_dns_upsert` | Create/update DNS records | ❌ No |
 | `cf_workers_list` | List deployed workers | ❌ No |
+| `cf_secrets` | Manage Worker secrets (list/set/delete) | ❌ Values are write-only |
 | `cf_deploy` | Deploy a Worker project | ❌ Sees build output only |
 
 **There is NO tool that returns a raw secret value. By design.**

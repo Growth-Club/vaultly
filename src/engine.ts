@@ -221,6 +221,49 @@ export class VaultEngine {
 
   // ─── Cloudflare API ────────────────────────────────────
 
+  /**
+   * Build Cloudflare auth headers from a vault's secrets.
+   * Supports two auth modes:
+   *   1. API token  → CLOUDFLARE_API_TOKEN (Authorization: Bearer)
+   *   2. Global key → CLOUDFLARE_EMAIL + CLOUDFLARE_API_KEY (X-Auth-Email/X-Auth-Key)
+   * Throws with a helpful message if neither is present.
+   */
+  private buildCfHeaders(
+    vaultName: string,
+    secrets: Record<string, string>
+  ): Record<string, string> {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    const token = secrets["CLOUDFLARE_API_TOKEN"];
+    const email = secrets["CLOUDFLARE_EMAIL"];
+    const apiKey = secrets["CLOUDFLARE_API_KEY"];
+
+    if (token) {
+      headers["Authorization"] = `Bearer ${token}`;
+      return headers;
+    }
+    if (email && apiKey) {
+      headers["X-Auth-Email"] = email;
+      headers["X-Auth-Key"] = apiKey;
+      return headers;
+    }
+
+    const found = Object.keys(secrets).join(", ") || "(empty)";
+    throw new Error(
+      `No Cloudflare credentials in '${vaultName}'. Need either ` +
+        `CLOUDFLARE_API_TOKEN (API token) or CLOUDFLARE_EMAIL + CLOUDFLARE_API_KEY (global key). ` +
+        `Found: ${found}`
+    );
+  }
+
+  /** Values that must be scrubbed from CF responses */
+  private cfSecretValues(secrets: Record<string, string>): string[] {
+    return [
+      secrets["CLOUDFLARE_API_TOKEN"],
+      secrets["CLOUDFLARE_EMAIL"],
+      secrets["CLOUDFLARE_API_KEY"],
+    ].filter((v): v is string => Boolean(v));
+  }
+
   async cloudflareApi(
     vaultName: string,
     method: string,
@@ -231,29 +274,24 @@ export class VaultEngine {
     this.policy.check(ctx, "cf_api", vaultName);
 
     const secrets = this.getSecrets(vaultName);
-    const apiToken = secrets["CLOUDFLARE_API_TOKEN"];
-    if (!apiToken) {
-      throw new Error(
-        `No CLOUDFLARE_API_TOKEN in '${vaultName}'. Found: ${Object.keys(secrets).join(", ") || "(empty)"}`
-      );
-    }
+    const headers = this.buildCfHeaders(vaultName, secrets);
 
     this.audit("CF_API", `${method} ${apiPath} (vault=${vaultName})`, ctx);
 
     const url = `https://api.cloudflare.com/client/v4${apiPath}`;
     const res = await fetch(url, {
       method,
-      headers: {
-        Authorization: `Bearer ${apiToken}`,
-        "Content-Type": "application/json",
-      },
+      headers,
       body: body ? JSON.stringify(body) : undefined,
     });
 
     const data = await res.json();
 
-    // Scrub token from response (in case it's echoed back)
-    const scrubbed = scrubOutput(JSON.stringify(data, null, 2), [apiToken]);
+    // Scrub credentials from response (in case it's echoed back)
+    const scrubbed = scrubOutput(
+      JSON.stringify(data, null, 2),
+      this.cfSecretValues(secrets)
+    );
 
     return { status: res.status, data: JSON.parse(scrubbed) };
   }
@@ -267,13 +305,8 @@ export class VaultEngine {
     this.policy.check(ctx, "cf_api", vaultName);
 
     const secrets = this.getSecrets(vaultName);
-    const apiToken = secrets["CLOUDFLARE_API_TOKEN"];
+    const headers = this.buildCfHeaders(vaultName, secrets);
     const accountId = secrets["CLOUDFLARE_ACCOUNT_ID"];
-    if (!apiToken) {
-      throw new Error(
-        `No CLOUDFLARE_API_TOKEN in '${vaultName}'. Found: ${Object.keys(secrets).join(", ") || "(empty)"}`
-      );
-    }
     if (!accountId) {
       throw new Error(
         `No CLOUDFLARE_ACCOUNT_ID in '${vaultName}'. Found: ${Object.keys(secrets).join(", ") || "(empty)"}`
@@ -285,7 +318,7 @@ export class VaultEngine {
     const url = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/workers/scripts`;
     const res = await fetch(url, {
       method: "GET",
-      headers: { Authorization: `Bearer ${apiToken}` },
+      headers,
     });
 
     const data = (await res.json()) as any;
@@ -296,24 +329,98 @@ export class VaultEngine {
     return { accountId, workers };
   }
 
+  // ─── Worker Secrets ─────────────────────────────────
+
+  async workerSecrets(
+    vaultName: string,
+    scriptName: string,
+    action: "list" | "set" | "delete",
+    name?: string,
+    value?: string,
+    ctx?: CallerContext
+  ): Promise<ApiResult> {
+    this.policy.check(ctx, "cf_api", vaultName);
+
+    if (action !== "list" && !name) {
+      throw new Error(`'name' is required for worker secret ${action}.`);
+    }
+    if (action === "set" && value === undefined) {
+      throw new Error(`'value' is required for worker secret set.`);
+    }
+
+    const secrets = this.getSecrets(vaultName);
+    const headers = this.buildCfHeaders(vaultName, secrets);
+    const accountId = secrets["CLOUDFLARE_ACCOUNT_ID"];
+    if (!accountId) {
+      throw new Error(
+        `No CLOUDFLARE_ACCOUNT_ID in '${vaultName}'. Found: ${Object.keys(secrets).join(", ") || "(empty)"}`
+      );
+    }
+
+    this.audit(
+      "CF_SECRETS",
+      `${action} ${scriptName}${name ? `/${name}` : ""} (vault=${vaultName})`,
+      ctx
+    );
+
+    const base = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/workers/scripts/${encodeURIComponent(scriptName)}/secrets`;
+
+    let res: Response;
+    if (action === "list") {
+      res = await fetch(base, { method: "GET", headers });
+    } else if (action === "set") {
+      res = await fetch(base, {
+        method: "PUT",
+        headers,
+        body: JSON.stringify({ name, text: value }),
+      });
+    } else {
+      res = await fetch(`${base}/${encodeURIComponent(name!)}`, {
+        method: "DELETE",
+        headers,
+      });
+    }
+
+    const data = await res.json();
+    const scrubbed = scrubOutput(
+      JSON.stringify(data, null, 2),
+      this.cfSecretValues(secrets)
+    );
+
+    return { status: res.status, data: JSON.parse(scrubbed) };
+  }
+
   // ─── Health Check ──────────────────────────────────────
 
   async healthCheck(vaultName: string, ctx?: CallerContext): Promise<{ ok: boolean; message: string }> {
     this.policy.check(ctx, "cf_api", vaultName);
 
     const secrets = this.getSecrets(vaultName);
-    const apiToken = secrets["CLOUDFLARE_API_TOKEN"];
-    if (!apiToken) {
-      return { ok: false, message: `No CLOUDFLARE_API_TOKEN in '${vaultName}'` };
+    const token = secrets["CLOUDFLARE_API_TOKEN"];
+    const email = secrets["CLOUDFLARE_EMAIL"];
+    const apiKey = secrets["CLOUDFLARE_API_KEY"];
+    if (!token && !(email && apiKey)) {
+      return {
+        ok: false,
+        message: `No Cloudflare credentials in '${vaultName}'. Need CLOUDFLARE_API_TOKEN or CLOUDFLARE_EMAIL + CLOUDFLARE_API_KEY.`,
+      };
     }
 
     try {
-      const result = await this.cloudflareApi(vaultName, "GET", "/user/tokens/verify");
-      const data = result.data as any;
-      if (data?.result?.status === "active") {
-        return { ok: true, message: `Token is active and valid ✓` };
+      if (token) {
+        const result = await this.cloudflareApi(vaultName, "GET", "/user/tokens/verify");
+        const data = result.data as any;
+        if (data?.result?.status === "active") {
+          return { ok: true, message: `Token is active and valid ✓` };
+        }
+        return { ok: false, message: `Token status: ${data?.result?.status || "unknown"}` };
       }
-      return { ok: false, message: `Token status: ${data?.result?.status || "unknown"}` };
+      // Global API key: verify via /user (works only with global auth)
+      const result = await this.cloudflareApi(vaultName, "GET", "/user");
+      const data = result.data as any;
+      return data?.success
+        ? { ok: true, message: `Global API key is valid ✓ (user: ${data?.result?.username || data?.result?.email || "unknown"})` }
+        : { ok: false, message: `Global API key invalid: ${(data?.errors || []).map((e: any) => e.message).join(", ") || "unknown error"}` };
     } catch (err: any) {
       return { ok: false, message: `Health check failed: ${err.message}` };
     }

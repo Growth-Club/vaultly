@@ -318,6 +318,40 @@ export async function startMcpServer(): Promise<void> {
   );
 
   server.tool(
+    "cf_secrets",
+    "Manage secrets for a deployed Worker (list, set, delete). Values are sent to Cloudflare and NEVER echoed back — write-only, same as vault_add.",
+    {
+      vaultName: z.string().describe("Vault with CLOUDFLARE_ACCOUNT_ID + auth"),
+      scriptName: z.string().describe("Worker script name"),
+      action: z.enum(["list", "set", "delete"]),
+      name: z.string().optional().describe("Secret name (required for set/delete)"),
+      value: z.string().optional().describe("Secret value (set only; write-only, never returned)"),
+    },
+    async ({ vaultName, scriptName, action, name, value }) =>
+      tryRunAsync(async () => {
+        if (action !== "list" && !name) {
+          return fail(`'name' is required for worker secret ${action}.`);
+        }
+        if (action === "set" && value === undefined) {
+          return fail(`'value' is required for worker secret set.`);
+        }
+        const r = await engine.workerSecrets(vaultName, scriptName, action, name, value, AGENT_CTX);
+        if (action === "list") {
+          const names = (r.data as any)?.result || [];
+          return ok(
+            `Secrets in '${scriptName}' (${names.length}):\n` +
+              names.map((s: any) => `  - ${s.name}`).join("\n") +
+              `\n\n(names only — values are never returned)`
+          );
+        }
+        const okText = action === "set" ? `✓ Set secret '${name}' on '${scriptName}'` : `✓ Deleted secret '${name}' from '${scriptName}'`;
+        return r.status < 400
+          ? ok(okText)
+          : fail(`${okText} — API error HTTP ${r.status}: ${JSON.stringify(r.data)}`);
+      })
+  );
+
+  server.tool(
     "cf_deploy",
     "Deploy a Cloudflare Worker project via wrangler. Credentials injected from vault.",
     {

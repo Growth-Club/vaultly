@@ -10,7 +10,7 @@
  *   vaultly delete <vault> [key]         Delete a secret or vault
  *   vaultly env <vault>                  Output shell export statements
  *   vaultly run <vault> -- <cmd>         Run with injected env (scrubbed)
- *   vaultly cf add|list|use|deploy       Manage Cloudflare accounts
+ *   vaultly cf add|list|use|deploy|secrets Manage Cloudflare accounts + Worker secrets
  *   vaultly template [name]              Create vault from template
  *   vaultly import <file> [--vault name] Import from plaintext file
  *   vaultly backup / restore             Encrypted remote backup
@@ -539,10 +539,12 @@ const cf = program
   .description("Manage Cloudflare accounts (fully dynamic — add as many as you want)");
 
 cf.command("add [name]")
-  .description("Add a Cloudflare account (prompts for token + account ID)")
+  .description("Add a Cloudflare account (API token OR global API key)")
   .option("-t, --token <token>", "API token (skip prompt)")
   .option("-a, --account-id <id>", "Account ID (skip prompt)")
-  .action(async (name?: string, opts?: { token?: string; accountId?: string }) => {
+  .option("-e, --email <email>", "Global key auth: account email (skip prompt)")
+  .option("-k, --api-key <key>", "Global key auth: API key (skip prompt)")
+  .action(async (name?: string, opts?: { token?: string; accountId?: string; email?: string; apiKey?: string }) => {
     const key = await requireUnlock();
     const readline = await import("node:readline");
     const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
@@ -560,10 +562,18 @@ cf.command("add [name]")
 
     const vaultName = name.startsWith("cf-") ? name : `cf-${name}`;
 
-    // Get token
+    // Auth mode: API token (default) or global API key (email + key)
     let token = opts?.token;
-    if (!token) {
-      token = await ask("CLOUDFLARE_API_TOKEN: ");
+    let email = opts?.email;
+    let apiKey = opts?.apiKey;
+    if (!token && !(email && apiKey)) {
+      const method = await ask("Auth method — [1] API token, [2] Global API key: ");
+      if (method.trim() === "2") {
+        email = await ask("CLOUDFLARE_EMAIL (global key): ");
+        apiKey = await ask("CLOUDFLARE_API_KEY (global key): ");
+      } else {
+        token = await ask("CLOUDFLARE_API_TOKEN: ");
+      }
     }
 
     // Get account ID
@@ -575,9 +585,12 @@ cf.command("add [name]")
     rl.close();
 
     if (token) vault.setSecret(vaultName, "CLOUDFLARE_API_TOKEN", token, key);
+    if (email) vault.setSecret(vaultName, "CLOUDFLARE_EMAIL", email, key);
+    if (apiKey) vault.setSecret(vaultName, "CLOUDFLARE_API_KEY", apiKey, key);
     if (accountId) vault.setSecret(vaultName, "CLOUDFLARE_ACCOUNT_ID", accountId, key);
 
-    console.log(chalk.green(`\n✓ Cloudflare account '${vaultName}' saved`));
+    const auth = token ? "API token" : "global API key";
+    console.log(chalk.green(`\n✓ Cloudflare account '${vaultName}' saved (${auth})`));
     console.log(chalk.dim(`  Use it:  vaultly cf use ${name}`));
     console.log(chalk.dim(`  Deploy:  vaultly cf deploy ${name} /path/to/project`));
   });
@@ -700,11 +713,90 @@ cf.command("zones <name>")
     }
   });
 
+cf.command("secrets <name> <scriptName>")
+  .description("Manage secrets for a deployed Worker (list, set, delete)")
+  .option("-l, --list", "List secret names (never values)")
+  .option("-s, --set <key>", "Set a secret (prompts for value if --value omitted)")
+  .option("-v, --value <value>", "Secret value to set (write-only)")
+  .option("-d, --delete <key>", "Delete a secret")
+  .addHelpText("after", "\nExamples:\n  vaultly cf secrets personal my-worker --list\n  vaultly cf secrets personal my-worker --set API_KEY --value sk-xxx\n  vaultly cf secrets personal my-worker --delete API_KEY")
+  .action(async (name: string, scriptName: string, opts?: { list?: boolean; set?: string; value?: string; delete?: string }) => {
+    blockInAgentMode("cf secrets");
+    const key = await requireUnlock();
+    const vaultName = name.startsWith("cf-") ? name : `cf-${name}`;
+    const secrets = vault.getSecrets(vaultName, key);
+    const token = secrets["CLOUDFLARE_API_TOKEN"];
+    const email = secrets["CLOUDFLARE_EMAIL"];
+    const apiKey = secrets["CLOUDFLARE_API_KEY"];
+    if (!token && !(email && apiKey)) {
+      console.error(chalk.red(`✗ No Cloudflare credentials in '${vaultName}'. Add with: vaultly cf add ${name}`));
+      process.exit(1);
+    }
+    if (!secrets["CLOUDFLARE_ACCOUNT_ID"]) {
+      console.error(chalk.red(`✗ No CLOUDFLARE_ACCOUNT_ID in '${vaultName}'`));
+      process.exit(1);
+    }
+
+    const action = opts?.list ? "list" : opts?.set ? "set" : opts?.delete ? "delete" : undefined;
+    if (!action) {
+      console.error(chalk.red("✗ Pick an action: --list, --set <key>, or --delete <key>"));
+      process.exit(1);
+    }
+
+    let value = opts?.value;
+    if (action === "set" && value === undefined) {
+      value = await promptPassword(`Secret value for '${opts!.set}': `);
+    }
+
+    const base = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(secrets.CLOUDFLARE_ACCOUNT_ID)}/workers/scripts/${encodeURIComponent(scriptName)}/secrets`;
+    const headers: Record<string, string> = {};
+    if (token) {
+      headers["Authorization"] = `Bearer ${token}`;
+    } else {
+      headers["X-Auth-Email"] = email!;
+      headers["X-Auth-Key"] = apiKey!;
+    }
+
+    try {
+      let res: Response;
+      if (action === "list") {
+        res = await fetch(base, { headers });
+      } else if (action === "set") {
+        res = await fetch(base, {
+          method: "PUT",
+          headers: { ...headers, "Content-Type": "application/json" },
+          body: JSON.stringify({ name: opts!.set, text: value }),
+        });
+      } else {
+        res = await fetch(`${base}/${encodeURIComponent(opts!.delete!)}`, { method: "DELETE", headers });
+      }
+      const data = await res.json() as any;
+      if (!res.ok || !data?.success) {
+        const msgs = (data?.errors || []).map((e: any) => e.message).join(", ");
+        console.error(chalk.red(`✗ Cloudflare error (HTTP ${res.status}): ${msgs || "unknown"}`));
+        process.exit(1);
+      }
+      if (action === "list") {
+        const names = (data?.result || []).map((s: any) => s.name);
+        console.log(chalk.bold(`\n🔑 Secrets in '${scriptName}' (${names.length}):\n`));
+        for (const n of names) console.log(`  - ${n}`);
+        console.log(chalk.dim("\n(names only — values are never returned)"));
+      } else if (action === "set") {
+        console.log(chalk.green(`✓ Set secret '${opts!.set}' on '${scriptName}'`));
+      } else {
+        console.log(chalk.green(`✓ Deleted secret '${opts!.delete}' from '${scriptName}'`));
+      }
+    } catch (err: any) {
+      console.error(chalk.red(`✗ Failed: ${err.message}`));
+      process.exit(1);
+    }
+  });
+
 // ─── templates ─────────────────────────────────────────────
 
 const TEMPLATES: Record<string, { keys: string[]; description: string }> = {
   cloudflare: {
-    description: "Cloudflare account (API token + account ID)",
+    description: "Cloudflare account (API token or global key + account ID)",
     keys: ["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID"],
   },
   github: {

@@ -70,13 +70,13 @@ describe("MCP server (end-to-end)", () => {
     fs.rmSync(dir(), { recursive: true, force: true });
   });
 
-  it("exposes exactly the 16 documented tools", async () => {
+  it("exposes exactly the 17 documented tools", async () => {
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
     expect(names).toEqual(
       [
         "cf_api", "cf_deploy", "cf_dns_list", "cf_dns_upsert", "cf_health",
-        "cf_workers_list", "cf_zones",
+        "cf_secrets", "cf_workers_list", "cf_zones",
         "vault_add", "vault_audit", "vault_delete", "vault_keys", "vault_list",
         "vault_lock", "vault_run", "vault_status", "vault_unlock",
       ].sort()
@@ -88,6 +88,15 @@ describe("MCP server (end-to-end)", () => {
     for (const t of tools) {
       expect(t.description?.toLowerCase()).not.toMatch(/returns? (the )?raw (secret )?value/);
     }
+  });
+
+  it("validates cf_secrets requires name/value for set", async () => {
+    const res = await client.callTool({
+      name: "cf_secrets",
+      arguments: { vaultName: "e2e", scriptName: "w", action: "set" },
+    });
+    const text = JSON.stringify(res);
+    expect(text).toContain("'name' is required");
   });
 
   it("stores a secret (write-only) and lists only its name", async () => {
