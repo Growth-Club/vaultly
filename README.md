@@ -6,12 +6,11 @@
 
 **AI agents can _use_ your secrets. They can never _read_ them.**
 
-[![TypeScript](https://img.shields.io/badge/TypeScript-5.x-3178C6?logo=typescript&logoColor=white)](https://typescriptlang.org)
+[![Rust](https://img.shields.io/badge/Rust-1.96-000000?logo=rust&logoColor=white)](https://rust-lang.org)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![MCP](https://img.shields.io/badge/MCP-16_tools-8A2BE2)](#ai-agent-integration-mcp)
+[![MCP](https://img.shields.io/badge/MCP-17_tools-8A2BE2)](#ai-agent-integration-mcp)
 [![Cloudflare](https://img.shields.io/badge/Cloudflare-Workers-F38020?logo=cloudflare&logoColor=white)](https://workers.cloudflare.com)
 [![Security](https://img.shields.io/badge/encryption-AES--256--GCM-red)](#security)
-[![Deps](https://img.shields.io/badge/dependencies-3-brightgreen)](package.json)
 
 </div>
 
@@ -38,9 +37,10 @@ Agent: "Deploy my Worker to Cloudflare"
 ## 🚀 Quick Start
 
 ```bash
-# Install
+# Install (Rust)
 git clone https://github.com/Growth-Club/vaultly.git
-cd vaultly && npm install && npm run build && npm link
+cd vaultly/rust && cargo build --release
+cp target/release/vaultly target/release/vaultly-mcp ~/.local/bin/   # (or anywhere on PATH)
 
 # Setup (interactive — creates password, adds accounts)
 bash setup.sh
@@ -183,19 +183,6 @@ vaultly get github TOKEN         # ❌ blocked
 vaultly env github               # ❌ blocked
 ```
 
-## 💾 Remote Backup
-
-Encrypted vaults backed up to Cloudflare KV (zero-knowledge):
-
-```bash
-# Deploy backup Worker
-cd worker && npx wrangler deploy
-
-# Backup / Restore
-vaultly backup -u https://your-worker.workers.dev -t TOKEN
-vaultly restore -u https://your-worker.workers.dev -t TOKEN
-```
-
 ## 📁 Storage
 
 ```
@@ -237,7 +224,7 @@ vaultly tui                               Interactive menu (no flags to remember
 See [ARCHITECTURE.md](ARCHITECTURE.md) for full system diagrams.
 
 ```
-3,261 LOC · 11 modules · 4 dependencies · 0 vulnerabilities
+7,210 LOC Rust · 3 crates · 8 modules · 46 tests · 0 dependencies
 ```
 
 ---

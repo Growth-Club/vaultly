@@ -3,10 +3,10 @@
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                                                                             │
-│                    V A U L T L Y   v 2                                      │
+│             V A U L T L Y   v 2                                      │
 │              Agent-First Credential Manager                                 │
 │                                                                             │
-│         3,261 LOC · 11 modules · 4 deps · 0 vulnerabilities                 │
+│         7,210 LOC Rust · 3 crates · 8 modules · 46 tests                    │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 
@@ -29,7 +29,7 @@
 │  🚪  INTERFACE LAYER                                                        │
 │                                                                             │
 │  │  MCP SERVER                 │  │  CLI + TUI                           │  │
-│  │  (mcp-server.ts)            │  │  (index.ts + tui.ts)                 │  │
+│  │  (vaultly-mcp/lib.rs)            │  │  (vaultly/main.rs + tui.rs)                 │  │
 │  │                             │  │                                      │  │
 │  │  17 tools:                  │  │  19 commands + 8 cf + 14 templates   │  │
 │  │                             │  │                                      │  │
@@ -73,7 +73,7 @@
 │                                                                             │
 │  ┌────────────────────┐ ┌────────────────────┐ ┌──────────────────────────┐ │
 │  │  POLICY ENGINE     │ │  OUTPUT SCRUBBER   │ │  SESSION MANAGER         │ │
-│  │  (policy.ts)       │ │  (scrubber.ts)     │ │  (engine.ts)             │ │
+│  │  (policy.rs)       │ │  (scrubber.rs)     │ │  (engine.rs)             │ │
 │  │                    │ │                    │ │                          │ │
 │  │  • Per-agent       │ │  Intercepts ALL    │ │  • TTL: 120 min          │ │
 │  │    permissions     │ │  output and        │ │    auto-lock             │ │
@@ -100,7 +100,7 @@
 │                                                                             │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
-│  ⚙️  CORE ENGINE  (engine.ts)                                              │
+│  ⚙️  CORE ENGINE  (engine.rs)                                              │
 │                                                                             │
 │  ┌──────────────────────────────────────────────────────────────────────┐   │
 │  │                                                                      │   │
@@ -108,7 +108,7 @@
 │  │      │                                                               │   │
 │  │      ▼                                                               │   │
 │  │  ┌──────────────────────────────────────────────────┐                │   │
-│  │  │  KEY DERIVATION  (crypto.ts)                     │                │   │
+│  │  │  KEY DERIVATION  (crypto.rs)                     │                │   │
 │  │  │                                                  │                │   │
 │  │  │  password ──┐                                    │                │   │
 │  │  │             ├──▶ PBKDF2-SHA256 ──▶ 256-bit key   │                │   │
@@ -118,7 +118,7 @@
 │  │                         │                                            │   │
 │  │                         ▼                                            │   │
 │  │  ┌──────────────────────────────────────────────────┐                │   │
-│  │  │  ENCRYPTION  (crypto.ts)                         │                │   │
+│  │  │  ENCRYPTION  (crypto.rs)                         │                │   │
 │  │  │                                                  │                │   │
 │  │  │  plaintext ──▶ AES-256-GCM ──▶ ciphertext        │                │   │
 │  │  │                random IV                          │                │   │
@@ -160,7 +160,7 @@
 │  │  ├─ cf-anything      │ │  vaultly kill     │ │           │            │  │
 │  │  ├─ github           │ │  clears entry     │ │           ▼            │  │
 │  │  ├─ aws              │ │                   │ │  ┌──────────────────┐  │  │
-│  │  ├─ stripe           │ │  (keychain.ts)    │ │  │  CF KV           │  │  │
+│  │  ├─ stripe           │ │  (keychain.rs)    │ │  │  CF KV           │  │  │
 │  │  ├─ databases        │ │                   │ │  │                  │  │  │
 │  │  ├─ personal         │ │                   │ │  │  Stores ONLY     │  │  │
 │  │  ├─ social           │ │                   │ │  │  encrypted       │  │  │
@@ -173,7 +173,7 @@
 │  │  dirs  700 (rwx---)  │ │                   │ │  └──────────────────┘  │  │
 │  │  files 600 (rw----)  │ │                   │ │                        │  │
 │  │                      │ │                   │ │  vaultly backup        │  │
-│  │  (vault.ts)          │ │                   │ │  vaultly restore       │  │
+│  │  (vault.rs)          │ │                   │ │  vaultly restore       │  │
 │  └──────────────────────┘ └───────────────────┘ └────────────────────────┘  │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -217,7 +217,7 @@
     │                        │                     │   https://..."     │
     │                        │                     │◀────────┼──────────│
     │                        │                     │         │          │
-    │                        │   scrubber.ts       │         │          │
+    │                        │   scrubber.rs       │         │          │
     │                        │   ● → [REDACTED]    │         │          │
     │                        │◀────────────────────│         │          │
     │                        │                     │         │          │
@@ -299,29 +299,32 @@
   FILE MAP
 
   vaultly/
-  ├── src/
-  │   ├── engine.ts         354 LOC   Core engine (shared CLI + MCP)
-  │   ├── index.ts          780 LOC   CLI: 18 cmds + 7 cf + 14 templates
-  │   ├── mcp-server.ts     409 LOC   MCP server: 16 agent tools
-  │   ├── vault.ts          230 LOC   Encrypted file storage
-  │   ├── policy.ts         139 LOC   Permissions, rate limits
-  │   ├── crypto.ts         122 LOC   AES-256-GCM + PBKDF2
-  │   ├── prompt.ts          98 LOC   Secure password input
-  │   ├── keychain.ts        93 LOC   macOS Keychain integration
-  │   └── scrubber.ts        74 LOC   Output secret redaction
-  │                                  ─────────
-  │                          3,261 LOC total
-  │
-  ├── worker/
-  │   ├── src/index.ts      Cloudflare Worker (zero-knowledge backup)
-  │   └── wrangler.toml     Worker config (KV binding)
+  ├── rust/
+  │   ├── Cargo.toml          Workspace: tokio, clap, serde, reqwest, aes-gcm
+  │   ├── crates/
+  │   │   ├── vaultly-core/    Core engine (shared CLI + MCP)
+  │   │   │   ├── engine.rs    1,177 LOC  VaultEngine: ops, run, CF API, audit
+  │   │   │   ├── vault.rs      319 LOC  Encrypted file storage
+  │   │   │   ├── policy.rs     313 LOC  Permissions, rate limits
+  │   │   │   ├── crypto.rs     235 LOC  AES-256-GCM + PBKDF2
+  │   │   │   ├── scrubber.rs   205 LOC  Output secret redaction
+  │   │   │   └── keychain.rs   114 LOC  macOS Keychain integration
+  │   │   ├── vaultly/          CLI + TUI + templates
+  │   │   │   ├── main.rs     1,125 LOC  CLI: 18 cmds + 7 cf + 14 templates
+  │   │   │   ├── tui.rs        471 LOC  Interactive menu (inquire)
+  │   │   │   ├── templates.rs  116 LOC  14 vault templates
+  │   │   │   └── prompt.rs      24 LOC  Secure password input
+  │   │   └── vaultly-mcp/      MCP server: 17 agent tools (JSON-RPC stdio)
+  │   │       └── lib.rs        677 LOC  Tool dispatch + e2e test
+  │   │                                  ─────────
+  │   │                          7,210 LOC total
+  │   └── tests/                46 tests (engine, CF mock server, MCP e2e)
   │
   ├── ARCHITECTURE.md       This file
   ├── AGENTS.md             Agent integration guide
   ├── README.md             Usage documentation
   ├── setup.sh              Interactive setup script
-  ├── package.json          3 deps: MCP SDK + commander + chalk
-  └── tsconfig.json         TypeScript config
+  └── LICENSE               MIT
 
 
  ═══════════════════════════════════════════════════════════════════════════
