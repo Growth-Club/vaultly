@@ -1,8 +1,10 @@
 //! Policy Engine — controls what each caller (agent or human) can do.
 //! Mirrors the TypeScript policy.ts.
 
+use crate::error::{VaultError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,7 +111,7 @@ struct RateLimitEntry {
 
 pub struct PolicyEngine {
     policies: HashMap<String, AgentPolicy>,
-    rate_limits: HashMap<String, RateLimitEntry>,
+    rate_limits: Mutex<HashMap<String, RateLimitEntry>>,
 }
 
 impl PolicyEngine {
@@ -128,7 +130,7 @@ impl PolicyEngine {
         );
         Self {
             policies,
-            rate_limits: HashMap::new(),
+            rate_limits: Mutex::new(HashMap::new()),
         }
     }
 
@@ -146,7 +148,12 @@ impl PolicyEngine {
     }
 
     /// Check if an operation is allowed. Err if denied.
-    pub fn check(&mut self, ctx: Option<&CallerContext>, op: Operation, vault_name: &str) -> Result<(), String> {
+    pub fn check(
+        &self,
+        ctx: Option<&CallerContext>,
+        op: Operation,
+        vault_name: &str,
+    ) -> Result<()> {
         // Humans can do everything (they have the password)
         let Some(ctx) = ctx else {
             return Ok(());
@@ -163,7 +170,7 @@ impl PolicyEngine {
             .cloned();
 
         let Some(policy) = policy else {
-            return Err(format!("No policy found for agent '{}'", agent_name));
+            return Err(VaultError::Policy(format!("No policy found for agent '{}'", agent_name)));
         };
 
         // Check operation permission
@@ -171,12 +178,15 @@ impl PolicyEngine {
             AllowedOperations::All => {}
             AllowedOperations::List(ops) => {
                 if !ops.contains(&op) {
-                    return Err(format!(
+                    return Err(VaultError::Policy(format!(
                         "🚫 Permission denied: agent '{}' cannot perform '{}'. Allowed: {}",
                         agent_name,
                         op.as_str(),
-                        ops.iter().map(|o| o.as_str()).collect::<Vec<_>>().join(", ")
-                    ));
+                        ops.iter()
+                            .map(|o| o.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )));
                 }
             }
         }
@@ -184,12 +194,12 @@ impl PolicyEngine {
         // Check vault permission
         if let AllowedVaults::List(vaults) = &policy.allowed_vaults {
             if vault_name != "*" && !vaults.iter().any(|v| v == vault_name) {
-                return Err(format!(
+                return Err(VaultError::Policy(format!(
                     "🚫 Permission denied: agent '{}' cannot access vault '{}'. Allowed: {}",
                     agent_name,
                     vault_name,
                     vaults.join(", ")
-                ));
+                )));
             }
         }
 
@@ -198,15 +208,19 @@ impl PolicyEngine {
         Ok(())
     }
 
-    fn check_rate_limit(&mut self, agent_name: &str, max_per_minute: u32) -> Result<(), String> {
+    fn check_rate_limit(&self, agent_name: &str, max_per_minute: u32) -> Result<()> {
         let now = Instant::now();
-        let entry = self.rate_limits.get_mut(agent_name);
+        let mut limits = self.rate_limits.lock().unwrap();
+        let entry = limits.get_mut(agent_name);
 
         match entry {
             None => {
-                self.rate_limits.insert(
+                limits.insert(
                     agent_name.to_string(),
-                    RateLimitEntry { count: 1, window_start: now },
+                    RateLimitEntry {
+                        count: 1,
+                        window_start: now,
+                    },
                 );
                 Ok(())
             }
@@ -216,10 +230,10 @@ impl PolicyEngine {
                     e.window_start = now;
                     Ok(())
                 } else if e.count >= max_per_minute {
-                    Err(format!(
+                    Err(VaultError::RateLimit(format!(
                         "🚫 Rate limit exceeded: agent '{}' has made {} operations in the last minute (max: {}). Slow down.",
                         agent_name, e.count, max_per_minute
-                    ))
+                    )))
                 } else {
                     e.count += 1;
                     Ok(())
@@ -249,8 +263,12 @@ mod tests {
 
     #[test]
     fn humans_can_do_everything() {
-        let mut p = PolicyEngine::new();
-        let human = CallerContext { caller: Caller::Human, agent_name: None, session_id: None };
+        let p = PolicyEngine::new();
+        let human = CallerContext {
+            caller: Caller::Human,
+            agent_name: None,
+            session_id: None,
+        };
         assert!(p.check(Some(&human), Operation::ReadValue, "any").is_ok());
         assert!(p.check(Some(&human), Operation::DeleteVault, "any").is_ok());
         assert!(p.check(Some(&human), Operation::Admin, "any").is_ok());
@@ -259,9 +277,13 @@ mod tests {
 
     #[test]
     fn agents_cannot_read_values_by_default() {
-        let mut p = PolicyEngine::new();
-        assert!(p.check(Some(&agent("a")), Operation::ReadValue, "v").is_err());
-        assert!(p.check(Some(&agent("a")), Operation::DeleteVault, "v").is_err());
+        let p = PolicyEngine::new();
+        assert!(p
+            .check(Some(&agent("a")), Operation::ReadValue, "v")
+            .is_err());
+        assert!(p
+            .check(Some(&agent("a")), Operation::DeleteVault, "v")
+            .is_err());
         assert!(p.check(Some(&agent("a")), Operation::Admin, "v").is_err());
         assert!(p.check(Some(&agent("a")), Operation::List, "v").is_ok());
         assert!(p.check(Some(&agent("a")), Operation::Write, "v").is_ok());
@@ -282,33 +304,43 @@ mod tests {
                 created_at: String::new(),
             }),
         );
-        assert!(p.check(Some(&agent("limited")), Operation::List, "github").is_ok());
-        assert!(p.check(Some(&agent("limited")), Operation::List, "aws").is_err());
+        assert!(p
+            .check(Some(&agent("limited")), Operation::List, "github")
+            .is_ok());
+        assert!(p
+            .check(Some(&agent("limited")), Operation::List, "aws")
+            .is_err());
     }
 
     #[test]
     fn rate_limiting_blocks_after_max() {
-        let mut p = PolicyEngine::new();
+        let p = PolicyEngine::new();
         let a = agent("busy");
         for _ in 0..60 {
             assert!(p.check(Some(&a), Operation::List, "v").is_ok());
         }
         let err = p.check(Some(&a), Operation::List, "v").unwrap_err();
-        assert!(err.contains("Rate limit exceeded"));
+        assert!(err.to_string().contains("Rate limit exceeded"));
     }
 
     #[test]
     fn unknown_agent_falls_back_to_default_policy() {
-        let mut p = PolicyEngine::new();
-        assert!(p.check(Some(&agent("stranger")), Operation::List, "v").is_ok());
-        assert!(p.check(Some(&agent("stranger")), Operation::ReadValue, "v").is_err());
+        let p = PolicyEngine::new();
+        assert!(p
+            .check(Some(&agent("stranger")), Operation::List, "v")
+            .is_ok());
+        assert!(p
+            .check(Some(&agent("stranger")), Operation::ReadValue, "v")
+            .is_err());
     }
 
     #[test]
     fn error_message_lists_allowed_ops() {
-        let mut p = PolicyEngine::new();
-        let err = p.check(Some(&agent("a")), Operation::ReadValue, "v").unwrap_err();
-        assert!(err.contains("read_value"));
-        assert!(err.contains("allowed") || err.contains("Allowed"));
+        let p = PolicyEngine::new();
+        let err = p
+            .check(Some(&agent("a")), Operation::ReadValue, "v")
+            .unwrap_err();
+        assert!(err.to_string().contains("read_value"));
+        assert!(err.to_string().contains("allowed") || err.to_string().contains("Allowed"));
     }
 }

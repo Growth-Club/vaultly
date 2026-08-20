@@ -3,10 +3,12 @@
 
 pub mod crypto;
 pub mod engine;
+pub mod error;
 pub mod keychain;
 pub mod policy;
 pub mod scrubber;
 pub mod vault;
 
 pub use engine::{ApiResult, RunResult, VaultEngine};
+pub use error::VaultError;
 pub use policy::CallerContext;

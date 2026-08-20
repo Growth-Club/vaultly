@@ -30,12 +30,17 @@ pub fn store_in_keychain(password: &str) -> bool {
     if !is_keychain_available() {
         return false;
     }
-    // Delete existing entry first (ignore errors)
     let _ = Command::new("security")
-        .args(["delete-generic-password", "-s", SERVICE_NAME, "-a", ACCOUNT_NAME])
+        .args([
+            "delete-generic-password",
+            "-s",
+            SERVICE_NAME,
+            "-a",
+            ACCOUNT_NAME,
+        ])
         .output();
 
-    Command::new("security")
+    let stored = Command::new("security")
         .args([
             "add-generic-password",
             "-s",
@@ -50,7 +55,13 @@ pub fn store_in_keychain(password: &str) -> bool {
         ])
         .output()
         .map(|o| o.status.success())
-        .unwrap_or(false)
+        .unwrap_or(false);
+
+    if !stored {
+        return false;
+    }
+
+    get_from_keychain().as_deref() == Some(password)
 }
 
 /// Retrieve the master password from Keychain
@@ -59,7 +70,14 @@ pub fn get_from_keychain() -> Option<String> {
         return None;
     }
     let out = Command::new("security")
-        .args(["find-generic-password", "-s", SERVICE_NAME, "-a", ACCOUNT_NAME, "-w"])
+        .args([
+            "find-generic-password",
+            "-s",
+            SERVICE_NAME,
+            "-a",
+            ACCOUNT_NAME,
+            "-w",
+        ])
         .output()
         .ok()?;
     if out.status.success() {
@@ -80,7 +98,13 @@ pub fn delete_from_keychain() -> bool {
         return false;
     }
     Command::new("security")
-        .args(["delete-generic-password", "-s", SERVICE_NAME, "-a", ACCOUNT_NAME])
+        .args([
+            "delete-generic-password",
+            "-s",
+            SERVICE_NAME,
+            "-a",
+            ACCOUNT_NAME,
+        ])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -92,7 +116,13 @@ pub fn keychain_entry_exists() -> bool {
         return false;
     }
     Command::new("security")
-        .args(["find-generic-password", "-s", SERVICE_NAME, "-a", ACCOUNT_NAME])
+        .args([
+            "find-generic-password",
+            "-s",
+            SERVICE_NAME,
+            "-a",
+            ACCOUNT_NAME,
+        ])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)

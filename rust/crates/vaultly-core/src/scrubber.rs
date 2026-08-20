@@ -72,11 +72,15 @@ pub fn scrub_output(output: &str, secret_values: &[String]) -> String {
         // 4. Quoted versions: "value" and 'value'
         let quoted = format!("\"{}\"", escape_regex(value));
         if let Ok(re) = Regex::new(&quoted) {
-            scrubbed = re.replace_all(&scrubbed, format!("\"{}\"", REDACTED)).to_string();
+            scrubbed = re
+                .replace_all(&scrubbed, format!("\"{}\"", REDACTED))
+                .to_string();
         }
         let quoted = format!("'{}'", escape_regex(value));
         if let Ok(re) = Regex::new(&quoted) {
-            scrubbed = re.replace_all(&scrubbed, format!("'{}'", REDACTED)).to_string();
+            scrubbed = re
+                .replace_all(&scrubbed, format!("'{}'", REDACTED))
+                .to_string();
         }
 
         // 5. For long values, also catch partial leaks (first 8 + last 8 chars)
@@ -166,7 +170,11 @@ mod tests {
     fn prefix_suffix_partial_leak() {
         let secret = "sk-live-0123456789abcdefghijklmnop";
         // Leak: first 8 + middle + last 8
-        let leak = format!("{}middle-chars{}", &secret[..8], &secret[secret.len() - 8..]);
+        let leak = format!(
+            "{}middle-chars{}",
+            &secret[..8],
+            &secret[secret.len() - 8..]
+        );
         let out = scrub_output(&leak, &[s(secret)]);
         assert!(!out.contains(&secret[..8]));
         assert!(out.contains(REDACTED));
@@ -175,7 +183,7 @@ mod tests {
     #[test]
     fn interior_fragment_leak() {
         let secret = "abcdefghijklmnopqrstuvwxyz0123456789"; // >20, no whitespace
-        // Only the middle ~20 chars leak (no prefix/suffix match possible)
+                                                             // Only the middle ~20 chars leak (no prefix/suffix match possible)
         let middle = &secret[10..30];
         let out = scrub_output(&format!("leak: {}", middle), &[s(secret)]);
         assert!(!out.contains(middle));

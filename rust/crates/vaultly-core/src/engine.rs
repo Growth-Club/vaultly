@@ -11,6 +11,7 @@ use serde_json::{Map, Value};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command as TokioCommand;
 
+use crate::error::{VaultError, Result};
 use crate::policy::{CallerContext, Operation, PolicyEngine};
 use crate::scrubber::scrub_output;
 use crate::vault::VaultStore;
@@ -113,7 +114,7 @@ impl VaultEngine {
         }
     }
 
-    pub fn unlock(&mut self, password: &str) -> Result<(), String> {
+    pub fn unlock(&mut self, password: &str) -> Result<()> {
         let key = self.store.unlock(password)?;
         self.key = Some(key);
         self.unlocked_at = Some(Instant::now());
@@ -134,18 +135,25 @@ impl VaultEngine {
     pub fn kill(&mut self, ctx: Option<&CallerContext>) {
         self.lock(ctx);
         crate::keychain::delete_from_keychain();
-        self.audit("KILL", "🚨 Killswitch activated — vault locked, keychain cleared", ctx);
+        self.audit(
+            "KILL",
+            "🚨 Killswitch activated — vault locked, keychain cleared",
+            ctx,
+        );
     }
 
-    fn require_unlocked(&self) -> Result<&[u8], String> {
+    fn require_unlocked(&self) -> Result<&[u8]> {
         let unlocked = self.key.is_some()
-            && self.unlocked_at.map(|at| at.elapsed() <= self.session_ttl).unwrap_or(false);
+            && self
+                .unlocked_at
+                .map(|at| at.elapsed() <= self.session_ttl)
+                .unwrap_or(false);
         if !unlocked {
             let expired = self.unlocked_at.is_some();
             return Err(if expired {
-                "Vault is locked. Session expired. Unlock first.".into()
+                VaultError::SessionExpired
             } else {
-                "Vault is locked. Unlock first.".into()
+                VaultError::Locked
             });
         }
         Ok(self.key.as_ref().unwrap())
@@ -153,47 +161,87 @@ impl VaultEngine {
 
     // ─── Vault Operations ─────────────────────────────────
 
-    pub fn list_vaults(&mut self, ctx: Option<&CallerContext>) -> Result<Vec<String>, String> {
+    pub fn list_vaults(&mut self, ctx: Option<&CallerContext>) -> Result<Vec<String>> {
         self.policy.check(ctx, Operation::List, "*")?;
         let vaults = self.store.list_vaults();
         self.audit("LIST_VAULTS", &format!("{} vaults", vaults.len()), ctx);
         Ok(vaults)
     }
 
-    pub fn list_keys(&mut self, vault_name: &str, ctx: Option<&CallerContext>) -> Result<Vec<String>, String> {
+    pub fn list_keys(
+        &mut self,
+        vault_name: &str,
+        ctx: Option<&CallerContext>,
+    ) -> Result<Vec<String>> {
         self.policy.check(ctx, Operation::ReadKeys, vault_name)?;
         let key = self.require_unlocked()?.to_vec();
         let keys = self.store.list_keys(vault_name, &key)?;
-        self.audit("LIST_KEYS", &format!("{}: {} keys", vault_name, keys.len()), ctx);
+        self.audit(
+            "LIST_KEYS",
+            &format!("{}: {} keys", vault_name, keys.len()),
+            ctx,
+        );
         Ok(keys)
     }
 
     /// WRITE-ONLY: store a secret. Cannot read back (for agents).
-    pub fn add_secret(&mut self, vault_name: &str, secret_key: &str, value: &str, ctx: Option<&CallerContext>) -> Result<(), String> {
+    pub fn add_secret(
+        &mut self,
+        vault_name: &str,
+        secret_key: &str,
+        value: &str,
+        ctx: Option<&CallerContext>,
+    ) -> Result<()> {
         self.policy.check(ctx, Operation::Write, vault_name)?;
         let key = self.require_unlocked()?.to_vec();
         self.store.set_secret(vault_name, secret_key, value, &key)?;
-        self.audit("ADD", &format!("{}/{} (value hidden)", vault_name, secret_key), ctx);
+        self.audit(
+            "ADD",
+            &format!("{}/{} (value hidden)", vault_name, secret_key),
+            ctx,
+        );
         Ok(())
     }
 
-    pub fn delete_secret(&mut self, vault_name: &str, secret_key: &str, ctx: Option<&CallerContext>) -> Result<bool, String> {
+    pub fn delete_secret(
+        &mut self,
+        vault_name: &str,
+        secret_key: &str,
+        ctx: Option<&CallerContext>,
+    ) -> Result<bool> {
         self.policy.check(ctx, Operation::Delete, vault_name)?;
         let key = self.require_unlocked()?.to_vec();
         let deleted = self.store.delete_secret(vault_name, secret_key, &key)?;
-        self.audit("DELETE", &format!("{}/{} success={}", vault_name, secret_key, deleted), ctx);
+        self.audit(
+            "DELETE",
+            &format!("{}/{} success={}", vault_name, secret_key, deleted),
+            ctx,
+        );
         Ok(deleted)
     }
 
-    pub fn delete_vault(&mut self, vault_name: &str, ctx: Option<&CallerContext>) -> Result<bool, String> {
+    pub fn delete_vault(
+        &mut self,
+        vault_name: &str,
+        ctx: Option<&CallerContext>,
+    ) -> Result<bool> {
         self.policy.check(ctx, Operation::DeleteVault, vault_name)?;
         let deleted = self.store.delete_vault(vault_name)?;
-        self.audit("DELETE_VAULT", &format!("{} success={}", vault_name, deleted), ctx);
+        self.audit(
+            "DELETE_VAULT",
+            &format!("{} success={}", vault_name, deleted),
+            ctx,
+        );
         Ok(deleted)
     }
 
     /// Read a raw secret value. Human-only — agents are blocked by policy (read_value).
-    pub fn get_secret_value(&mut self, vault_name: &str, secret_key: &str, ctx: Option<&CallerContext>) -> Result<String, String> {
+    pub fn get_secret_value(
+        &mut self,
+        vault_name: &str,
+        secret_key: &str,
+        ctx: Option<&CallerContext>,
+    ) -> Result<String> {
         self.policy.check(ctx, Operation::ReadValue, vault_name)?;
         let key = self.require_unlocked()?.to_vec();
         let value = self.store.get_secret(vault_name, secret_key, &key)?;
@@ -202,7 +250,7 @@ impl VaultEngine {
                 self.audit("GET", &format!("{}/{}", vault_name, secret_key), ctx);
                 Ok(v)
             }
-            None => Err(format!("'{}' not found in '{}'.", secret_key, vault_name)),
+            None => Err(VaultError::SecretNotFound(secret_key.to_string(), vault_name.to_string())),
         }
     }
 
@@ -211,7 +259,7 @@ impl VaultEngine {
         vault_name: &str,
         entries: &Map<String, Value>,
         ctx: Option<&CallerContext>,
-    ) -> Result<usize, String> {
+    ) -> Result<usize> {
         self.policy.check(ctx, Operation::Write, vault_name)?;
         let key = self.require_unlocked()?.to_vec();
         let count = self.store.import_secrets(vault_name, entries, &key)?;
@@ -224,7 +272,7 @@ impl VaultEngine {
         &mut self,
         vault_name: &str,
         ctx: Option<&CallerContext>,
-    ) -> Result<Map<String, Value>, String> {
+    ) -> Result<Map<String, Value>> {
         self.policy.check(ctx, Operation::ReadValue, vault_name)?;
         self.read_secrets(vault_name)
     }
@@ -232,7 +280,7 @@ impl VaultEngine {
     /// Internal: read secrets for injection/CF calls.
     /// No read_value check — callers (run, cf_api, ...) already gate on their
     /// own policy operation, and agents are allowed to use values downstream.
-    fn read_secrets(&mut self, vault_name: &str) -> Result<Map<String, Value>, String> {
+    fn read_secrets(&mut self, vault_name: &str) -> Result<Map<String, Value>> {
         let key = self.require_unlocked()?.to_vec();
         self.store.get_secrets(vault_name, &key)
     }
@@ -247,9 +295,10 @@ impl VaultEngine {
         cwd: Option<&str>,
         timeout_ms: Option<u64>,
         ctx: Option<&CallerContext>,
-    ) -> Result<RunResult, String> {
+    ) -> Result<RunResult> {
         self.policy.check(ctx, Operation::Run, vault_name)?;
 
+        let vault_exists = self.store.vault_exists(vault_name)?;
         let secrets = self.read_secrets(vault_name)?;
         let secret_keys: Vec<String> = secrets.keys().cloned().collect();
         let secret_values: Vec<String> = secrets
@@ -259,12 +308,22 @@ impl VaultEngine {
             .collect();
 
         if secret_keys.is_empty() {
-            return Err(format!("Vault '{}' is empty or doesn't exist.", vault_name));
+            return Err(if vault_exists {
+                VaultError::VaultEmpty(vault_name.to_string())
+            } else {
+                VaultError::VaultNotFound(vault_name.to_string())
+            });
         }
 
         self.audit(
             "RUN",
-            &format!("vault={} cmd=\"{} {}\" secrets=[{}]", vault_name, command, args.join(" "), secret_keys.join(",")),
+            &format!(
+                "vault={} cmd=\"{} {}\" secrets=[{}]",
+                vault_name,
+                command,
+                args.join(" "),
+                secret_keys.join(",")
+            ),
             ctx,
         );
 
@@ -274,7 +333,13 @@ impl VaultEngine {
             .collect();
 
         let result = self
-            .spawn(command, args, &env, cwd, timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS))
+            .spawn(
+                command,
+                args,
+                &env,
+                cwd,
+                timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS),
+            )
             .await?;
 
         // SCRUB secret values from output before returning
@@ -283,7 +348,11 @@ impl VaultEngine {
         let was_scrubbed = scrubbed_stdout != result.stdout || scrubbed_stderr != result.stderr;
 
         if was_scrubbed {
-            self.audit("SCRUB", &format!("Scrubbed secret values from output of: {}", command), ctx);
+            self.audit(
+                "SCRUB",
+                &format!("Scrubbed secret values from output of: {}", command),
+                ctx,
+            );
         }
 
         Ok(RunResult {
@@ -303,13 +372,15 @@ impl VaultEngine {
         cwd: Option<&str>,
         timeout_ms: Option<u64>,
         ctx: Option<&CallerContext>,
-    ) -> Result<RunResult, String> {
-        let parts = shell_words::split(command_str).unwrap_or_else(|_| vec![command_str.to_string()]);
+    ) -> Result<RunResult> {
+        let parts =
+            shell_words::split(command_str).unwrap_or_else(|_| vec![command_str.to_string()]);
         let (cmd, args) = match parts.split_first() {
             Some((c, rest)) => (c.clone(), rest.to_vec()),
-            None => return Err("Empty command".into()),
+            None => return Err(VaultError::CommandSpawn(String::new(), "Empty command".into())),
         };
-        self.run(vault_name, &cmd, &args, cwd, timeout_ms, ctx).await
+        self.run(vault_name, &cmd, &args, cwd, timeout_ms, ctx)
+            .await
     }
 
     // ─── Spawn (timeout + output cap) ─────────────────────
@@ -321,7 +392,8 @@ impl VaultEngine {
         env: &[(String, String)],
         cwd: Option<&str>,
         timeout_ms: u64,
-    ) -> Result<RunResult, String> {
+    ) -> Result<RunResult> {
+        let injected_keys: Vec<String> = env.iter().map(|(k, _)| k.clone()).collect();
         let mut child = TokioCommand::new(command);
         child
             .args(args)
@@ -333,7 +405,9 @@ impl VaultEngine {
             child.current_dir(dir);
         }
 
-        let mut child = child.spawn().map_err(|e| format!("Failed to start '{}': {}", command, e))?;
+        let mut child = child
+            .spawn()
+            .map_err(|e| VaultError::Policy(format!("Failed to start '{}': {}", command, e)))?;
         let mut stdout = child.stdout.take().expect("stdout piped");
         let mut stderr = child.stderr.take().expect("stderr piped");
 
@@ -357,7 +431,7 @@ impl VaultEngine {
                     stdout: fmt_buf(out, out_trunc),
                     stderr,
                     code: 124,
-                    secrets_injected: vec![],
+                    secrets_injected: injected_keys,
                     scrubbed: false,
                 });
             }
@@ -370,14 +444,17 @@ impl VaultEngine {
             stdout: fmt_buf(out, out_trunc),
             stderr: fmt_buf(err, err_trunc),
             code: status.ok().and_then(|s| s.code()).unwrap_or(0),
-            secrets_injected: vec![],
+            secrets_injected: injected_keys,
             scrubbed: false,
         })
     }
 
     // ─── Cloudflare API ───────────────────────────────────
 
-    fn build_cf_headers(vault_name: &str, secrets: &Map<String, Value>) -> Result<reqwest::header::HeaderMap, String> {
+    fn build_cf_headers(
+        vault_name: &str,
+        secrets: &Map<String, Value>,
+    ) -> Result<reqwest::header::HeaderMap> {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             reqwest::header::CONTENT_TYPE,
@@ -390,30 +467,52 @@ impl VaultEngine {
         if let Some(token) = token {
             headers.insert(
                 reqwest::header::AUTHORIZATION,
-                reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token)).map_err(|e| e.to_string())?,
+                reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token))
+                    .map_err(|e| VaultError::Policy(e.to_string()))?,
             );
             return Ok(headers);
         }
         if let (Some(email), Some(api_key)) = (email, api_key) {
-            headers.insert("X-Auth-Email", reqwest::header::HeaderValue::from_str(email).map_err(|e| e.to_string())?);
-            headers.insert("X-Auth-Key", reqwest::header::HeaderValue::from_str(api_key).map_err(|e| e.to_string())?);
+            headers.insert(
+                "X-Auth-Email",
+                reqwest::header::HeaderValue::from_str(email).map_err(|e| VaultError::Policy(e.to_string()))?,
+            );
+            headers.insert(
+                "X-Auth-Key",
+                reqwest::header::HeaderValue::from_str(api_key).map_err(|e| VaultError::Policy(e.to_string()))?,
+            );
             return Ok(headers);
         }
 
         let found: Vec<String> = secrets.keys().cloned().collect();
-        let found = if found.is_empty() { "(empty)".to_string() } else { found.join(", ") };
-        Err(format!(
-            "No Cloudflare credentials in '{}'. Need either CLOUDFLARE_API_TOKEN (API token) or CLOUDFLARE_EMAIL + CLOUDFLARE_API_KEY (global key). Found: {}",
-            vault_name, found
+        let found = if found.is_empty() {
+            "(empty)".to_string()
+        } else {
+            found.join(", ")
+        };
+        let hint = if token.is_none() && email.is_none() {
+            "Need CLOUDFLARE_API_TOKEN".to_string()
+        } else if token.is_none() {
+            "Need CLOUDFLARE_API_KEY (email present but key missing)".to_string()
+        } else {
+            "Need CLOUDFLARE_EMAIL (key present but email missing)".to_string()
+        };
+        Err(VaultError::CloudflareCredentials(
+            vault_name.to_string(),
+            format!("{} Found: {}", hint, found),
         ))
     }
 
     fn cf_secret_values(secrets: &Map<String, Value>) -> Vec<String> {
-        ["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_EMAIL", "CLOUDFLARE_API_KEY"]
-            .iter()
-            .filter_map(|k| secrets.get(*k).and_then(|v| v.as_str()))
-            .map(|s| s.to_string())
-            .collect()
+        [
+            "CLOUDFLARE_API_TOKEN",
+            "CLOUDFLARE_EMAIL",
+            "CLOUDFLARE_API_KEY",
+        ]
+        .iter()
+        .filter_map(|k| secrets.get(*k).and_then(|v| v.as_str()))
+        .map(|s| s.to_string())
+        .collect()
     }
 
     pub async fn cloudflare_api(
@@ -423,28 +522,44 @@ impl VaultEngine {
         api_path: &str,
         body: Option<Value>,
         ctx: Option<&CallerContext>,
-    ) -> Result<ApiResult, String> {
+    ) -> Result<ApiResult> {
         self.policy.check(ctx, Operation::CfApi, vault_name)?;
         let secrets = self.read_secrets(vault_name)?;
         let headers = Self::build_cf_headers(vault_name, &secrets)?;
 
-        self.audit("CF_API", &format!("{} {} (vault={})", method, api_path, vault_name), ctx);
+        self.audit(
+            "CF_API",
+            &format!("{} {} (vault={})", method, api_path, vault_name),
+            ctx,
+        );
 
         let url = format!("{}{}", self.cf_base, api_path);
         let client = reqwest::Client::new();
-        let mut req = client.request(reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| e.to_string())?, &url);
+        let mut req = client.request(
+            reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| VaultError::Policy(e.to_string()))?,
+            &url,
+        );
         req = req.headers(headers);
         if let Some(b) = body {
             req = req.json(&b);
         }
 
-        let res = req.send().await.map_err(|e| format!("Cloudflare request failed: {}", e))?;
+        let res = req
+            .send()
+            .await
+            .map_err(|e| VaultError::Policy(format!("Cloudflare request failed: {}", e)))?;
         let status = res.status().as_u16();
-        let data: Value = res.json().await.map_err(|e| format!("Invalid response: {}", e))?;
+        let data: Value = res
+            .json()
+            .await
+            .map_err(|e| VaultError::Policy(format!("Invalid response: {}", e)))?;
 
         // Scrub credentials from response (in case they're echoed back)
-        let scrubbed = scrub_output(&serde_json::to_string_pretty(&data).unwrap_or_default(), &Self::cf_secret_values(&secrets));
-        let data: Value = serde_json::from_str(&scrubbed).unwrap_or(Value::Null);
+        let scrubbed = scrub_output(
+            &serde_json::to_string_pretty(&data).unwrap_or_default(),
+            &Self::cf_secret_values(&secrets),
+        );
+        let data: Value = serde_json::from_str(&scrubbed).unwrap_or(data);
 
         Ok(ApiResult { status, data })
     }
@@ -455,21 +570,26 @@ impl VaultEngine {
         &mut self,
         vault_name: &str,
         ctx: Option<&CallerContext>,
-    ) -> Result<(String, Vec<String>), String> {
+    ) -> Result<(String, Vec<String>)> {
         self.policy.check(ctx, Operation::CfApi, vault_name)?;
         let secrets = self.read_secrets(vault_name)?;
         let headers = Self::build_cf_headers(vault_name, &secrets)?;
         let account_id = secrets
             .get("CLOUDFLARE_ACCOUNT_ID")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| format!(
-                "No CLOUDFLARE_ACCOUNT_ID in '{}'. Found: {}",
-                vault_name,
-                secrets.keys().cloned().collect::<Vec<_>>().join(", ")
-            ))?
+            .ok_or_else(|| {
+                VaultError::MissingAccountId(
+                    vault_name.to_string(),
+                    secrets.keys().cloned().collect::<Vec<_>>().join(", "),
+                )
+            })?
             .to_string();
 
-        self.audit("CF_WORKERS", &format!("list workers (vault={})", vault_name), ctx);
+        self.audit(
+            "CF_WORKERS",
+            &format!("list workers (vault={})", vault_name),
+            ctx,
+        );
 
         let url = format!(
             "{}/accounts/{}/workers/scripts",
@@ -477,9 +597,13 @@ impl VaultEngine {
             urlencode(&account_id)
         );
         let client = reqwest::Client::new();
-        let res = client.get(&url).headers(headers).send().await.map_err(|e| e.to_string())?;
-        let data: Value = res.json().await.map_err(|e| e.to_string())?;
-
+        let res = client
+            .get(&url)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|e| VaultError::Policy(e.to_string()))?;
+        let data: Value = res.json().await.map_err(|e| VaultError::Policy(e.to_string()))?;
         let workers: Vec<String> = data
             .get("result")
             .and_then(|r| r.as_array())
@@ -504,14 +628,14 @@ impl VaultEngine {
         name: Option<&str>,
         value: Option<&str>,
         ctx: Option<&CallerContext>,
-    ) -> Result<ApiResult, String> {
+    ) -> Result<ApiResult> {
         self.policy.check(ctx, Operation::CfApi, vault_name)?;
 
         if action != "list" && name.is_none() {
-            return Err(format!("'name' is required for worker secret {}.", action));
+            return Err(VaultError::RequiredField("name".into(), action.into()));
         }
         if action == "set" && value.is_none() {
-            return Err("'value' is required for worker secret set.".into());
+            return Err(VaultError::RequiredField("value".into(), "set".into()));
         }
 
         let secrets = self.read_secrets(vault_name)?;
@@ -519,16 +643,23 @@ impl VaultEngine {
         let account_id = secrets
             .get("CLOUDFLARE_ACCOUNT_ID")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| format!(
-                "No CLOUDFLARE_ACCOUNT_ID in '{}'. Found: {}",
-                vault_name,
-                secrets.keys().cloned().collect::<Vec<_>>().join(", ")
-            ))?
+            .ok_or_else(|| {
+                VaultError::MissingAccountId(
+                    vault_name.to_string(),
+                    secrets.keys().cloned().collect::<Vec<_>>().join(", "),
+                )
+            })?
             .to_string();
 
         self.audit(
             "CF_SECRETS",
-            &format!("{} {}{} (vault={})", action, script_name, name.map(|n| format!("/{}", n)).unwrap_or_default(), vault_name),
+            &format!(
+                "{} {}{} (vault={})",
+                action,
+                script_name,
+                name.map(|n| format!("/{}", n)).unwrap_or_default(),
+                vault_name
+            ),
             ctx,
         );
 
@@ -541,25 +672,41 @@ impl VaultEngine {
         let client = reqwest::Client::new();
 
         let res = match action {
-            "list" => client.get(&base).headers(headers).send().await.map_err(|e| e.to_string())?,
+            "list" => client
+                .get(&base)
+                .headers(headers)
+                .send()
+                .await
+                .map_err(|e| VaultError::Policy(e.to_string()))?,
             "set" => {
                 let body = serde_json::json!({ "name": name.unwrap(), "text": value.unwrap() });
-                client.put(&base).headers(headers).json(&body).send().await.map_err(|e| e.to_string())?
+                client
+                    .put(&base)
+                    .headers(headers)
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|e| e.to_string())?
             }
             "delete" => {
                 let url = format!("{}/{}", base, urlencode(name.unwrap()));
-                client.delete(&url).headers(headers).send().await.map_err(|e| e.to_string())?
+                client
+                    .delete(&url)
+                    .headers(headers)
+                    .send()
+                    .await
+                    .map_err(|e| e.to_string())?
             }
-            other => return Err(format!("Unknown worker secret action: {}", other)),
+            other => return Err(VaultError::UnknownSecretAction(other.to_string())),
         };
 
         let status = res.status().as_u16();
-        let data: Value = res.json().await.map_err(|e| e.to_string())?;
+        let data: Value = res.json().await.map_err(|e| VaultError::Policy(e.to_string()))?;
         let scrubbed = scrub_output(
             &serde_json::to_string_pretty(&data).unwrap_or_default(),
             &Self::cf_secret_values(&secrets),
         );
-        let data: Value = serde_json::from_str(&scrubbed).unwrap_or(Value::Null);
+        let data: Value = serde_json::from_str(&scrubbed).unwrap_or(data);
 
         Ok(ApiResult { status, data })
     }
@@ -570,7 +717,7 @@ impl VaultEngine {
         &mut self,
         vault_name: &str,
         ctx: Option<&CallerContext>,
-    ) -> Result<(bool, String), String> {
+    ) -> Result<(bool, String)> {
         self.policy.check(ctx, Operation::CfApi, vault_name)?;
         let secrets = self.read_secrets(vault_name)?;
         let token = secrets.get("CLOUDFLARE_API_TOKEN").and_then(|v| v.as_str());
@@ -588,23 +735,32 @@ impl VaultEngine {
         }
 
         let result = if token.is_some() {
-            self.cloudflare_api(vault_name, "GET", "/user/tokens/verify", None, ctx).await
+            self.cloudflare_api(vault_name, "GET", "/user/tokens/verify", None, ctx)
+                .await
         } else {
-            self.cloudflare_api(vault_name, "GET", "/user", None, ctx).await
+            self.cloudflare_api(vault_name, "GET", "/user", None, ctx)
+                .await
         };
 
         match result {
             Ok(r) => {
                 let data = &r.data;
                 if token.is_some() {
-                    let status = data.get("result").and_then(|x| x.get("status")).and_then(|s| s.as_str()).unwrap_or("unknown");
+                    let status = data
+                        .get("result")
+                        .and_then(|x| x.get("status"))
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("unknown");
                     if status == "active" {
                         Ok((true, "Token is active and valid ✓".to_string()))
                     } else {
                         Ok((false, format!("Token status: {}", status)))
                     }
                 } else {
-                    let ok = data.get("success").and_then(|s| s.as_bool()).unwrap_or(false);
+                    let ok = data
+                        .get("success")
+                        .and_then(|s| s.as_bool())
+                        .unwrap_or(false);
                     if ok {
                         let user = data
                             .get("result")
@@ -616,9 +772,24 @@ impl VaultEngine {
                         let msgs: Vec<String> = data
                             .get("errors")
                             .and_then(|e| e.as_array())
-                            .map(|arr| arr.iter().filter_map(|e| e.get("message").and_then(|m| m.as_str())).map(|s| s.to_string()).collect())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|e| e.get("message").and_then(|m| m.as_str()))
+                                    .map(|s| s.to_string())
+                                    .collect()
+                            })
                             .unwrap_or_default();
-                        Ok((false, format!("Global API key invalid: {}", if msgs.is_empty() { "unknown error".into() } else { msgs.join(", ") })))
+                        Ok((
+                            false,
+                            format!(
+                                "Global API key invalid: {}",
+                                if msgs.is_empty() {
+                                    "unknown error".into()
+                                } else {
+                                    msgs.join(", ")
+                                }
+                            ),
+                        ))
                     }
                 }
             }
@@ -632,13 +803,16 @@ impl VaultEngine {
         self.store.get_encrypted_vaults()
     }
 
-    pub fn restore_encrypted_vaults(&mut self, vaults: &Map<String, Value>) -> Result<usize, String> {
+    pub fn restore_encrypted_vaults(
+        &mut self,
+        vaults: &Map<String, Value>,
+    ) -> Result<usize> {
         let count = self.store.restore_encrypted_vaults(vaults)?;
         self.audit("RESTORE", &format!("{} vaults restored", count), None);
         Ok(count)
     }
 
-    pub fn update_backup_meta(&mut self, worker_url: &str) -> Result<(), String> {
+    pub fn update_backup_meta(&mut self, worker_url: &str) -> Result<()> {
         self.store.update_backup_meta(worker_url)
     }
 
@@ -650,7 +824,13 @@ impl VaultEngine {
             return vec![];
         };
         let entries: Vec<&str> = raw.lines().collect();
-        entries.iter().rev().take(lines).rev().map(|s| s.to_string()).collect()
+        entries
+            .iter()
+            .rev()
+            .take(lines)
+            .rev()
+            .map(|s| s.to_string())
+            .collect()
     }
 
     pub fn audit(&mut self, action: &str, detail: &str, ctx: Option<&CallerContext>) {
@@ -671,7 +851,12 @@ impl VaultEngine {
         if let Ok(json) = serde_json::to_string(&entry) {
             let path: PathBuf = self.store.audit_log_path();
             use std::io::Write;
-            if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).mode(0o600).open(&path) {
+            if let Ok(mut f) = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .open(&path)
+            {
                 let _ = writeln!(f, "{}", json);
             }
         }
@@ -730,7 +915,11 @@ mod tests {
     const PASSWORD: &str = "test-master-password";
 
     fn agent_ctx() -> CallerContext {
-        CallerContext { caller: Caller::Agent, agent_name: Some("test-agent".into()), session_id: None }
+        CallerContext {
+            caller: Caller::Agent,
+            agent_name: Some("test-agent".into()),
+            session_id: None,
+        }
     }
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -764,27 +953,48 @@ mod tests {
     #[tokio::test]
     async fn add_lists_and_deletes_secrets() {
         let (mut engine, _dir) = setup();
-        engine.add_secret("github", "GITHUB_TOKEN", "ghp_456", Some(&agent_ctx())).unwrap();
-        assert_eq!(engine.list_vaults(Some(&agent_ctx())).unwrap(), vec!["github"]);
-        assert_eq!(engine.list_keys("github", Some(&agent_ctx())).unwrap(), vec!["GITHUB_TOKEN"]);
-        assert!(engine.delete_secret("github", "GITHUB_TOKEN", Some(&agent_ctx())).unwrap());
-        assert_eq!(engine.list_keys("github", Some(&agent_ctx())).unwrap(), Vec::<String>::new());
+        engine
+            .add_secret("github", "GITHUB_TOKEN", "ghp_456", Some(&agent_ctx()))
+            .unwrap();
+        assert_eq!(
+            engine.list_vaults(Some(&agent_ctx())).unwrap(),
+            vec!["github"]
+        );
+        assert_eq!(
+            engine.list_keys("github", Some(&agent_ctx())).unwrap(),
+            vec!["GITHUB_TOKEN"]
+        );
+        assert!(engine
+            .delete_secret("github", "GITHUB_TOKEN", Some(&agent_ctx()))
+            .unwrap());
+        assert_eq!(
+            engine.list_keys("github", Some(&agent_ctx())).unwrap(),
+            Vec::<String>::new()
+        );
     }
 
     #[tokio::test]
     async fn agents_cannot_delete_vaults() {
         let (mut engine, _dir) = setup();
-        engine.add_secret("github", "K", "v", Some(&agent_ctx())).unwrap();
-        let err = engine.delete_vault("github", Some(&agent_ctx())).unwrap_err();
-        assert!(err.contains("Permission denied"));
+        engine
+            .add_secret("github", "K", "v", Some(&agent_ctx()))
+            .unwrap();
+        let err = engine
+            .delete_vault("github", Some(&agent_ctx()))
+            .unwrap_err();
+        assert!(err.to_string().contains("Permission denied"));
     }
 
     #[tokio::test]
     async fn agents_cannot_read_values() {
         let (mut engine, _dir) = setup();
-        engine.add_secret("github", "K", "v", Some(&agent_ctx())).unwrap();
-        let err = engine.get_secret_value("github", "K", Some(&agent_ctx())).unwrap_err();
-        assert!(err.contains("Permission denied"));
+        engine
+            .add_secret("github", "K", "v", Some(&agent_ctx()))
+            .unwrap();
+        let err = engine
+            .get_secret_value("github", "K", Some(&agent_ctx()))
+            .unwrap_err();
+        assert!(err.to_string().contains("Permission denied"));
         // Human can
         assert_eq!(engine.get_secret_value("github", "K", None).unwrap(), "v");
     }
@@ -792,7 +1002,9 @@ mod tests {
     #[tokio::test]
     async fn run_injects_secrets_and_scrubs_output() {
         let (mut engine, _dir) = setup();
-        engine.add_secret("runvault", "API_KEY", "inject-me-123", Some(&agent_ctx())).unwrap();
+        engine
+            .add_secret("runvault", "API_KEY", "inject-me-123", Some(&agent_ctx()))
+            .unwrap();
         let res = engine
             .run(
                 "runvault",
@@ -814,7 +1026,9 @@ mod tests {
     #[tokio::test]
     async fn timeout_kills_long_running_commands() {
         let (mut engine, _dir) = setup();
-        engine.add_secret("slow", "K", "v", Some(&agent_ctx())).unwrap();
+        engine
+            .add_secret("slow", "K", "v", Some(&agent_ctx()))
+            .unwrap();
         let res = engine
             .run(
                 "slow",
@@ -833,12 +1047,17 @@ mod tests {
     #[tokio::test]
     async fn output_capped_at_5mb() {
         let (mut engine, _dir) = setup();
-        engine.add_secret("big", "K", "v", Some(&agent_ctx())).unwrap();
+        engine
+            .add_secret("big", "K", "v", Some(&agent_ctx()))
+            .unwrap();
         let res = engine
             .run(
                 "big",
                 "sh",
-                &["-c".into(), "head -c 6000000 /dev/zero | tr '\\0' 'a'".into()],
+                &[
+                    "-c".into(),
+                    "head -c 6000000 /dev/zero | tr '\\0' 'a'".into(),
+                ],
                 None,
                 Some(30_000),
                 Some(&agent_ctx()),
@@ -853,7 +1072,9 @@ mod tests {
     #[tokio::test]
     async fn audit_logs_structured_entries() {
         let (mut engine, _dir) = setup();
-        engine.add_secret("github", "K", "SECRET-VALUE-9", Some(&agent_ctx())).unwrap();
+        engine
+            .add_secret("github", "K", "SECRET-VALUE-9", Some(&agent_ctx()))
+            .unwrap();
         let log = engine.get_audit_log(50);
         let joined = log.join("\n");
         assert!(joined.contains("\"action\":\"ADD\""));
@@ -893,7 +1114,10 @@ mod tests {
     /// Local HTTP server that captures one request and answers with canned JSON.
     async fn spawn_cf_server(
         resp_json: &str,
-    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<CapturedRequest>>>) {
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<CapturedRequest>>>,
+    ) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -978,29 +1202,57 @@ mod tests {
     async fn cf_sends_bearer_token_auth_when_token_present() {
         let (mut engine, _dir) = setup();
         engine
-            .add_secret("cf", "CLOUDFLARE_API_TOKEN", "cf-token-abcdef123456", Some(&agent_ctx()))
+            .add_secret(
+                "cf",
+                "CLOUDFLARE_API_TOKEN",
+                "cf-token-abcdef123456",
+                Some(&agent_ctx()),
+            )
             .unwrap();
         let (base, reqs) = spawn_cf_server(r#"{"success":true,"result":[]}"#).await;
         engine.cf_base = base;
 
-        let r = engine.cloudflare_api("cf", "GET", "/zones", None, Some(&agent_ctx())).await.unwrap();
+        let r = engine
+            .cloudflare_api("cf", "GET", "/zones", None, Some(&agent_ctx()))
+            .await
+            .unwrap();
         assert_eq!(r.status, 200);
         let req = &reqs.lock().unwrap()[0];
         assert_eq!(req.path, "/zones");
         assert_eq!(req.method, "GET");
-        assert_eq!(req.header("authorization"), Some("Bearer cf-token-abcdef123456"));
+        assert_eq!(
+            req.header("authorization"),
+            Some("Bearer cf-token-abcdef123456")
+        );
         assert!(req.header("x-auth-email").is_none());
     }
 
     #[tokio::test]
     async fn cf_sends_global_key_auth_when_present() {
         let (mut engine, _dir) = setup();
-        engine.add_secret("cf", "CLOUDFLARE_EMAIL", "admin@example.com", Some(&agent_ctx())).unwrap();
-        engine.add_secret("cf", "CLOUDFLARE_API_KEY", "cf-global-key-secret", Some(&agent_ctx())).unwrap();
+        engine
+            .add_secret(
+                "cf",
+                "CLOUDFLARE_EMAIL",
+                "admin@example.com",
+                Some(&agent_ctx()),
+            )
+            .unwrap();
+        engine
+            .add_secret(
+                "cf",
+                "CLOUDFLARE_API_KEY",
+                "cf-global-key-secret",
+                Some(&agent_ctx()),
+            )
+            .unwrap();
         let (base, reqs) = spawn_cf_server(r#"{"success":true,"result":[]}"#).await;
         engine.cf_base = base;
 
-        let r = engine.cloudflare_api("cf", "GET", "/zones", None, Some(&agent_ctx())).await.unwrap();
+        let r = engine
+            .cloudflare_api("cf", "GET", "/zones", None, Some(&agent_ctx()))
+            .await
+            .unwrap();
         assert_eq!(r.status, 200);
         let req = &reqs.lock().unwrap()[0];
         assert_eq!(req.header("x-auth-email"), Some("admin@example.com"));
@@ -1011,27 +1263,46 @@ mod tests {
     #[tokio::test]
     async fn cf_errors_helpfully_when_no_credentials() {
         let (mut engine, _dir) = setup();
-        engine.add_secret("cf", "SOMETHING_ELSE", "x", Some(&agent_ctx())).unwrap();
+        engine
+            .add_secret("cf", "SOMETHING_ELSE", "x", Some(&agent_ctx()))
+            .unwrap();
         let err = engine
             .cloudflare_api("cf", "GET", "/zones", None, Some(&agent_ctx()))
             .await
             .unwrap_err();
-        assert!(err.contains("No Cloudflare credentials"), "{}", err);
-        assert!(err.contains("CLOUDFLARE_EMAIL + CLOUDFLARE_API_KEY"), "{}", err);
+        assert!(err.to_string().contains("No valid Cloudflare credentials"), "{}", err);
+        assert!(err.to_string().contains("CLOUDFLARE_API_TOKEN"), "{}", err);
     }
 
     #[tokio::test]
     async fn cf_scrubs_credentials_from_api_responses() {
         let (mut engine, _dir) = setup();
-        engine.add_secret("cf", "CLOUDFLARE_EMAIL", "admin@example.com", Some(&agent_ctx())).unwrap();
-        engine.add_secret("cf", "CLOUDFLARE_API_KEY", "cf-global-key-secret", Some(&agent_ctx())).unwrap();
+        engine
+            .add_secret(
+                "cf",
+                "CLOUDFLARE_EMAIL",
+                "admin@example.com",
+                Some(&agent_ctx()),
+            )
+            .unwrap();
+        engine
+            .add_secret(
+                "cf",
+                "CLOUDFLARE_API_KEY",
+                "cf-global-key-secret",
+                Some(&agent_ctx()),
+            )
+            .unwrap();
         let (base, _reqs) = spawn_cf_server(
             r#"{"success":true,"result":{"echo":"admin@example.com","key":"cf-global-key-secret"}}"#,
         )
         .await;
         engine.cf_base = base;
 
-        let r = engine.cloudflare_api("cf", "GET", "/zones", None, Some(&agent_ctx())).await.unwrap();
+        let r = engine
+            .cloudflare_api("cf", "GET", "/zones", None, Some(&agent_ctx()))
+            .await
+            .unwrap();
         let text = serde_json::to_string(&r.data).unwrap();
         assert!(!text.contains("admin@example.com"), "{}", text);
         assert!(!text.contains("cf-global-key-secret"), "{}", text);
@@ -1041,9 +1312,15 @@ mod tests {
     async fn cf_health_check_verifies_token_via_user_tokens_verify() {
         let (mut engine, _dir) = setup();
         engine
-            .add_secret("cf", "CLOUDFLARE_API_TOKEN", "cf-token-abcdef123456", Some(&agent_ctx()))
+            .add_secret(
+                "cf",
+                "CLOUDFLARE_API_TOKEN",
+                "cf-token-abcdef123456",
+                Some(&agent_ctx()),
+            )
             .unwrap();
-        let (base, reqs) = spawn_cf_server(r#"{"success":true,"result":{"status":"active"}}"#).await;
+        let (base, reqs) =
+            spawn_cf_server(r#"{"success":true,"result":{"status":"active"}}"#).await;
         engine.cf_base = base;
 
         let (ok, _msg) = engine.health_check("cf", Some(&agent_ctx())).await.unwrap();
@@ -1054,9 +1331,24 @@ mod tests {
     #[tokio::test]
     async fn cf_health_check_verifies_global_keys_via_user() {
         let (mut engine, _dir) = setup();
-        engine.add_secret("cf", "CLOUDFLARE_EMAIL", "admin@example.com", Some(&agent_ctx())).unwrap();
-        engine.add_secret("cf", "CLOUDFLARE_API_KEY", "cf-global-key-secret", Some(&agent_ctx())).unwrap();
-        let (base, reqs) = spawn_cf_server(r#"{"success":true,"result":{"email":"admin@example.com"}}"#).await;
+        engine
+            .add_secret(
+                "cf",
+                "CLOUDFLARE_EMAIL",
+                "admin@example.com",
+                Some(&agent_ctx()),
+            )
+            .unwrap();
+        engine
+            .add_secret(
+                "cf",
+                "CLOUDFLARE_API_KEY",
+                "cf-global-key-secret",
+                Some(&agent_ctx()),
+            )
+            .unwrap();
+        let (base, reqs) =
+            spawn_cf_server(r#"{"success":true,"result":{"email":"admin@example.com"}}"#).await;
         engine.cf_base = base;
 
         let (ok, _msg) = engine.health_check("cf", Some(&agent_ctx())).await.unwrap();
@@ -1067,12 +1359,25 @@ mod tests {
     #[tokio::test]
     async fn cf_list_workers_with_global_key_auth() {
         let (mut engine, _dir) = cf_setup();
-        engine.add_secret("cf", "CLOUDFLARE_EMAIL", "admin@example.com", Some(&agent_ctx())).unwrap();
-        engine.add_secret("cf", "CLOUDFLARE_API_KEY", "cf-global-key-secret", Some(&agent_ctx())).unwrap();
-        let (base, reqs) = spawn_cf_server(
-            r#"{"success":true,"result":[{"id":"worker-a"},{"id":"worker-b"}]}"#,
-        )
-        .await;
+        engine
+            .add_secret(
+                "cf",
+                "CLOUDFLARE_EMAIL",
+                "admin@example.com",
+                Some(&agent_ctx()),
+            )
+            .unwrap();
+        engine
+            .add_secret(
+                "cf",
+                "CLOUDFLARE_API_KEY",
+                "cf-global-key-secret",
+                Some(&agent_ctx()),
+            )
+            .unwrap();
+        let (base, reqs) =
+            spawn_cf_server(r#"{"success":true,"result":[{"id":"worker-a"},{"id":"worker-b"}]}"#)
+                .await;
         engine.cf_base = base;
 
         let (_account, workers) = engine.list_workers("cf", Some(&agent_ctx())).await.unwrap();
@@ -1086,12 +1391,16 @@ mod tests {
     async fn cf_worker_secrets_lists_names_never_values() {
         let (mut engine, _dir) = cf_setup();
         engine
-            .add_secret("cf", "CLOUDFLARE_API_TOKEN", "cf-token-abcdef123456", Some(&agent_ctx()))
+            .add_secret(
+                "cf",
+                "CLOUDFLARE_API_TOKEN",
+                "cf-token-abcdef123456",
+                Some(&agent_ctx()),
+            )
             .unwrap();
-        let (base, reqs) = spawn_cf_server(
-            r#"{"success":true,"result":[{"name":"API_KEY"},{"name":"DB_URL"}]}"#,
-        )
-        .await;
+        let (base, reqs) =
+            spawn_cf_server(r#"{"success":true,"result":[{"name":"API_KEY"},{"name":"DB_URL"}]}"#)
+                .await;
         engine.cf_base = base;
 
         let r = engine
@@ -1107,41 +1416,75 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["API_KEY", "DB_URL"]);
         let req = &reqs.lock().unwrap()[0];
-        assert!(req.path.ends_with("/workers/scripts/my-worker/secrets"), "{}", req.path);
+        assert!(
+            req.path.ends_with("/workers/scripts/my-worker/secrets"),
+            "{}",
+            req.path
+        );
     }
 
     #[tokio::test]
     async fn cf_worker_secrets_set_sends_value_never_echoes_it() {
         let (mut engine, _dir) = cf_setup();
         engine
-            .add_secret("cf", "CLOUDFLARE_API_TOKEN", "cf-token-abcdef123456", Some(&agent_ctx()))
+            .add_secret(
+                "cf",
+                "CLOUDFLARE_API_TOKEN",
+                "cf-token-abcdef123456",
+                Some(&agent_ctx()),
+            )
             .unwrap();
-        let (base, reqs) = spawn_cf_server(r#"{"success":true,"result":{"name":"MY_SECRET"}}"#).await;
+        let (base, reqs) =
+            spawn_cf_server(r#"{"success":true,"result":{"name":"MY_SECRET"}}"#).await;
         engine.cf_base = base;
 
         let r = engine
-            .worker_secrets("cf", "my-worker", "set", Some("MY_SECRET"), Some("raw-value-777"), Some(&agent_ctx()))
+            .worker_secrets(
+                "cf",
+                "my-worker",
+                "set",
+                Some("MY_SECRET"),
+                Some("raw-value-777"),
+                Some(&agent_ctx()),
+            )
             .await
             .unwrap();
         assert_eq!(r.status, 200);
         let req = &reqs.lock().unwrap()[0];
         assert_eq!(req.method, "PUT");
         let body: Value = serde_json::from_str(&req.body).unwrap();
-        assert_eq!(body, serde_json::json!({ "name": "MY_SECRET", "text": "raw-value-777" }));
-        assert!(!serde_json::to_string(&r.data).unwrap().contains("raw-value-777"));
+        assert_eq!(
+            body,
+            serde_json::json!({ "name": "MY_SECRET", "text": "raw-value-777" })
+        );
+        assert!(!serde_json::to_string(&r.data)
+            .unwrap()
+            .contains("raw-value-777"));
     }
 
     #[tokio::test]
     async fn cf_worker_secrets_deletes() {
         let (mut engine, _dir) = cf_setup();
         engine
-            .add_secret("cf", "CLOUDFLARE_API_TOKEN", "cf-token-abcdef123456", Some(&agent_ctx()))
+            .add_secret(
+                "cf",
+                "CLOUDFLARE_API_TOKEN",
+                "cf-token-abcdef123456",
+                Some(&agent_ctx()),
+            )
             .unwrap();
         let (base, reqs) = spawn_cf_server(r#"{"success":true,"result":{"id":"deleted"}}"#).await;
         engine.cf_base = base;
 
         let r = engine
-            .worker_secrets("cf", "my-worker", "delete", Some("MY_SECRET"), None, Some(&agent_ctx()))
+            .worker_secrets(
+                "cf",
+                "my-worker",
+                "delete",
+                Some("MY_SECRET"),
+                None,
+                Some(&agent_ctx()),
+            )
             .await
             .unwrap();
         assert_eq!(r.status, 200);
@@ -1154,25 +1497,187 @@ mod tests {
     async fn cf_worker_secrets_validates_name_and_value() {
         let (mut engine, _dir) = cf_setup();
         engine
-            .add_secret("cf", "CLOUDFLARE_API_TOKEN", "cf-token-abcdef123456", Some(&agent_ctx()))
+            .add_secret(
+                "cf",
+                "CLOUDFLARE_API_TOKEN",
+                "cf-token-abcdef123456",
+                Some(&agent_ctx()),
+            )
             .unwrap();
 
         let err = engine
             .worker_secrets("cf", "w", "set", None, None, Some(&agent_ctx()))
             .await
             .unwrap_err();
-        assert!(err.contains("name") && err.contains("required"), "{}", err);
+        assert!(err.to_string().contains("name") && err.to_string().contains("required"), "{}", err);
 
         let err = engine
             .worker_secrets("cf", "w", "set", Some("K"), None, Some(&agent_ctx()))
             .await
             .unwrap_err();
-        assert!(err.contains("value") && err.contains("required"), "{}", err);
+        assert!(err.to_string().contains("value") && err.to_string().contains("required"), "{}", err);
 
         let err = engine
             .worker_secrets("cf", "w", "delete", None, None, Some(&agent_ctx()))
             .await
             .unwrap_err();
-        assert!(err.contains("name") && err.contains("required"), "{}", err);
+        assert!(err.to_string().contains("name") && err.to_string().contains("required"), "{}", err);
+    }
+
+    // ─── DNS upsert (list → PUT if exists, else POST) ─�────
+
+    fn dns_upsert_setup(engine: &mut VaultEngine) {
+        engine
+            .add_secret(
+                "cf",
+                "CLOUDFLARE_API_TOKEN",
+                "cf-token-abcdef123456",
+                Some(&agent_ctx()),
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cf_dns_upsert_creates_via_post_when_no_existing_record() {
+        let (mut engine, _dir) = cf_setup();
+        dns_upsert_setup(&mut engine);
+
+        // GET list returns empty → caller should POST to create
+        let (base, reqs) = spawn_cf_server(r#"{"success":true,"result":[]}"#).await;
+        engine.cf_base = base;
+
+        let r = engine
+            .cloudflare_api(
+                "cf",
+                "POST",
+                "/zones/zone-123/dns_records",
+                Some(serde_json::json!({
+                    "type": "A",
+                    "name": "app.example.com",
+                    "content": "1.2.3.4"
+                })),
+                Some(&agent_ctx()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status, 200);
+        let req = &reqs.lock().unwrap()[0];
+        assert_eq!(req.method, "POST");
+        assert!(req.path.ends_with("/dns_records"), "{}", req.path);
+    }
+
+    #[tokio::test]
+    async fn cf_dns_upsert_updates_via_put_when_existing_record_found() {
+        let (mut engine, _dir) = cf_setup();
+        dns_upsert_setup(&mut engine);
+
+        // GET list returns an existing record → caller should PUT to update
+        let (base, reqs) = spawn_cf_server(
+            r#"{"success":true,"result":[{"id":"rec-456","type":"A","name":"app.example.com","content":"1.2.3.4"}]}"#,
+        )
+        .await;
+        engine.cf_base = base;
+
+        let r = engine
+            .cloudflare_api(
+                "cf",
+                "PUT",
+                "/zones/zone-123/dns_records/rec-456",
+                Some(serde_json::json!({
+                    "type": "A",
+                    "name": "app.example.com",
+                    "content": "5.6.7.8"
+                })),
+                Some(&agent_ctx()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status, 200);
+        let req = &reqs.lock().unwrap()[0];
+        assert_eq!(req.method, "PUT");
+        assert!(
+            req.path.ends_with("/dns_records/rec-456"),
+            "{}",
+            req.path
+        );
+    }
+
+    #[tokio::test]
+    async fn cf_dns_upsert_full_flow_create_then_update() {
+        let (mut engine, _dir) = cf_setup();
+        dns_upsert_setup(&mut engine);
+
+        // 1. List returns empty → create via POST
+        let (base, reqs) = spawn_cf_server(r#"{"success":true,"result":[]}"#).await;
+        engine.cf_base = base;
+
+        let r = engine
+            .cloudflare_api(
+                "cf",
+                "GET",
+                "/zones/zone-123/dns_records?type=A&name=app.example.com",
+                None,
+                Some(&agent_ctx()),
+            )
+            .await
+            .unwrap();
+        assert!(r.data["result"].as_array().unwrap().is_empty());
+
+        // 2. Create via POST
+        let r = engine
+            .cloudflare_api(
+                "cf",
+                "POST",
+                "/zones/zone-123/dns_records",
+                Some(serde_json::json!({
+                    "type": "A",
+                    "name": "app.example.com",
+                    "content": "1.2.3.4"
+                })),
+                Some(&agent_ctx()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status, 200);
+        assert_eq!(reqs.lock().unwrap()[1].method, "POST");
+
+        // 3. List now returns the record → update via PUT
+        let (base2, reqs2) = spawn_cf_server(
+            r#"{"success":true,"result":[{"id":"rec-789","type":"A","name":"app.example.com","content":"1.2.3.4"}]}"#,
+        )
+        .await;
+        engine.cf_base = base2;
+
+        let r = engine
+            .cloudflare_api(
+                "cf",
+                "GET",
+                "/zones/zone-123/dns_records?type=A&name=app.example.com",
+                None,
+                Some(&agent_ctx()),
+            )
+            .await
+            .unwrap();
+        let rec_id = r.data["result"][0]["id"].as_str().unwrap();
+
+        let r = engine
+            .cloudflare_api(
+                "cf",
+                "PUT",
+                &format!("/zones/zone-123/dns_records/{}", rec_id),
+                Some(serde_json::json!({
+                    "type": "A",
+                    "name": "app.example.com",
+                    "content": "9.9.9.9"
+                })),
+                Some(&agent_ctx()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status, 200);
+        assert_eq!(reqs2.lock().unwrap()[1].method, "PUT");
+        assert!(reqs2.lock().unwrap()[1]
+            .path
+            .ends_with(&format!("/dns_records/{}", rec_id)));
     }
 }

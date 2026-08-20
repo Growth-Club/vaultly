@@ -13,9 +13,23 @@ const SECRET_VALUE: &str = "sk-e2e-super-secret-token-1234567890";
 const SECRET_KEY: &str = "E2E_SECRET_KEY";
 
 const EXPECTED_TOOLS: [&str; 17] = [
-    "cf_api", "cf_deploy", "cf_dns_list", "cf_dns_upsert", "cf_health", "cf_secrets",
-    "cf_workers_list", "cf_zones", "vault_add", "vault_audit", "vault_delete", "vault_keys",
-    "vault_list", "vault_lock", "vault_run", "vault_status", "vault_unlock",
+    "cf_api",
+    "cf_deploy",
+    "cf_dns_list",
+    "cf_dns_upsert",
+    "cf_health",
+    "cf_secrets",
+    "cf_workers_list",
+    "cf_zones",
+    "vault_add",
+    "vault_audit",
+    "vault_delete",
+    "vault_keys",
+    "vault_list",
+    "vault_lock",
+    "vault_run",
+    "vault_status",
+    "vault_unlock",
 ];
 
 struct McpClient {
@@ -41,14 +55,21 @@ impl McpClient {
         });
         let stdin = BufWriter::new(child.stdin.take().unwrap());
         let stdout = BufReader::new(child.stdout.take().unwrap());
-        let mut client = McpClient { _child: child, stdin, stdout };
+        let mut client = McpClient {
+            _child: child,
+            stdin,
+            stdout,
+        };
         client.call(1, "initialize", json!({})).await;
         client
     }
 
     async fn call(&mut self, id: u64, method: &str, params: Value) -> Value {
         let msg = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-        self.stdin.write_all(serde_json::to_string(&msg).unwrap().as_bytes()).await.unwrap();
+        self.stdin
+            .write_all(serde_json::to_string(&msg).unwrap().as_bytes())
+            .await
+            .unwrap();
         self.stdin.write_all(b"\n").await.unwrap();
         self.stdin.flush().await.unwrap();
         let mut line = String::new();
@@ -57,11 +78,15 @@ impl McpClient {
     }
 
     async fn call_tool(&mut self, id: u64, name: &str, args: Value) -> Value {
-        self.call(id, "tools/call", json!({ "name": name, "arguments": args })).await
+        self.call(id, "tools/call", json!({ "name": name, "arguments": args }))
+            .await
     }
 
     fn result_text(&self, res: &Value) -> String {
-        res["result"]["content"][0]["text"].as_str().unwrap_or("").to_string()
+        res["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .to_string()
     }
 }
 
@@ -96,20 +121,30 @@ async fn mcp_e2e_security_surface() {
 
         // 3. cf_secrets requires name/value for set
         let res = mcp
-            .call_tool(3, "cf_secrets", json!({ "vaultName": "e2e", "scriptName": "w", "action": "set" }))
+            .call_tool(
+                3,
+                "cf_secrets",
+                json!({ "vaultName": "e2e", "scriptName": "w", "action": "set" }),
+            )
             .await;
         let text = serde_json::to_string(&res).unwrap();
         assert!(text.contains("'name' is required"), "{}", text);
 
         // 4. Stores a secret (write-only) and lists only its name
         let res = mcp
-            .call_tool(4, "vault_add", json!({ "vaultName": "e2e", "key": SECRET_KEY, "value": SECRET_VALUE }))
+            .call_tool(
+                4,
+                "vault_add",
+                json!({ "vaultName": "e2e", "key": SECRET_KEY, "value": SECRET_VALUE }),
+            )
             .await;
         let text = serde_json::to_string(&res).unwrap();
         assert!(!text.contains(SECRET_VALUE), "{}", text);
         assert!(text.contains("Stored"), "{}", text);
 
-        let res = mcp.call_tool(5, "vault_keys", json!({ "vaultName": "e2e" })).await;
+        let res = mcp
+            .call_tool(5, "vault_keys", json!({ "vaultName": "e2e" }))
+            .await;
         let text = serde_json::to_string(&res).unwrap();
         assert!(text.contains(SECRET_KEY), "{}", text);
         assert!(!text.contains(SECRET_VALUE), "{}", text);
@@ -128,7 +163,11 @@ async fn mcp_e2e_security_surface() {
 
         // 6. Lets agents lock and reports locked status
         let res = mcp.call_tool(7, "vault_lock", json!({})).await;
-        assert!(mcp.result_text(&res).to_lowercase().contains("lock"), "{}", res);
+        assert!(
+            mcp.result_text(&res).to_lowercase().contains("lock"),
+            "{}",
+            res
+        );
         let res = mcp.call_tool(8, "vault_status", json!({})).await;
         assert!(mcp.result_text(&res).contains("Unlocked: no"), "{}", res);
 
@@ -145,7 +184,9 @@ async fn mcp_e2e_security_surface() {
         assert!(!names.contains(&"env".to_string()));
 
         // 8. Audits agent actions with agent attribution
-        let res = mcp.call_tool(10, "vault_audit", json!({ "lines": 20 })).await;
+        let res = mcp
+            .call_tool(10, "vault_audit", json!({ "lines": 20 }))
+            .await;
         let text = mcp.result_text(&res);
         assert!(text.contains("\"action\":\"ADD\""), "{}", text);
         assert!(text.contains("\"agent\":\"mcp-agent\""), "{}", text);

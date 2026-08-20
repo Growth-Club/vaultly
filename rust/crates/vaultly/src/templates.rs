@@ -53,7 +53,11 @@ pub const TEMPLATES: &[(&str, VaultTemplate)] = &[
         "stripe",
         VaultTemplate {
             description: "Stripe payments",
-            keys: &["STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET", "STRIPE_PUBLISHABLE_KEY"],
+            keys: &[
+                "STRIPE_SECRET_KEY",
+                "STRIPE_WEBHOOK_SECRET",
+                "STRIPE_PUBLISHABLE_KEY",
+            ],
         },
     ),
     (
@@ -88,14 +92,23 @@ pub const TEMPLATES: &[(&str, VaultTemplate)] = &[
         "ssh",
         VaultTemplate {
             description: "Server access",
-            keys: &["SERVER_HOST", "SERVER_USER", "SERVER_PASSWORD", "SERVER_SSH_KEY"],
+            keys: &[
+                "SERVER_HOST",
+                "SERVER_USER",
+                "SERVER_PASSWORD",
+                "SERVER_SSH_KEY",
+            ],
         },
     ),
     (
         "social-media",
         VaultTemplate {
             description: "Social media APIs",
-            keys: &["META_ACCESS_TOKEN", "TWITTER_BEARER_TOKEN", "LINKEDIN_ACCESS_TOKEN"],
+            keys: &[
+                "META_ACCESS_TOKEN",
+                "TWITTER_BEARER_TOKEN",
+                "LINKEDIN_ACCESS_TOKEN",
+            ],
         },
     ),
     (
