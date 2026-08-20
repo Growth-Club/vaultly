@@ -1,0 +1,24 @@
+[package]
+name = "vaultly-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Vaultly core: AES-256-GCM vaults, policy engine, scrubber, Cloudflare API"
+
+[dependencies]
+aes-gcm = "0.10"
+pbkdf2 = "0.12"
+sha2 = "0.10"
+hmac = "0.12"
+rand = "0.8"
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+base64.workspace = true
+regex.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+dirs.workspace = true
+shell-words.workspace = true
