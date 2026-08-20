@@ -17,7 +17,7 @@ import {
   verifyPassword,
 } from "./crypto.js";
 
-const VAULTLY_DIR = path.join(os.homedir(), ".vaultly");
+const VAULTLY_DIR = process.env.VAULTLY_DIR || path.join(os.homedir(), ".vaultly");
 const CONFIG_PATH = path.join(VAULTLY_DIR, "config.json");
 const VAULTS_DIR = path.join(VAULTLY_DIR, "vaults");
 const AUDIT_LOG = path.join(VAULTLY_DIR, "audit.log");

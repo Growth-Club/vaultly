@@ -43,10 +43,10 @@ export default {
       return json({ status: "ok", service: "vaultly-backup" }, 200, cors);
     }
 
-    // Auth check
+    // Auth check (constant-time comparison to avoid timing attacks)
     const authHeader = request.headers.get("Authorization");
     const token = authHeader?.replace("Bearer ", "");
-    if (!token || token !== env.BACKUP_TOKEN) {
+    if (!token || !safeEqual(token, env.BACKUP_TOKEN)) {
       return json({ error: "Unauthorized" }, 401, cors);
     }
 
@@ -54,12 +54,18 @@ export default {
     if (url.pathname === "/backup") {
       // PUT: store backup
       if (request.method === "PUT") {
+        // Fast path: reject early if the declared size is too large
         const contentLength = request.headers.get("Content-Length");
         if (contentLength && parseInt(contentLength) > MAX_SIZE) {
           return json({ error: "Payload too large (max 5MB)" }, 413, cors);
         }
 
         const body = await request.text();
+
+        // Authoritative check — Content-Length is not always set by clients
+        if (body.length > MAX_SIZE) {
+          return json({ error: "Payload too large (max 5MB)" }, 413, cors);
+        }
 
         // Basic validation: must be JSON with a "vaults" key
         try {
@@ -115,4 +121,16 @@ function json(
     status,
     headers: { "Content-Type": "application/json", ...extraHeaders },
   });
+}
+
+/** Constant-time string comparison (WebCrypto has no timingSafeEqual) */
+export function safeEqual(a: string, b: string): boolean {
+  const aBuf = new TextEncoder().encode(a);
+  const bBuf = new TextEncoder().encode(b);
+  if (aBuf.length !== bBuf.length) return false;
+  let diff = 0;
+  for (let i = 0; i < aBuf.length; i++) {
+    diff |= aBuf[i] ^ bBuf[i];
+  }
+  return diff === 0;
 }

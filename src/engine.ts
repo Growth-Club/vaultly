@@ -7,11 +7,12 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { spawn, execSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import * as vault from "./vault.js";
 import * as crypto from "./crypto.js";
 import { scrubOutput } from "./scrubber.js";
 import { PolicyEngine, type CallerContext } from "./policy.js";
+import { deleteFromKeychain } from "./keychain.js";
 
 export interface RunResult {
   stdout: string;
@@ -66,29 +67,22 @@ export class VaultEngine {
   }
 
   /** Lock vault — wipe key from memory */
-  lock(): void {
+  lock(ctx?: CallerContext): void {
     if (this.key) {
       // Overwrite key buffer with zeros before releasing
       this.key.fill(0);
       this.key = null;
     }
     this.unlockedAt = null;
-    this.audit("LOCK", "Vault locked");
+    this.audit("LOCK", "Vault locked", ctx);
   }
 
   /** Killswitch — emergency lock + clear all session data */
-  kill(): void {
-    this.lock();
-    // Remove keychain entry if exists
-    try {
-      execSync(
-        'security delete-generic-password -s "vaultly-master-key" 2>/dev/null || true',
-        { stdio: "ignore" }
-      );
-    } catch {
-      // Ignore — keychain entry may not exist
-    }
-    this.audit("KILL", "🚨 Killswitch activated — vault locked, keychain cleared");
+  kill(ctx?: CallerContext): void {
+    this.lock(ctx);
+    // Remove keychain entry if exists (same service/account as keychain.ts)
+    deleteFromKeychain();
+    this.audit("KILL", "🚨 Killswitch activated — vault locked, keychain cleared", ctx);
   }
 
   private requireUnlocked(): Buffer {
@@ -168,7 +162,7 @@ export class VaultEngine {
     vaultName: string,
     command: string,
     args: string[],
-    options?: { cwd?: string; ctx?: CallerContext }
+    options?: { cwd?: string; ctx?: CallerContext; timeoutMs?: number }
   ): Promise<RunResult> {
     this.policy.check(options?.ctx, "run", vaultName);
 
@@ -186,7 +180,13 @@ export class VaultEngine {
       options?.ctx
     );
 
-    const result = await this.spawn(command, args, secrets, options?.cwd);
+    const result = await this.spawn(
+      command,
+      args,
+      secrets,
+      options?.cwd,
+      options?.timeoutMs
+    );
 
     // SCRUB secret values from output before returning
     const scrubbedStdout = scrubOutput(result.stdout, secretValues);
@@ -211,7 +211,7 @@ export class VaultEngine {
   async runCommand(
     vaultName: string,
     commandStr: string,
-    options?: { cwd?: string; ctx?: CallerContext }
+    options?: { cwd?: string; ctx?: CallerContext; timeoutMs?: number }
   ): Promise<RunResult> {
     const parts = commandStr.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) || [commandStr];
     const cmd = parts[0];
@@ -256,6 +256,44 @@ export class VaultEngine {
     const scrubbed = scrubOutput(JSON.stringify(data, null, 2), [apiToken]);
 
     return { status: res.status, data: JSON.parse(scrubbed) };
+  }
+
+  // ─── Workers List ────────────────────────────────────
+
+  async listWorkers(
+    vaultName: string,
+    ctx?: CallerContext
+  ): Promise<{ accountId: string; workers: string[] }> {
+    this.policy.check(ctx, "cf_api", vaultName);
+
+    const secrets = this.getSecrets(vaultName);
+    const apiToken = secrets["CLOUDFLARE_API_TOKEN"];
+    const accountId = secrets["CLOUDFLARE_ACCOUNT_ID"];
+    if (!apiToken) {
+      throw new Error(
+        `No CLOUDFLARE_API_TOKEN in '${vaultName}'. Found: ${Object.keys(secrets).join(", ") || "(empty)"}`
+      );
+    }
+    if (!accountId) {
+      throw new Error(
+        `No CLOUDFLARE_ACCOUNT_ID in '${vaultName}'. Found: ${Object.keys(secrets).join(", ") || "(empty)"}`
+      );
+    }
+
+    this.audit("CF_WORKERS", `list workers (vault=${vaultName})`, ctx);
+
+    const url = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/workers/scripts`;
+    const res = await fetch(url, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${apiToken}` },
+    });
+
+    const data = (await res.json()) as any;
+    const workers = Array.isArray(data?.result)
+      ? data.result.map((w: any) => w.id).filter(Boolean)
+      : [];
+
+    return { accountId, workers };
   }
 
   // ─── Health Check ──────────────────────────────────────
@@ -332,7 +370,8 @@ export class VaultEngine {
     command: string,
     args: string[],
     env: Record<string, string>,
-    cwd?: string
+    cwd?: string,
+    timeoutMs = 300_000
   ): Promise<{ stdout: string; stderr: string; code: number }> {
     return new Promise((resolve) => {
       const child = spawn(command, args, {
@@ -342,12 +381,47 @@ export class VaultEngine {
         stdio: ["ignore", "pipe", "pipe"],
       });
 
+      // Cap buffered output to avoid memory exhaustion on chatty commands
+      const MAX_BUFFER = 5 * 1024 * 1024;
       let stdout = "";
       let stderr = "";
-      child.stdout.on("data", (d) => (stdout += d.toString()));
-      child.stderr.on("data", (d) => (stderr += d.toString()));
-      child.on("error", (err) => resolve({ stdout, stderr: stderr + err.message, code: 1 }));
-      child.on("close", (code) => resolve({ stdout, stderr, code: code ?? 0 }));
+      let truncated = false;
+
+      const timedOut = setTimeout(() => {
+        child.kill("SIGKILL");
+        resolve({
+          stdout,
+          stderr: stderr + `\n⏱ Command timed out after ${Math.round(timeoutMs / 1000)}s and was killed.\n`,
+          code: 124,
+        });
+      }, timeoutMs);
+
+      child.stdout.on("data", (d) => {
+        if (stdout.length < MAX_BUFFER) {
+          stdout += d.toString().slice(0, MAX_BUFFER - stdout.length);
+        } else {
+          truncated = true;
+        }
+      });
+      child.stderr.on("data", (d) => {
+        if (stderr.length < MAX_BUFFER) {
+          stderr += d.toString().slice(0, MAX_BUFFER - stderr.length);
+        } else {
+          truncated = true;
+        }
+      });
+      child.on("error", (err) => {
+        clearTimeout(timedOut);
+        resolve({ stdout, stderr: stderr + err.message, code: 1 });
+      });
+      child.on("close", (code) => {
+        clearTimeout(timedOut);
+        resolve({
+          stdout: truncated ? stdout + "\n...(output truncated at 5MB)" : stdout,
+          stderr: truncated ? stderr + "\n...(output truncated at 5MB)" : stderr,
+          code: code ?? 0,
+        });
+      });
     });
   }
 }

@@ -12,6 +12,8 @@ and handle Cloudflare — all without ever seeing raw secret values.
 | `vault_add` | Store a new secret (write-only) | ❌ Can't read back |
 | `vault_delete` | Delete a secret | ❌ No |
 | `vault_run` | Run command with injected env vars | ❌ Sees output only |
+| `vault_lock` | Lock session — wipes key from memory | ❌ No |
+| `vault_unlock` | Re-open via macOS Keychain | ❌ No |
 | `vault_audit` | View audit log | ❌ No values logged |
 | `cf_api` | Cloudflare API calls (authenticated) | ❌ Sees response only |
 | `cf_zones` | List domains/zones | ❌ No |

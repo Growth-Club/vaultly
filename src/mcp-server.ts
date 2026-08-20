@@ -182,6 +182,7 @@ export async function startMcpServer(): Promise<void> {
         const result = await engine.runCommand(vaultName, command, {
           cwd,
           ctx: AGENT_CTX,
+          timeoutMs: 300_000,
         });
         const maxLen = 10000;
         const stdout = result.stdout.length > maxLen ? result.stdout.slice(0, maxLen) + "\n...(truncated)" : result.stdout;
@@ -308,25 +309,11 @@ export async function startMcpServer(): Promise<void> {
     { vaultName: z.string().describe("Vault with CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID") },
     async ({ vaultName }) =>
       tryRunAsync(async () => {
-        // Get account ID from vault
-        const keys = engine.listKeys(vaultName, AGENT_CTX);
-        if (!keys.includes("CLOUDFLARE_ACCOUNT_ID")) {
-          return fail(`No CLOUDFLARE_ACCOUNT_ID in '${vaultName}'. Found: ${keys.join(", ")}`);
-        }
-        // Use cf_api with the account ID — we need to get it without exposing it
-        // Run a command that uses it
-        const result = await engine.runCommand(
-          vaultName,
-          'sh -c "curl -s -H \\"Authorization: Bearer $CLOUDFLARE_API_TOKEN\\" https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts"',
-          { ctx: AGENT_CTX }
+        const result = await engine.listWorkers(vaultName, AGENT_CTX);
+        return ok(
+          `Workers (${result.workers.length}):\n` +
+            result.workers.map((w: string) => `  - ${w}`).join("\n")
         );
-        try {
-          const data = JSON.parse(result.stdout);
-          const workers = data?.result || [];
-          return ok(`Workers (${workers.length}):\n` + workers.map((w: any) => `  - ${w.id}`).join("\n"));
-        } catch {
-          return ok(result.stdout);
-        }
       })
   );
 
@@ -341,7 +328,11 @@ export async function startMcpServer(): Promise<void> {
     async ({ vaultName, projectDir, extraArgs }) =>
       tryRunAsync(async () => {
         const cmd = `npx wrangler deploy${extraArgs ? ` ${extraArgs}` : ""}`;
-        const result = await engine.runCommand(vaultName, cmd, { cwd: projectDir, ctx: AGENT_CTX });
+        const result = await engine.runCommand(vaultName, cmd, {
+          cwd: projectDir,
+          ctx: AGENT_CTX,
+          timeoutMs: 300_000,
+        });
         const maxLen = 10000;
         const stdout = result.stdout.length > maxLen ? result.stdout.slice(0, maxLen) + "\n...(truncated)" : result.stdout;
         return {
@@ -386,6 +377,38 @@ export async function startMcpServer(): Promise<void> {
   );
 
   server.tool(
+    "vault_lock",
+    "Lock the vault session immediately — wipes the decryption key from memory. Use vault_unlock to re-open.",
+    {},
+    async () =>
+      tryRun(() => {
+        engine.lock(AGENT_CTX);
+        return ok("✓ Vault locked. Decryption key wiped from memory.");
+      })
+  );
+
+  server.tool(
+    "vault_unlock",
+    "Re-open a locked session. Uses the macOS Keychain (hardware-backed) — the agent never handles the password.",
+    {},
+    async () => {
+      if (!isKeychainAvailable()) {
+        return fail("Keychain unavailable. Restart the MCP server to unlock.");
+      }
+      const pw = getFromKeychain();
+      if (!pw) {
+        return fail("No keychain entry found. Run `vaultly keychain store` or restart the MCP server.");
+      }
+      try {
+        engine.unlock(pw);
+        return ok("✓ Vault unlocked.");
+      } catch {
+        return fail("Keychain password invalid.");
+      }
+    }
+  );
+
+  server.tool(
     "vault_status",
     "Show vault status: session TTL, vault count, keychain status.",
     {},
@@ -395,7 +418,7 @@ export async function startMcpServer(): Promise<void> {
         const ttlMin = Math.round(engine.sessionExpiresIn / 60000);
         return ok(
           `Vaultly Status:\n` +
-            `  Unlocked: yes (expires in ${ttlMin} min)\n` +
+            `  Unlocked: ${engine.isUnlocked ? "yes" : "no"} (expires in ${ttlMin} min)\n` +
             `  Vaults: ${vaults.length} (${vaults.join(", ") || "none"})\n` +
             `  Keychain: ${isKeychainAvailable() ? "available" : "not available"}\n` +
             `  Platform: ${process.platform}`

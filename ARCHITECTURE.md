@@ -6,7 +6,7 @@
 │                    V A U L T L Y   v 2                                      │
 │              Agent-First Credential Manager                                 │
 │                                                                             │
-│         2,450 LOC · 9 modules · 2 deps · 0 vulnerabilities                 │
+│         2,539 LOC · 9 modules · 3 deps · 0 vulnerabilities                 │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 
@@ -42,24 +42,26 @@
 │  │  │  vault_delete         │  │  │  │  backup   restore  protect     │  │  │
 │  │  │  vault_run (scrubbed) │  │  │  │  status   kill                 │  │  │
 │  │  │  vault_status         │  │  │  ├────────────────────────────────┤  │  │
-│  │  │  vault_audit          │  │  │  │ CLOUDFLARE (vaultly cf ...)    │  │  │
-│  │  ├───────────────────────┤  │  │  │  cf add [name]                 │  │  │
-│  │  │ CLOUDFLARE TOOLS      │  │  │  │  cf list                       │  │  │
-│  │  │  cf_api               │  │  │  │  cf use <name>                 │  │  │
-│  │  │  cf_zones             │  │  │  │  cf deploy <name> <dir>        │  │  │
-│  │  │  cf_dns_list          │  │  │  │  cf remove <name>              │  │  │
-│  │  │  cf_dns_upsert        │  │  │  │  cf zones <name>               │  │  │
-│  │  │  cf_workers_list      │  │  │  ├────────────────────────────────┤  │  │
-│  │  │  cf_deploy            │  │  │  │ TEMPLATES (vaultly template)   │  │  │
-│  │  │  cf_health            │  │  │  │  cloudflare  github   aws      │  │  │
-│  │  └───────────────────────┘  │  │  │  gcp         vercel   stripe   │  │  │
-│  │                             │  │  │  database    openai   smtp     │  │  │
-│  │  Unlock:                    │  │  │  docker      npm      ssh      │  │  │
-│  │  1. macOS Keychain (auto)   │  │  │  social-media  custom          │  │  │
-│  │  2. VAULTLY_MASTER_PASSWORD │  │  ├────────────────────────────────┤  │  │
-│  │  3. /dev/tty prompt         │  │  │ KEYCHAIN                       │  │  │
-│  │                             │  │  │  keychain store/remove/status  │  │  │
-│  │  * no tool returns raw      │  │  └────────────────────────────────┘  │  │
+│  │  │  vault_lock           │  │  │  │ CLOUDFLARE (vaultly cf ...)    │  │  │
+│  │  │  vault_unlock         │  │  │  │  cf add [name]                 │  │  │
+│  │  │  vault_audit          │  │  │  │  cf list                       │  │  │
+│  │  ├───────────────────────┤  │  │  │  cf use <name>                 │  │  │
+│  │  │ CLOUDFLARE TOOLS      │  │  │  │  cf deploy <name> <dir>        │  │  │
+│  │  │  cf_api               │  │  │  │  cf remove <name>              │  │  │
+│  │  │  cf_zones             │  │  │  │  cf zones <name>               │  │  │
+│  │  │  cf_dns_list          │  │  │  ├────────────────────────────────┤  │  │
+│  │  │  cf_dns_upsert        │  │  │  │ TEMPLATES (vaultly template)   │  │  │
+│  │  │  cf_workers_list      │  │  │  │  cloudflare  github   aws      │  │  │
+│  │  │  cf_deploy            │  │  │  │  gcp         vercel   stripe   │  │  │
+│  │  │  cf_health            │  │  │  │  database    openai   smtp     │  │  │
+│  │  └───────────────────────┘  │  │  │  docker      npm      ssh      │  │  │
+│  │                             │  │  │  social-media  custom          │  │  │
+│  │  Unlock:                    │  │  ├────────────────────────────────┤  │  │
+│  │  1. macOS Keychain (auto)   │  │  │ KEYCHAIN                       │  │  │
+│  │  2. VAULTLY_MASTER_PASSWORD │  │  │  keychain store/remove/status  │  │  │
+│  │  3. /dev/tty prompt         │  │  └────────────────────────────────┘  │  │
+│  │                             │  │                                      │  │
+│  │  * no tool returns raw      │  │  * get/env blocked in agent mode     │  │
 │  │    secret values — EVER     │  │                                      │  │
 │  │                             │  │  * get/env blocked in agent mode     │  │
 │  └──────────────┬──────────────┘  └──────────────────┬───────────────────┘  │
@@ -307,7 +309,7 @@
   │   ├── keychain.ts        93 LOC   macOS Keychain integration
   │   └── scrubber.ts        74 LOC   Output secret redaction
   │                                  ─────────
-  │                          2,450 LOC total
+  │                          2,539 LOC total
   │
   ├── worker/
   │   ├── src/index.ts      Cloudflare Worker (zero-knowledge backup)
@@ -317,7 +319,7 @@
   ├── AGENTS.md             Agent integration guide
   ├── README.md             Usage documentation
   ├── setup.sh              Interactive setup script
-  ├── package.json          2 deps: commander + chalk
+  ├── package.json          3 deps: MCP SDK + commander + chalk
   └── tsconfig.json         TypeScript config
 
 

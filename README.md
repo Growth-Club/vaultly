@@ -11,7 +11,7 @@
 [![MCP](https://img.shields.io/badge/MCP-16_tools-8A2BE2)](#ai-agent-integration-mcp)
 [![Cloudflare](https://img.shields.io/badge/Cloudflare-Workers-F38020?logo=cloudflare&logoColor=white)](https://workers.cloudflare.com)
 [![Security](https://img.shields.io/badge/encryption-AES--256--GCM-red)](#security)
-[![Deps](https://img.shields.io/badge/dependencies-2-brightgreen)](package.json)
+[![Deps](https://img.shields.io/badge/dependencies-3-brightgreen)](package.json)
 
 </div>
 
@@ -125,6 +125,8 @@ Add to your AI tool's MCP config:
 | 🗑️ `vault_delete` | Delete a secret |
 | ▶️ `vault_run` | Run command with injected env (**output scrubbed**) |
 | 📊 `vault_status` | Session status, TTL, vault count |
+| 🔒 `vault_lock` | Lock session — wipe key from memory |
+| 🔓 `vault_unlock` | Re-open via macOS Keychain (agent never sees password) |
 | 📜 `vault_audit` | Recent audit log entries |
 | 🌐 `cf_api` | Call any Cloudflare API endpoint |
 | 🏠 `cf_zones` | List zones (domains) |
@@ -218,7 +220,7 @@ vaultly status                            Session and vault info
 See [ARCHITECTURE.md](ARCHITECTURE.md) for full system diagrams.
 
 ```
-2,450 LOC · 9 modules · 2 dependencies · 0 vulnerabilities
+2,539 LOC · 9 modules · 3 dependencies · 0 vulnerabilities
 ```
 
 ---

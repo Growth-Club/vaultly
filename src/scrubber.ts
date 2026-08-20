@@ -59,9 +59,29 @@ export function scrubOutput(output: string, secretValues: string[]): string {
       const suffix = escapeRegex(value.slice(-8));
       // Match prefix...suffix with limited gap (non-greedy, bounded)
       scrubbed = scrubbed.replace(
-        new RegExp(`${prefix}.{0,200}?${suffix}`, "g"),
+        new RegExp(`${prefix}.{0,1000}?${suffix}`, "g"),
         REDACTED
       );
+
+      // 6. Interior fragments: prefix/suffix matching misses leaks that
+      //    contain only a middle portion of the secret. Dense overlapping
+      //    windows across the whole value (single regex pass) catch any
+      //    fragment of ~20+ chars. Token-style secrets only (no whitespace)
+      //    to avoid false positives on passphrases.
+      if (!/\s/.test(value)) {
+        const WINDOW = 16;
+        const STEP = 4;
+        const windows: string[] = [];
+        for (let i = 0; i + WINDOW <= value.length; i += STEP) {
+          windows.push(value.slice(i, i + WINDOW));
+        }
+        if (windows.length > 0) {
+          scrubbed = scrubbed.replace(
+            new RegExp(windows.map(escapeRegex).join("|"), "g"),
+            REDACTED
+          );
+        }
+      }
     }
   }
 
