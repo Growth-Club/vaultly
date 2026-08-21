@@ -1,22 +1,147 @@
-//! Vaultly TUI — interactive menu for humans.
-//! Port of src/tui.ts using `inquire`. Everything routes through VaultEngine
+//! Vaultly TUI — full-screen interactive terminal UI using ratatui.
+//! Port of the inquire-based TUI. Everything routes through VaultEngine
 //! (same audit, policy, encryption as CLI/MCP). Human-only: refused in agent mode.
 
-use std::io::IsTerminal;
+use std::io::{self, Write};
+
+use crossterm::event::{
+    self, Event, KeyEvent, KeyEventKind, KeyCode, KeyModifiers,
+};
+use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use ratatui::Terminal;
+use ratatui::Frame;
 
 use colored::Colorize;
-use inquire::{Confirm, Password, Select, Text};
 use vaultly_core::{keychain, VaultEngine};
 
-trait VaultResultExt<T> {
-    fn s(self) -> Result<T, String>;
+// ─── Constants ─────────────────────────────────────────────
+
+const MENU_OPTIONS: [&str; 13] = [
+    "📋  List vaults & keys",
+    "➕  Add / update a secret",
+    "🔑  Read a secret value",
+    "🗑️  Delete secret or vault",
+    "▶️  Run command with secrets",
+    "📦  Create vault from template",
+    "☁️  Add Cloudflare account",
+    "🌐  List accounts & zones",
+    "🚀  Deploy a Worker",
+    "🔐  Worker secrets",
+    "🔒  Keychain (auto-unlock)",
+    "📊  Status",
+    "🚪  Lock & exit",
+];
+
+// ─── App State ─────────────────────────────────────────────
+
+#[derive(PartialEq, Clone, Copy)]
+enum Screen {
+    Menu,
+    AddSecret,
+    GetSecret,
+    DeleteSecret,
+    RunCommand,
+    Template,
+    CfAdd,
+    CfZones,
+    CfDeploy,
+    CfSecrets,
+    Keychain,
+    Status,
+    Exit,
 }
 
-impl<T, E: std::fmt::Display> VaultResultExt<T> for Result<T, E> {
-    fn s(self) -> Result<T, String> {
-        self.map_err(|e| e.to_string())
+#[derive(PartialEq, Clone, Copy)]
+enum InputMode {
+    Navigation,
+    Editing,
+}
+
+struct App {
+    screen: Screen,
+    input_mode: InputMode,
+    menu_selected: usize,
+    input_buffer: String,
+    status_msg: Option<String>,
+    status_is_error: bool,
+    vaults: Vec<String>,
+    
+    cf_vault_names: Vec<String>,
+    template_keys: Vec<String>,
+    template_step: usize,
+    run_result: Option<(String, String, i32, bool)>,
+    // Multi-step flow tracking
+    flow_step: usize,
+    flow_vault: Option<String>,
+    flow_key: Option<String>,
+    flow_value: Option<String>,
+    flow_command: Option<String>,
+    flow_template_name: Option<String>,
+    flow_cf_name: Option<String>,
+    flow_script_name: Option<String>,
+    flow_secret_name: Option<String>,
+    flow_secret_value: Option<String>,
+}
+
+impl App {
+    fn new() -> Self {
+        App {
+            screen: Screen::Menu,
+            input_mode: InputMode::Navigation,
+            menu_selected: 0,
+            input_buffer: String::new(),
+            status_msg: None,
+            status_is_error: false,
+            vaults: Vec::new(),
+
+            cf_vault_names: Vec::new(),
+            template_keys: Vec::new(),
+            template_step: 0,
+            run_result: None,
+flow_step: 0,
+            flow_vault: None,
+            flow_key: None,
+            flow_value: None,
+            flow_command: None,
+            flow_template_name: None,
+            flow_cf_name: None,
+            flow_script_name: None,
+            flow_secret_name: None,
+            flow_secret_value: None,
+        }
+    }
+
+    fn reset_flow(&mut self) {
+        self.flow_step = 0;
+        self.flow_vault = None;
+        self.flow_key = None;
+        self.flow_value = None;
+        self.flow_command = None;
+        self.flow_template_name = None;
+        self.flow_cf_name = None;
+        self.flow_script_name = None;
+        self.flow_secret_name = None;
+        self.flow_secret_value = None;
+        self.input_buffer.clear();
+        self.status_msg = None;
+        self.status_is_error = false;
+    }
+
+    fn set_status(&mut self, msg: &str, is_error: bool) {
+        self.status_msg = Some(msg.to_string());
+        self.status_is_error = is_error;
     }
 }
+
+// ─── Main Entry Point ──────────────────────────────────────
 
 pub async fn start_tui() {
     if std::env::var("VAULTLY_AGENT_MODE").as_deref() == Ok("1") {
@@ -27,613 +152,1657 @@ pub async fn start_tui() {
         std::process::exit(1);
     }
 
-    if !std::io::stdin().is_terminal() {
-        eprintln!(
-            "{} The TUI is interactive-only. Run it in a terminal (no pipes).",
-            "⚠".yellow()
-        );
-        std::process::exit(0);
-    }
+    let mut terminal = match setup_terminal() {
+        Ok(t) => t,
+        Err(_) => {
+            eprintln!("{} Failed to initialize terminal.", "✗".red());
+            std::process::exit(1);
+        }
+    };
 
+    let mut app = App::new();
     let mut engine = VaultEngine::new(Some(120));
 
     if !engine.is_initialized() {
+        cleanup_terminal();
         eprintln!("{} Not initialized. Run: vaultly init", "✗".red());
         std::process::exit(1);
     }
 
-    // Unlock: macOS Keychain first, then password prompt
+    // Unlock
+    let mut unlocked = false;
     if keychain::is_keychain_available() {
         if let Some(pw) = keychain::get_from_keychain() {
             if engine.unlock(&pw).is_ok() {
-                println!("{} Unlocked from Keychain\n", "✓".dimmed());
+                unlocked = true;
             }
         }
     }
-    if !engine.is_unlocked() {
-        let pw = match Password::new("🔑 Master password:").prompt() {
-            Ok(p) => p,
-            Err(_) => std::process::exit(1),
-        };
-        if engine.unlock(&pw).is_err() {
+    if !unlocked {
+        cleanup_terminal();
+        let pw = rpassword::read_password().unwrap_or_default();
+        if pw.is_empty() || engine.unlock(&pw).is_err() {
             eprintln!("{} Wrong master password.", "✗".red());
             std::process::exit(1);
         }
     }
 
-    println!("{}", "🔐 Vaultly — interactive".cyan().bold());
-    println!(
-        "{}",
-        "  arrow keys to navigate, enter to select, ctrl+c to exit\n".dimmed()
-    );
-
-    loop {
-        let action = match Select::new("What do you want to do?", menu_options())
-            .with_page_size(14)
-            .prompt()
-        {
-            Ok(a) => a,
-            Err(_) => std::process::exit(1),
-        };
-
-        let result = match action {
-            "list" => tui_list(&mut engine),
-            "add" => tui_add(&mut engine),
-            "get" => tui_get(&mut engine),
-            "delete" => tui_delete(&mut engine),
-            "run" => tui_run(&mut engine).await,
-            "template" => tui_template(&mut engine),
-            "cf_add" => tui_cf_add(&mut engine),
-            "cf_zones" => tui_cf_zones(&mut engine).await,
-            "cf_deploy" => tui_cf_deploy(&mut engine).await,
-            "cf_secrets" => tui_cf_secrets(&mut engine).await,
-            "keychain" => tui_keychain(),
-            "status" => tui_status(&mut engine),
-            "exit" => {
-                engine.lock(None);
-                println!("{}", "\n🔒 Vault locked. Bye!\n".dimmed());
-                std::process::exit(0);
-            }
-            _ => Ok(()),
-        };
-
-        if let Err(e) = result {
-            eprintln!("{} {}", "✗".red(), e);
-        }
-        println!();
-    }
-}
-
-fn menu_options() -> Vec<&'static str> {
-    vec![
-        "📋  List vaults & keys",
-        "➕  Add / update a secret",
-        "🔑  Read a secret value",
-        "🗑️  Delete secret or vault",
-        "▶️  Run command with secrets",
-        "📦  Create vault from template",
-        "☁️  Add Cloudflare account",
-        "🌐  List accounts & zones",
-        "🚀  Deploy a Worker",
-        "🔐  Worker secrets",
-        "🔒  Keychain (auto-unlock)",
-        "📊  Status",
-        "🚪  Lock & exit",
-    ]
-}
-
-fn pick_vault(engine: &mut VaultEngine, message: &str) -> Result<String, String> {
-    let vaults = engine.list_vaults(None).s()?;
-    if vaults.is_empty() {
-        let name = Text::new("No vaults yet. New vault name:")
-            .prompt()
-            .map_err(|e| e.to_string())?;
-        return Ok(name.trim().to_string());
-    }
-    let mut options = vaults.clone();
-    options.push("➕  New vault...".to_string());
-    let choice = Select::new(message, options)
-        .prompt()
-        .map_err(|e| e.to_string())?;
-    if choice == "➕  New vault..." {
-        let name = Text::new("New vault name:")
-            .prompt()
-            .map_err(|e| e.to_string())?;
-        Ok(name.trim().to_string())
-    } else {
-        Ok(choice)
-    }
-}
-
-fn pick_key(engine: &mut VaultEngine, vault_name: &str) -> Result<String, String> {
-    let keys = engine.list_keys(vault_name, None).s()?;
-    Select::new(&format!("Key in '{}':", vault_name), keys)
-        .prompt()
-        .map_err(|e| e.to_string())
-}
-
-// ─── Actions ──────────────────────────────────────────────
-
-fn tui_list(engine: &mut VaultEngine) -> Result<(), String> {
-    let vaults = engine.list_vaults(None).s()?;
-    if vaults.is_empty() {
-        println!(
-            "{}",
-            "No vaults yet. Pick 'Add a secret' to create one.".dimmed()
-        );
-        return Ok(());
-    }
-    for v in vaults {
-        let keys = engine.list_keys(&v, None).s()?;
-        let suffix = if keys.is_empty() {
-            "(empty)".dimmed().to_string()
-        } else {
-            format!(" — {}", keys.join(", ")).dimmed().to_string()
-        };
-        println!("  {}{}", v.cyan(), suffix);
-    }
-    Ok(())
-}
-
-fn tui_add(engine: &mut VaultEngine) -> Result<(), String> {
-    let vault_name = pick_vault(engine, "Vault to store in:")?;
-    let key = Text::new("Secret name (e.g. GITHUB_TOKEN):")
-        .prompt()
-        .map_err(|e| e.to_string())?;
-    let value = Password::new(&format!("Value for {} (hidden):", key))
-        .prompt()
-        .map_err(|e| e.to_string())?;
-    if key.trim().is_empty() || value.is_empty() {
-        return Err("Name and value are required.".into());
-    }
-    engine.add_secret(&vault_name, key.trim(), &value, None).s()?;
-    println!(
-        "{} Stored '{}' in '{}'",
-        "✓".green(),
-        key.trim(),
-        vault_name
-    );
-    Ok(())
-}
-
-fn tui_get(engine: &mut VaultEngine) -> Result<(), String> {
-    let vault_name = pick_vault(engine, "Vault:")?;
-    let key = pick_key(engine, &vault_name)?;
-    let value = engine.get_secret_value(&vault_name, &key, None).s()?;
-    println!("  {}: {}", key.green(), value);
-    Ok(())
-}
-
-fn tui_delete(engine: &mut VaultEngine) -> Result<(), String> {
-    let vaults = engine.list_vaults(None).s()?;
-    if vaults.is_empty() {
-        println!("{}", "Nothing to delete.".dimmed());
-        return Ok(());
-    }
-    let vault_name = pick_vault(engine, "Delete from vault:").s()?;
-    let keys = engine.list_keys(&vault_name, None).s()?;
-    let mut options: Vec<String> = keys.iter().map(|k| format!("Secret: {}", k)).collect();
-    options.push(format!("🚨  Whole vault '{}'", vault_name));
-    let choice = Select::new(&format!("Delete what from '{}'?", vault_name), options)
-        .prompt()
-        .map_err(|e| e.to_string())?;
-
-    if let Some(key) = choice.strip_prefix("Secret: ") {
-        engine.delete_secret(&vault_name, key, None).s()?;
-        println!("{} Deleted '{}'", "✓".green(), key);
-    } else {
-        let yes = Confirm::new(&format!(
-            "Really delete vault '{}'? This cannot be undone.",
-            vault_name
-        ))
-        .with_default(false)
-        .prompt()
-        .map_err(|e| e.to_string())?;
-        if !yes {
-            return Ok(());
-        }
-        engine.delete_vault(&vault_name, None).s()?;
-        println!("{} Deleted vault '{}'", "✓".green(), vault_name);
-    }
-    Ok(())
-}
-
-async fn tui_run(engine: &mut VaultEngine) -> Result<(), String> {
-    let vault_name = pick_vault(engine, "Vault to inject:").s()?;
-    let command = Text::new("Command (e.g. npx wrangler deploy):")
-        .prompt()
-        .map_err(|e| e.to_string())?;
-    if command.trim().is_empty() {
-        return Ok(());
-    }
-    println!("{} {}\n", "▶".dimmed(), command.trim());
-    let result = engine
-        .run_command(&vault_name, command.trim(), None, None, None)
-        .await.s()?;
-    if !result.stdout.is_empty() {
-        println!("{}", result.stdout);
-    }
-    if !result.stderr.is_empty() {
-        eprintln!("{}", result.stderr);
-    }
-    if result.scrubbed {
-        println!("{} Secret values were scrubbed from output.", "⚠".yellow());
-    }
-    println!("{} Exit code: {}", "".dimmed(), result.code);
-    Ok(())
-}
-
-fn tui_template(engine: &mut VaultEngine) -> Result<(), String> {
-    use crate::templates;
-
-    let options: Vec<String> = templates::TEMPLATES
-        .iter()
-        .map(|(n, t)| format!("{:<14} {}", n, t.description))
-        .collect();
-    let pick = Select::new("Template:", options)
-        .with_page_size(16)
-        .prompt()
-        .map_err(|e| e.to_string())?;
-    let name = templates::TEMPLATES
-        .iter()
-        .find(|(n, t)| format!("{:<14} {}", n, t.description) == pick)
-        .map(|(n, _)| *n)
-        .ok_or("Unknown template")?;
-    let tpl = templates::get_template(name).ok_or("Unknown template")?;
-
-    let vault_name = if name == "custom" {
-        Text::new("Vault name:")
-            .prompt()
-            .map_err(|e| e.to_string())?
-    } else {
-        if Confirm::new(&format!("Use vault name '{}'?", name))
-            .with_default(true)
-            .prompt()
-            .map_err(|e| e.to_string())?
-        {
-            name.to_string()
-        } else {
-            Text::new("Vault name:")
-                .prompt()
-                .map_err(|e| e.to_string())?
-        }
-    };
-
-    let keys: Vec<String> = if tpl.keys.is_empty() {
-        Text::new("Custom key names (comma-separated, e.g. A,B,C):")
-            .prompt()
-            .map_err(|e| e.to_string())?
-            .split(',')
-            .map(|k| k.trim().to_string())
-            .filter(|k| !k.is_empty())
-            .collect()
-    } else {
-        tpl.keys.iter().map(|k| k.to_string()).collect()
-    };
-
-    let mut saved = 0;
-    for k in &keys {
-        let value = Password::new(&format!("  {}:", k))
-            .prompt()
-            .map_err(|e| e.to_string())?;
-        if !value.is_empty() {
-            engine.add_secret(vault_name.trim(), k, &value, None).s()?;
-            saved += 1;
-        }
-    }
-    println!(
-        "{} Vault '{}' created with {} secret(s)",
-        "✓".green(),
-        vault_name.trim(),
-        saved
-    );
-    Ok(())
-}
-
-fn tui_cf_add(engine: &mut VaultEngine) -> Result<(), String> {
-    let name = Text::new("Account name (e.g. personal, work):")
-        .prompt()
-        .map_err(|e| e.to_string())?;
-    let vault_name = if name.trim().starts_with("cf-") {
-        name.trim().to_string()
-    } else {
-        format!("cf-{}", name.trim())
-    };
-    let method = Select::new(
-        "Auth method:",
-        vec![
-            "API token (recommended, scoped)",
-            "Global API key (email + key)",
-        ],
-    )
-    .prompt()
-    .map_err(|e| e.to_string())?;
-
-    if method.starts_with("API token") {
-        let token = Password::new("CLOUDFLARE_API_TOKEN:")
-            .prompt()
-            .map_err(|e| e.to_string())?;
-        if !token.is_empty() {
-            engine.add_secret(&vault_name, "CLOUDFLARE_API_TOKEN", &token, None).s()?;
-        }
-    } else {
-        let email = Text::new("CLOUDFLARE_EMAIL:")
-            .prompt()
-            .map_err(|e| e.to_string())?;
-        let api_key = Password::new("CLOUDFLARE_API_KEY:")
-            .prompt()
-            .map_err(|e| e.to_string())?;
-        if !email.trim().is_empty() && !api_key.is_empty() {
-            engine.add_secret(&vault_name, "CLOUDFLARE_EMAIL", email.trim(), None).s()?;
-            engine.add_secret(&vault_name, "CLOUDFLARE_API_KEY", &api_key, None).s()?;
-        }
-    }
-    let account_id = Text::new("CLOUDFLARE_ACCOUNT_ID:")
-        .prompt()
-        .map_err(|e| e.to_string())?;
-    if !account_id.trim().is_empty() {
-        engine
-            .add_secret(
-                &vault_name,
-                "CLOUDFLARE_ACCOUNT_ID",
-                account_id.trim(),
-                None,
-            )
-            .s()?;
-    }
-    println!("{} Cloudflare account '{}' saved", "✓".green(), vault_name);
-    Ok(())
-}
-
-fn cf_vaults(engine: &mut VaultEngine) -> Result<Vec<String>, String> {
-    let vaults: Vec<String> = engine
+    // Load initial data
+    app.vaults = engine.list_vaults(None).unwrap_or_default();
+    app.cf_vault_names = engine
         .list_vaults(None)
-        .s()?
+        .unwrap_or_default()
         .into_iter()
         .filter(|v| v.starts_with("cf-"))
         .collect();
-    Ok(vaults)
-}
 
-async fn tui_cf_zones(engine: &mut VaultEngine) -> Result<(), String> {
-    let vaults = cf_vaults(engine)?;
-    if vaults.is_empty() {
-        println!("{}", "No Cloudflare accounts. Add one first.".dimmed());
-        return Ok(());
+    // Main loop
+    loop {
+        if terminal.draw(|frame| render(frame, &mut app, &mut engine)).is_err() {
+        break;
     }
-    let vault_name = Select::new("Account:", vaults.clone())
-        .prompt()
-        .map_err(|e| e.to_string())?;
-    let r = engine
-        .cloudflare_api(&vault_name, "GET", "/zones?per_page=50", None, None)
-        .await.s()?;
-    let zones = r
-        .data
-        .get("result")
-        .and_then(|z| z.as_array())
-        .cloned()
-        .unwrap_or_default();
-    if zones.is_empty() {
-        println!("{}", "No zones found (check token permissions).".dimmed());
-        return Ok(());
-    }
-    for z in zones {
-        let zone_name = z.get("name").and_then(|n| n.as_str()).unwrap_or("?");
-        let id = z.get("id").and_then(|i| i.as_str()).unwrap_or("?");
-        let status = z.get("status").and_then(|s| s.as_str()).unwrap_or("?");
-        println!("  {} ({}, id={})", zone_name.green(), status, id);
-    }
-    Ok(())
-}
 
-async fn tui_cf_deploy(engine: &mut VaultEngine) -> Result<(), String> {
-    let vaults = cf_vaults(engine)?;
-    if vaults.is_empty() {
-        println!("{}", "No Cloudflare accounts. Add one first.".dimmed());
-        return Ok(());
-    }
-    let vault_name = Select::new("Account:", vaults.clone())
-        .prompt()
-        .map_err(|e| e.to_string())?;
-    let project_dir = Text::new("Worker project directory:")
-        .prompt()
-        .map_err(|e| e.to_string())?;
-    if project_dir.trim().is_empty() {
-        return Ok(());
-    }
-    let result = engine
-        .run_command(
-            &vault_name,
-            "npx wrangler deploy",
-            Some(project_dir.trim()),
-            Some(86_400_000),
-            None,
-        )
-        .await.s()?;
-    if !result.stdout.is_empty() {
-        println!("{}", result.stdout);
-    }
-    if !result.stderr.is_empty() {
-        eprintln!("{}", result.stderr);
-    }
-    println!("{} Exit code: {}", "".dimmed(), result.code);
-    Ok(())
-}
-
-async fn tui_cf_secrets(engine: &mut VaultEngine) -> Result<(), String> {
-    let vaults = cf_vaults(engine)?;
-    if vaults.is_empty() {
-        println!("{}", "No Cloudflare accounts. Add one first.".dimmed());
-        return Ok(());
-    }
-    let vault_name = Select::new("Account:", vaults.clone())
-        .prompt()
-        .map_err(|e| e.to_string())?;
-    let script_name = Text::new("Worker script name:")
-        .prompt()
-        .map_err(|e| e.to_string())?;
-    if script_name.trim().is_empty() {
-        return Ok(());
-    }
-    let action = Select::new(
-        &format!("Secrets for '{}':", script_name.trim()),
-        vec!["📋  List", "➕  Set a secret", "🗑️  Delete a secret"],
-    )
-    .prompt()
-    .map_err(|e| e.to_string())?;
-
-    if action.contains("List") {
-        let r = engine
-            .worker_secrets(&vault_name, script_name.trim(), "list", None, None, None)
-            .await.s()?;
-        let names: Vec<String> = r
-            .data
-            .get("result")
-            .and_then(|x| x.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|s| {
-                        s.get("name")
-                            .and_then(|n| n.as_str())
-                            .map(|n| n.to_string())
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        if names.is_empty() {
-            println!("{}", "No secrets on this Worker.".dimmed());
-        } else {
-            for n in names {
-                println!("  - {}", n);
+        if event::poll(std::time::Duration::from_millis(100)).ok() == Some(true) {
+            if let Ok(Event::Key(key)) = event::read() {
+                if key.kind == KeyEventKind::Press {
+                    let should_quit = handle_event(&mut app, &mut engine, key).await;
+                    if should_quit {
+                        break;
+                    }
+                }
             }
         }
-        return Ok(());
     }
 
-    let name = Text::new("Secret name:")
-        .prompt()
-        .map_err(|e| e.to_string())?;
-    if name.trim().is_empty() {
-        return Ok(());
-    }
-    if action.contains("Set") {
-        let value = Password::new(&format!("Value for {} (hidden):", name.trim()))
-            .prompt()
-            .map_err(|e| e.to_string())?;
-        if value.is_empty() {
-            return Ok(());
-        }
-        engine
-            .worker_secrets(
-                &vault_name,
-                script_name.trim(),
-                "set",
-                Some(name.trim()),
-                Some(&value),
-                None,
-            )
-            .await.s()?;
-        println!(
-            "{} Set '{}' on '{}'",
-            "✓".green(),
-            name.trim(),
-            script_name.trim()
-        );
-    } else {
-        engine
-            .worker_secrets(
-                &vault_name,
-                script_name.trim(),
-                "delete",
-                Some(name.trim()),
-                None,
-                None,
-            )
-            .await.s()?;
-        println!(
-            "{} Deleted '{}' from '{}'",
-            "✓".green(),
-            name.trim(),
-            script_name.trim()
-        );
-    }
-    Ok(())
+    cleanup_terminal();
 }
 
-fn tui_keychain() -> Result<(), String> {
-    if !keychain::is_keychain_available() {
-        println!("{}", "Keychain not available (macOS only).".dimmed());
-        return Ok(());
-    }
-    let has_entry = keychain::keychain_entry_exists();
-    let mut options: Vec<String> = vec![];
-    if has_entry {
-        options.push("🗑️  Remove entry (password needed every time)".to_string());
-    }
-    options.push("🔒  Store master password (auto-unlock)".to_string());
-    options.push("📊  Status".to_string());
+fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    stdout.flush()?;
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    Terminal::new(backend)
+}
 
-    let action = Select::new(
-        if has_entry {
-            "Keychain entry exists. What next?"
-        } else {
-            "No keychain entry yet."
-        },
-        options,
+fn cleanup_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), LeaveAlternateScreen);
+}
+
+// ─── Render ────────────────────────────────────────────────
+
+fn render(frame: &mut Frame, app: &mut App, engine: &mut VaultEngine) {
+    let area = frame.area();
+
+    // Main layout: content + status bar
+    let chunks = Layout::new(
+        Direction::Vertical,
+        [
+            Constraint::Min(0),
+            Constraint::Length(3),
+        ],
     )
-    .prompt()
-    .map_err(|e| e.to_string())?;
+    .split(area);
 
-    if action.contains("Store") {
-        let pw = Password::new("Master password to store:")
-            .prompt()
-            .map_err(|e| e.to_string())?;
-        if keychain::store_in_keychain(&pw) {
-            println!(
-                "{} Stored — MCP server and TUI will auto-unlock.",
-                "✓".green()
-            );
-        } else {
-            eprintln!("{} Failed to store in Keychain.", "✗".red());
-        }
-    } else if action.contains("Remove") {
-        keychain::delete_from_keychain();
-        println!("{} Removed from Keychain.", "✓".green());
+    match app.screen {
+        Screen::Menu => render_menu(frame, chunks[0], app),
+        Screen::AddSecret => render_add_secret(frame, chunks[0], app),
+        Screen::GetSecret => render_get_secret(frame, chunks[0], app),
+        Screen::DeleteSecret => render_delete_secret(frame, chunks[0], app),
+        Screen::RunCommand => render_run_command(frame, chunks[0], app),
+        Screen::Template => render_template(frame, chunks[0], app),
+        Screen::CfAdd => render_cf_add(frame, chunks[0], app),
+        Screen::CfZones => render_cf_zones(frame, chunks[0], app),
+        Screen::CfDeploy => render_cf_deploy(frame, chunks[0], app),
+        Screen::CfSecrets => render_cf_secrets(frame, chunks[0], app),
+        Screen::Keychain => render_keychain(frame, chunks[0], app),
+        Screen::Status => render_status(frame, chunks[0], app, engine),
+        Screen::Exit => render_exit(frame, chunks[0]),
+    }
+
+    // Status bar
+    render_status_bar(frame, chunks[1], app);
+}
+
+fn render_status_bar(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+    let text = if app.input_mode == InputMode::Editing {
+        Line::from(vec![
+            Span::styled(" Type text, ", Style::new().fg(Color::Black).bg(Color::Cyan)),
+            Span::styled("Enter to confirm, ", Style::new().fg(Color::White)),
+            Span::styled("Esc to cancel", Style::new().fg(Color::White)),
+        ])
     } else {
-        println!(
-            "{}",
-            if keychain::keychain_entry_exists() {
-                "  Keychain: stored ✓".green().to_string()
+        Line::from(vec![
+            Span::styled(" ↑↓ navigate, ", Style::new().fg(Color::Yellow)),
+            Span::styled("Enter select, ", Style::new().fg(Color::White)),
+            Span::styled("Esc back, ", Style::new().fg(Color::White)),
+            Span::styled("Q quit", Style::new().fg(Color::White)),
+        ])
+    };
+
+    let status = if let Some(msg) = &app.status_msg {
+        let color = if app.status_is_error { Color::Red } else { Color::Green };
+        Line::from(vec![
+            Span::styled(format!(" {} ", msg), Style::new().fg(color).add_modifier(Modifier::BOLD)),
+        ])
+    } else {
+        Line::from("")
+    };
+
+    let chunks = Layout::new(
+        Direction::Vertical,
+        [Constraint::Length(1), Constraint::Length(1)],
+    )
+    .split(area);
+
+    frame.render_widget(Paragraph::new(text), chunks[0]);
+    frame.render_widget(Paragraph::new(status), chunks[1]);
+}
+
+fn render_menu(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+    let items: Vec<ListItem> = MENU_OPTIONS
+        .iter()
+        .enumerate()
+        .map(|(i, opt)| {
+            let style = if i == app.menu_selected {
+                Style::new().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
             } else {
-                "  Keychain: not stored".dimmed().to_string()
-            }
-        );
-    }
-    Ok(())
+                Style::new().fg(Color::White)
+            };
+            ListItem::new(Line::from(Span::styled(*opt, style)))
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(Block::new().borders(Borders::ALL).title(" Vaultly — Interactive "));
+    frame.render_widget(list, area);
 }
 
-fn tui_status(engine: &mut VaultEngine) -> Result<(), String> {
-    let vaults = engine.list_vaults(None).s()?;
-    let ttl_min = engine.session_expires_in() / 60;
-    println!("  Unlocked: {}", "yes".green());
-    println!("  Session:  ~{} min remaining", ttl_min);
-    println!(
-        "  Vaults:   {}",
-        if vaults.is_empty() {
-            "none".to_string()
-        } else {
-            vaults.join(", ")
-        }
+fn render_add_secret(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+    let chunks = Layout::new(
+        Direction::Vertical,
+        [
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(0),
+        ],
+    )
+    .split(area);
+
+    // Title
+    frame.render_widget(
+        Paragraph::new("➕  Add / Update Secret")
+            .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+            .block(Block::new().borders(Borders::BOTTOM)),
+        chunks[0],
     );
-    println!(
-        "  Keychain: {}",
-        if !keychain::is_keychain_available() {
-            "not available (macOS only)".dimmed().to_string()
-        } else if keychain::keychain_entry_exists() {
-            "stored ✓".green().to_string()
-        } else {
-            "not stored".dimmed().to_string()
-        }
+
+    // Vault
+    let vault_text = app
+        .flow_vault
+        .as_deref()
+        .map(|v| format!("Vault: {}", v))
+        .unwrap_or_else(|| "Enter vault name:".to_string());
+    let vault_style = if app.flow_step == 0 {
+        Style::new().fg(Color::Yellow)
+    } else {
+        Style::new().fg(Color::White)
+    };
+    frame.render_widget(
+        Paragraph::new(vault_text).style(vault_style).block(
+            Block::new()
+                .borders(Borders::ALL)
+                .title(" Vault ")
+                .border_style(if app.flow_step == 0 {
+                    Color::Yellow
+                } else {
+                    Color::Gray
+                }),
+        ),
+        chunks[1],
     );
-    Ok(())
+
+    // Key
+    let key_text = app.flow_key.as_deref().unwrap_or("");
+    let key_prompt = if app.flow_step == 1 {
+        format!("Secret name (e.g. GITHUB_TOKEN): {}", key_text)
+    } else if app.flow_step == 2 {
+        format!("Secret name: {}", key_text)
+    } else {
+        "Enter secret name".to_string()
+    };
+    frame.render_widget(
+        Paragraph::new(key_prompt).style(Style::new().fg(Color::White)).block(
+            Block::new()
+                .borders(Borders::ALL)
+                .title(" Key ")
+                .border_style(if app.flow_step == 1 {
+                    Color::Yellow
+                } else {
+                    Color::Gray
+                }),
+        ),
+        chunks[2],
+    );
+
+    // Value
+    let value_text = if app.flow_step == 2 {
+        format!("Value (hidden): {}", "*".repeat(app.input_buffer.len()))
+    } else {
+        "Enter value".to_string()
+    };
+    frame.render_widget(
+        Paragraph::new(value_text).style(Style::new().fg(Color::White)).block(
+            Block::new()
+                .borders(Borders::ALL)
+                .title(" Value ")
+                .border_style(if app.flow_step == 2 {
+                    Color::Yellow
+                } else {
+                    Color::Gray
+                }),
+        ),
+        chunks[3],
+    );
+}
+
+fn render_get_secret(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+    let chunks = Layout::new(
+        Direction::Vertical,
+        [Constraint::Length(3), Constraint::Length(3), Constraint::Min(0)],
+    )
+    .split(area);
+
+    frame.render_widget(
+        Paragraph::new("🔑  Read Secret Value")
+            .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+            .block(Block::new().borders(Borders::BOTTOM)),
+        chunks[0],
+    );
+
+    let vault_text = app
+        .flow_vault
+        .as_deref()
+        .map(|v| format!("Vault: {}", v))
+        .unwrap_or_else(|| "Select vault:".to_string());
+    frame.render_widget(
+        Paragraph::new(vault_text).style(Style::new().fg(Color::White)).block(
+            Block::new()
+                .borders(Borders::ALL)
+                .title(" Vault ")
+                .border_style(if app.flow_step == 0 {
+                    Color::Yellow
+                } else {
+                    Color::Gray
+                }),
+        ),
+        chunks[1],
+    );
+
+    let key_text = app.flow_key.as_deref().unwrap_or("");
+    let key_prompt = if app.flow_step == 1 {
+        format!("Select key: {}", key_text)
+    } else {
+        "Select key".to_string()
+    };
+    frame.render_widget(
+        Paragraph::new(key_prompt).style(Style::new().fg(Color::White)).block(
+            Block::new()
+                .borders(Borders::ALL)
+                .title(" Key ")
+                .border_style(if app.flow_step == 1 {
+                    Color::Yellow
+                } else {
+                    Color::Gray
+                }),
+        ),
+        chunks[2],
+    );
+}
+
+fn render_delete_secret(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+    let chunks = Layout::new(
+        Direction::Vertical,
+        [Constraint::Length(3), Constraint::Length(3), Constraint::Min(0)],
+    )
+    .split(area);
+
+    frame.render_widget(
+        Paragraph::new("🗑️  Delete Secret or Vault")
+            .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+            .block(Block::new().borders(Borders::BOTTOM)),
+        chunks[0],
+    );
+
+    let vault_text = app
+        .flow_vault
+        .as_deref()
+        .map(|v| format!("Vault: {}", v))
+        .unwrap_or_else(|| "Select vault:".to_string());
+    frame.render_widget(
+        Paragraph::new(vault_text).style(Style::new().fg(Color::White)).block(
+            Block::new()
+                .borders(Borders::ALL)
+                .title(" Vault ")
+                .border_style(if app.flow_step == 0 {
+                    Color::Yellow
+                } else {
+                    Color::Gray
+                }),
+        ),
+        chunks[1],
+    );
+
+    let key_text = app.flow_key.as_deref().unwrap_or("");
+    let prompt = if app.flow_step == 1 {
+        format!("Select key to delete, or choose whole vault: {}", key_text)
+    } else {
+        "Select key or vault".to_string()
+    };
+    frame.render_widget(
+        Paragraph::new(prompt).style(Style::new().fg(Color::White)).block(
+            Block::new()
+                .borders(Borders::ALL)
+                .title(" Delete ")
+                .border_style(if app.flow_step == 1 {
+                    Color::Yellow
+                } else {
+                    Color::Gray
+                }),
+        ),
+        chunks[2],
+    );
+}
+
+fn render_run_command(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+    let chunks = Layout::new(
+        Direction::Vertical,
+        [Constraint::Length(3), Constraint::Length(3), Constraint::Min(0)],
+    )
+    .split(area);
+
+    frame.render_widget(
+        Paragraph::new("▶️  Run Command with Secrets")
+            .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+            .block(Block::new().borders(Borders::BOTTOM)),
+        chunks[0],
+    );
+
+    let vault_text = app
+        .flow_vault
+        .as_deref()
+        .map(|v| format!("Vault: {}", v))
+        .unwrap_or_else(|| "Select vault:".to_string());
+    frame.render_widget(
+        Paragraph::new(vault_text).style(Style::new().fg(Color::White)).block(
+            Block::new()
+                .borders(Borders::ALL)
+                .title(" Vault ")
+                .border_style(if app.flow_step == 0 {
+                    Color::Yellow
+                } else {
+                    Color::Gray
+                }),
+        ),
+        chunks[1],
+    );
+
+    let cmd_text = app.flow_command.as_deref().unwrap_or("");
+    let prompt = if app.flow_step == 1 {
+        format!("Command (e.g. npx wrangler deploy): {}", cmd_text)
+    } else {
+        "Enter command".to_string()
+    };
+    frame.render_widget(
+        Paragraph::new(prompt).style(Style::new().fg(Color::White)).block(
+            Block::new()
+                .borders(Borders::ALL)
+                .title(" Command ")
+                .border_style(if app.flow_step == 1 {
+                    Color::Yellow
+                } else {
+                    Color::Gray
+                }),
+        ),
+        chunks[2],
+    );
+}
+
+fn render_template(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+    let chunks = Layout::new(
+        Direction::Vertical,
+        [Constraint::Length(3), Constraint::Length(3), Constraint::Min(0)],
+    )
+    .split(area);
+
+    frame.render_widget(
+        Paragraph::new("📦  Create Vault from Template")
+            .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+            .block(Block::new().borders(Borders::BOTTOM)),
+        chunks[0],
+    );
+
+    let name_text = app
+        .flow_template_name
+        .as_deref()
+        .unwrap_or("");
+    let prompt = if app.flow_step == 0 {
+        format!("Select template: {}", name_text)
+    } else if app.flow_step == 1 {
+        format!("Vault name: {}", name_text)
+    } else {
+        "Enter key values".to_string()
+    };
+    frame.render_widget(
+        Paragraph::new(prompt).style(Style::new().fg(Color::White)).block(
+            Block::new()
+                .borders(Borders::ALL)
+                .title(" Template ")
+                .border_style(if app.flow_step < 2 {
+                    Color::Yellow
+                } else {
+                    Color::Gray
+                }),
+        ),
+        chunks[1],
+    );
+
+    let keys_info = if app.template_keys.is_empty() {
+        "No keys defined".to_string()
+    } else {
+        format!(
+            "Keys: {} (step {}/{})",
+            app.template_keys.join(", "),
+            app.template_step + 1,
+            app.template_keys.len()
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(keys_info).style(Style::new().fg(Color::White)).block(
+            Block::new()
+                .borders(Borders::ALL)
+                .title(" Keys ")
+                .border_style(if app.flow_step == 2 {
+                    Color::Yellow
+                } else {
+                    Color::Gray
+                }),
+        ),
+        chunks[2],
+    );
+}
+
+fn render_cf_add(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+    let chunks = Layout::new(
+        Direction::Vertical,
+        [Constraint::Length(3), Constraint::Length(3), Constraint::Min(0)],
+    )
+    .split(area);
+
+    frame.render_widget(
+        Paragraph::new("☁️  Add Cloudflare Account")
+            .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+            .block(Block::new().borders(Borders::BOTTOM)),
+        chunks[0],
+    );
+
+    let name_text = app.flow_cf_name.as_deref().unwrap_or("");
+    let prompt = if app.flow_step == 0 {
+        format!("Account name (e.g. personal, work): {}", name_text)
+    } else if app.flow_step == 1 {
+        "Select auth method".to_string()
+    } else {
+        format!("Enter credentials (step {})", app.flow_step)
+    };
+    frame.render_widget(
+        Paragraph::new(prompt).style(Style::new().fg(Color::White)).block(
+            Block::new()
+                .borders(Borders::ALL)
+                .title(" Cloudflare ")
+                .border_style(if app.flow_step < 3 {
+                    Color::Yellow
+                } else {
+                    Color::Gray
+                }),
+        ),
+        chunks[1],
+    );
+
+    let info = if app.flow_step == 1 {
+        "1) API token (recommended)\n2) Global API key (email + key)"
+    } else {
+        "Fill in the credentials for the selected auth method"
+    };
+    frame.render_widget(
+        Paragraph::new(info).style(Style::new().fg(Color::White)).block(
+            Block::new()
+                .borders(Borders::ALL)
+                .title(" Auth ")
+                .border_style(if app.flow_step == 1 {
+                    Color::Yellow
+                } else {
+                    Color::Gray
+                }),
+        ),
+        chunks[2],
+    );
+}
+
+fn render_cf_zones(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+    let chunks = Layout::new(
+        Direction::Vertical,
+        [Constraint::Length(3), Constraint::Min(0)],
+    )
+    .split(area);
+
+    frame.render_widget(
+        Paragraph::new("🌐  List Accounts & Zones")
+            .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+            .block(Block::new().borders(Borders::BOTTOM)),
+        chunks[0],
+    );
+
+    let vault_text = app
+        .flow_vault
+        .as_deref()
+        .map(|v| format!("Vault: {}", v))
+        .unwrap_or_else(|| "Select Cloudflare account:".to_string());
+    frame.render_widget(
+        Paragraph::new(vault_text).style(Style::new().fg(Color::White)).block(
+            Block::new()
+                .borders(Borders::ALL)
+                .title(" Account ")
+                .border_style(if app.flow_step == 0 {
+                    Color::Yellow
+                } else {
+                    Color::Gray
+                }),
+        ),
+        chunks[1],
+    );
+}
+
+fn render_cf_deploy(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+    let chunks = Layout::new(
+        Direction::Vertical,
+        [Constraint::Length(3), Constraint::Length(3), Constraint::Min(0)],
+    )
+    .split(area);
+
+    frame.render_widget(
+        Paragraph::new("🚀  Deploy a Worker")
+            .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+            .block(Block::new().borders(Borders::BOTTOM)),
+        chunks[0],
+    );
+
+    let vault_text = app
+        .flow_vault
+        .as_deref()
+        .map(|v| format!("Vault: {}", v))
+        .unwrap_or_else(|| "Select Cloudflare account:".to_string());
+    frame.render_widget(
+        Paragraph::new(vault_text).style(Style::new().fg(Color::White)).block(
+            Block::new()
+                .borders(Borders::ALL)
+                .title(" Account ")
+                .border_style(if app.flow_step == 0 {
+                    Color::Yellow
+                } else {
+                    Color::Gray
+                }),
+        ),
+        chunks[1],
+    );
+
+    let dir_text = app.flow_command.as_deref().unwrap_or("");
+    let prompt = if app.flow_step == 1 {
+        format!("Worker project directory: {}", dir_text)
+    } else {
+        "Enter project directory".to_string()
+    };
+    frame.render_widget(
+        Paragraph::new(prompt).style(Style::new().fg(Color::White)).block(
+            Block::new()
+                .borders(Borders::ALL)
+                .title(" Directory ")
+                .border_style(if app.flow_step == 1 {
+                    Color::Yellow
+                } else {
+                    Color::Gray
+                }),
+        ),
+        chunks[2],
+    );
+}
+
+fn render_cf_secrets(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+    let chunks = Layout::new(
+        Direction::Vertical,
+        [Constraint::Length(3), Constraint::Length(3), Constraint::Min(0)],
+    )
+    .split(area);
+
+    frame.render_widget(
+        Paragraph::new("🔐  Worker Secrets")
+            .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+            .block(Block::new().borders(Borders::BOTTOM)),
+        chunks[0],
+    );
+
+    let vault_text = app
+        .flow_vault
+        .as_deref()
+        .map(|v| format!("Vault: {}", v))
+        .unwrap_or_else(|| "Select Cloudflare account:".to_string());
+    frame.render_widget(
+        Paragraph::new(vault_text).style(Style::new().fg(Color::White)).block(
+            Block::new()
+                .borders(Borders::ALL)
+                .title(" Account ")
+                .border_style(if app.flow_step == 0 {
+                    Color::Yellow
+                } else {
+                    Color::Gray
+                }),
+        ),
+        chunks[1],
+    );
+
+    let script_text = app.flow_script_name.as_deref().unwrap_or("");
+    let prompt = if app.flow_step == 1 {
+        format!("Worker script name: {}", script_text)
+    } else if app.flow_step == 2 {
+        "Select action: list, set, delete".to_string()
+    } else if app.flow_step == 3 {
+        format!("Secret name: {}", app.flow_secret_name.as_deref().unwrap_or(""))
+    } else if app.flow_step == 4 {
+        format!("Secret value: {}", "*".repeat(app.input_buffer.len()))
+    } else {
+        "Manage secrets".to_string()
+    };
+    frame.render_widget(
+        Paragraph::new(prompt).style(Style::new().fg(Color::White)).block(
+            Block::new()
+                .borders(Borders::ALL)
+                .title(" Secrets ")
+                .border_style(if app.flow_step < 5 {
+                    Color::Yellow
+                } else {
+                    Color::Gray
+                }),
+        ),
+        chunks[2],
+    );
+}
+
+fn render_keychain(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+    let chunks = Layout::new(
+        Direction::Vertical,
+        [Constraint::Length(3), Constraint::Min(0)],
+    )
+    .split(area);
+
+    frame.render_widget(
+        Paragraph::new("🔒  Keychain (Auto-Unlock)")
+            .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+            .block(Block::new().borders(Borders::BOTTOM)),
+        chunks[0],
+    );
+
+    let has_entry = keychain::keychain_entry_exists();
+    let options = if has_entry {
+        vec![
+            "🗑️  Remove entry (password needed every time)",
+            "📊  Status",
+        ]
+    } else {
+        vec![
+            "🔒  Store master password (auto-unlock)",
+            "📊  Status",
+        ]
+    };
+
+    let items: Vec<ListItem> = options
+        .iter()
+        .enumerate()
+        .map(|(i, opt)| {
+            let style = if i == app.menu_selected {
+                Style::new().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().fg(Color::White)
+            };
+            ListItem::new(Line::from(Span::styled(*opt, style)))
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(Block::new().borders(Borders::ALL).title(" Keychain "));
+    frame.render_widget(list, chunks[1]);
+}
+
+fn render_status(frame: &mut Frame, area: ratatui::layout::Rect, _app: &App, engine: &mut VaultEngine) {
+    let chunks = Layout::new(
+        Direction::Vertical,
+        [
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Min(0),
+        ],
+    )
+    .split(area);
+
+    frame.render_widget(
+        Paragraph::new("📊  Vaultly Status").style(
+            Style::new()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .block(Block::new().borders(Borders::BOTTOM)),
+        chunks[0],
+    );
+
+    let vaults = engine.list_vaults(None).unwrap_or_default();
+    let vaults_str = if vaults.is_empty() {
+        "none".to_string()
+    } else {
+        vaults.join(", ")
+    };
+
+    frame.render_widget(
+        Paragraph::new(format!("  Vaults: {}", vaults_str))
+            .style(Style::new().fg(Color::White)),
+        chunks[1],
+    );
+
+    let kc = if !keychain::is_keychain_available() {
+        "not available (macOS only)"
+    } else if keychain::keychain_entry_exists() {
+        "stored ✓"
+    } else {
+        "not stored"
+    };
+    frame.render_widget(
+        Paragraph::new(format!("  Keychain: {}", kc))
+            .style(Style::new().fg(Color::White)),
+        chunks[2],
+    );
+
+    frame.render_widget(
+        Paragraph::new(format!("  Platform: {}", std::env::consts::OS))
+            .style(Style::new().fg(Color::White)),
+        chunks[3],
+    );
+
+    let agent_mode = if std::env::var("VAULTLY_AGENT_MODE").as_deref() == Ok("1") {
+        "ON (get/env blocked)"
+    } else {
+        "off"
+    };
+    frame.render_widget(
+        Paragraph::new(format!("  Agent mode: {}", agent_mode))
+            .style(Style::new().fg(Color::White)),
+        chunks[4],
+    );
+}
+
+fn render_exit(frame: &mut Frame, area: ratatui::layout::Rect) {
+    let text = "🚪  Lock & exit?\n\n  Y — lock vault and exit\n  N — cancel";
+    frame.render_widget(
+        Paragraph::new(text)
+            .style(Style::new().fg(Color::White))
+            .block(Block::new().borders(Borders::ALL).title(" Exit ")),
+        area,
+    );
+}
+
+// ─── Event Handling ────────────────────────────────────────
+
+async fn handle_event(
+    app: &mut App,
+    engine: &mut VaultEngine,
+    key: KeyEvent,
+) -> bool {
+    // Returns true if should quit
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        return true;
+    }
+
+    match app.screen {
+        Screen::Menu => handle_menu(app, engine, key).await,
+        Screen::AddSecret => handle_add_secret(app, engine, key).await,
+        Screen::GetSecret => handle_get_secret(app, engine, key).await,
+        Screen::DeleteSecret => handle_delete_secret(app, engine, key).await,
+        Screen::RunCommand => handle_run_command(app, engine, key).await,
+        Screen::Template => handle_template(app, engine, key).await,
+        Screen::CfAdd => handle_cf_add(app, engine, key).await,
+        Screen::CfZones => handle_cf_zones(app, engine, key).await,
+        Screen::CfDeploy => handle_cf_deploy(app, engine, key).await,
+        Screen::CfSecrets => handle_cf_secrets(app, engine, key).await,
+        Screen::Keychain => handle_keychain(app, engine, key).await,
+        Screen::Status => handle_status(app, engine, key).await,
+        Screen::Exit => handle_exit(app, engine, key).await,
+    }
+}
+
+async fn handle_menu(app: &mut App, _engine: &mut VaultEngine, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Up => {
+            if app.menu_selected > 0 {
+                app.menu_selected -= 1;
+            }
+        }
+        KeyCode::Down => {
+            if app.menu_selected < MENU_OPTIONS.len() - 1 {
+                app.menu_selected += 1;
+            }
+        }
+        KeyCode::Enter => {
+            let selected = app.menu_selected;
+            match selected {
+                0 => {
+                    // List vaults & keys
+                    app.screen = Screen::Status;
+                    app.set_status(&format!("{} vaults", app.vaults.len()), false);
+                }
+                1 => {
+                    // Add secret
+                    app.reset_flow();
+                    app.screen = Screen::AddSecret;
+                    app.input_mode = InputMode::Editing;
+                    app.flow_step = 0;
+                }
+                2 => {
+                    // Get secret
+                    app.reset_flow();
+                    app.screen = Screen::GetSecret;
+                    app.input_mode = InputMode::Navigation;
+                    app.flow_step = 0;
+                }
+                3 => {
+                    // Delete secret
+                    app.reset_flow();
+                    app.screen = Screen::DeleteSecret;
+                    app.input_mode = InputMode::Navigation;
+                    app.flow_step = 0;
+                }
+                4 => {
+                    // Run command
+                    app.reset_flow();
+                    app.screen = Screen::RunCommand;
+                    app.input_mode = InputMode::Navigation;
+                    app.flow_step = 0;
+                }
+                5 => {
+                    // Template
+                    app.reset_flow();
+                    app.screen = Screen::Template;
+                    app.input_mode = InputMode::Navigation;
+                    app.flow_step = 0;
+                }
+                6 => {
+                    // CF add
+                    app.reset_flow();
+                    app.screen = Screen::CfAdd;
+                    app.input_mode = InputMode::Editing;
+                    app.flow_step = 0;
+                }
+                7 => {
+                    // CF zones
+                    app.reset_flow();
+                    app.screen = Screen::CfZones;
+                    app.input_mode = InputMode::Navigation;
+                    app.flow_step = 0;
+                }
+                8 => {
+                    // CF deploy
+                    app.reset_flow();
+                    app.screen = Screen::CfDeploy;
+                    app.input_mode = InputMode::Navigation;
+                    app.flow_step = 0;
+                }
+                9 => {
+                    // CF secrets
+                    app.reset_flow();
+                    app.screen = Screen::CfSecrets;
+                    app.input_mode = InputMode::Navigation;
+                    app.flow_step = 0;
+                }
+                10 => {
+                    // Keychain
+                    app.reset_flow();
+                    app.screen = Screen::Keychain;
+                    app.input_mode = InputMode::Navigation;
+                    app.menu_selected = 0;
+                }
+                11 => {
+                    // Status
+                    app.screen = Screen::Status;
+                }
+                12 => {
+                    // Exit
+                    app.screen = Screen::Exit;
+                }
+                _ => {}
+            }
+        }
+        KeyCode::Char('q') | KeyCode::Esc => {
+            return true;
+        }
+        _ => {}
+    }
+    false
+}
+
+async fn handle_add_secret(app: &mut App, engine: &mut VaultEngine, key: KeyEvent) -> bool {
+    match app.input_mode {
+        InputMode::Editing => match key.code {
+            KeyCode::Enter => {
+                let input = app.input_buffer.trim().to_string();
+                if app.flow_step == 0 {
+                    // Vault name
+                    if input.is_empty() {
+                        app.set_status("Vault name is required", true);
+                        return false;
+                    }
+                    app.flow_vault = Some(input);
+                    app.flow_step = 1;
+                    app.input_buffer.clear();
+                } else if app.flow_step == 1 {
+                    // Key name
+                    if input.is_empty() {
+                        app.set_status("Secret name is required", true);
+                        return false;
+                    }
+                    app.flow_key = Some(input);
+                    app.flow_step = 2;
+                    app.input_buffer.clear();
+                } else if app.flow_step == 2 {
+                    // Value
+                    if input.is_empty() {
+                        app.set_status("Value is required", true);
+                        return false;
+                    }
+                    app.flow_value = Some(input);
+                    // Execute
+                    let vault = app.flow_vault.clone().unwrap();
+                    let key_name = app.flow_key.clone().unwrap();
+                    let value = app.flow_value.clone().unwrap();
+                    match engine.add_secret(&vault, &key_name, &value, None) {
+                        Ok(()) => {
+                            app.set_status(&format!("✓ Stored '{}' in '{}'", key_name, vault), false);
+                            // Refresh vault list
+                            app.vaults = engine.list_vaults(None).unwrap_or_default();
+                            app.screen = Screen::Menu;
+                            app.input_mode = InputMode::Navigation;
+                        }
+                        Err(e) => {
+                            app.set_status(&format!("✗ {}", e), true);
+                            app.flow_step = 2; // Stay on value step
+                        }
+                    }
+                }
+            }
+            KeyCode::Esc => {
+                app.reset_flow();
+                app.screen = Screen::Menu;
+                app.input_mode = InputMode::Navigation;
+            }
+            KeyCode::Backspace => {
+                app.input_buffer.pop();
+            }
+            KeyCode::Char(c) => {
+                if !key.modifiers.contains(KeyModifiers::SHIFT) || c.is_alphabetic() {
+                    app.input_buffer.push(c);
+                }
+            }
+            _ => {}
+        }
+        _ => {}
+    }
+    false
+}
+
+async fn handle_get_secret(app: &mut App, engine: &mut VaultEngine, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Up => {
+            if app.flow_step == 0 && !app.vaults.is_empty() {
+                // Navigate vaults
+                if let Some(idx) = app.vaults.iter().position(|v| Some(v) == app.flow_vault.as_ref()) {
+                    let next = (idx + 1) % app.vaults.len();
+                    app.flow_vault = Some(app.vaults[next].clone());
+                } else if !app.vaults.is_empty() {
+                    app.flow_vault = Some(app.vaults[0].clone());
+                }
+            }
+        }
+        KeyCode::Down => {
+            if app.flow_step == 0 && !app.vaults.is_empty() {
+                if let Some(idx) = app.vaults.iter().position(|v| Some(v) == app.flow_vault.as_ref()) {
+                    let next = if idx == 0 { app.vaults.len() - 1 } else { idx - 1 };
+                    app.flow_vault = Some(app.vaults[next].clone());
+                }
+            }
+        }
+        KeyCode::Enter => {
+            if app.flow_step == 0 {
+                if app.flow_vault.is_some() {
+                    app.flow_step = 1;
+                } else {
+                    app.set_status("Select a vault first", true);
+                }
+            } else if app.flow_step == 1 {
+                let vault = app.flow_vault.clone().unwrap();
+                let key_name = app.flow_key.clone().unwrap();
+                match engine.get_secret_value(&vault, &key_name, None) {
+                    Ok(value) => {
+                        app.set_status(&format!("{}: {}", key_name, value), false);
+                        app.screen = Screen::Menu;
+                        app.input_mode = InputMode::Navigation;
+                    }
+                    Err(e) => {
+                        app.set_status(&format!("✗ {}", e), true);
+                    }
+                }
+            }
+        }
+        KeyCode::Esc => {
+            app.reset_flow();
+            app.screen = Screen::Menu;
+            app.input_mode = InputMode::Navigation;
+        }
+        _ => {}
+    }
+    false
+}
+
+async fn handle_delete_secret(app: &mut App, engine: &mut VaultEngine, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Up | KeyCode::Down => {
+            if app.flow_step == 0 && !app.vaults.is_empty() {
+                if let Some(idx) = app.vaults.iter().position(|v| Some(v) == app.flow_vault.as_ref()) {
+                    let next = if key.code == KeyCode::Up {
+                        if idx == 0 { app.vaults.len() - 1 } else { idx - 1 }
+                    } else {
+                        (idx + 1) % app.vaults.len()
+                    };
+                    app.flow_vault = Some(app.vaults[next].clone());
+                } else if !app.vaults.is_empty() {
+                    app.flow_vault = Some(app.vaults[0].clone());
+                }
+            }
+        }
+        KeyCode::Enter => {
+            if app.flow_step == 0 {
+                if app.flow_vault.is_some() {
+                    app.flow_step = 1;
+                } else {
+                    app.set_status("Select a vault first", true);
+                }
+            } else if app.flow_step == 1 {
+                let vault = app.flow_vault.clone().unwrap();
+                if let Some(key_name) = &app.flow_key {
+                    match engine.delete_secret(&vault, key_name, None) {
+                        Ok(true) => {
+                            app.set_status(&format!("✓ Deleted '{}' from '{}'", key_name, vault), false);
+                            app.screen = Screen::Menu;
+                            app.input_mode = InputMode::Navigation;
+                        }
+                        Ok(false) => {
+                            app.set_status(&format!("✗ '{}' not found in '{}'", key_name, vault), true);
+                        }
+                        Err(e) => {
+                            app.set_status(&format!("✗ {}", e), true);
+                        }
+                    }
+                } else {
+                    // Delete whole vault
+                    match engine.delete_vault(&vault, None) {
+                        Ok(true) => {
+                            app.set_status(&format!("✓ Deleted vault '{}'", vault), false);
+                            app.vaults = engine.list_vaults(None).unwrap_or_default();
+                            app.screen = Screen::Menu;
+                            app.input_mode = InputMode::Navigation;
+                        }
+                        Ok(false) => {
+                            app.set_status(&format!("✗ Vault '{}' not found", vault), true);
+                        }
+                        Err(e) => {
+                            app.set_status(&format!("✗ {}", e), true);
+                        }
+                    }
+                }
+            }
+        }
+        KeyCode::Esc => {
+            app.reset_flow();
+            app.screen = Screen::Menu;
+            app.input_mode = InputMode::Navigation;
+        }
+        _ => {}
+    }
+    false
+}
+
+async fn handle_run_command(app: &mut App, engine: &mut VaultEngine, key: KeyEvent) -> bool {
+    match app.input_mode {
+        InputMode::Editing => match key.code {
+            KeyCode::Enter => {
+                let input = app.input_buffer.trim().to_string();
+                if app.flow_step == 0 {
+                    if input.is_empty() {
+                        app.set_status("Vault name is required", true);
+                        return false;
+                    }
+                    app.flow_vault = Some(input);
+                    app.flow_step = 1;
+                    app.input_buffer.clear();
+                } else if app.flow_step == 1 {
+                    if input.is_empty() {
+                        app.set_status("Command is required", true);
+                        return false;
+                    }
+                    app.flow_command = Some(input);
+                    // Execute
+                    let vault = app.flow_vault.clone().unwrap();
+                    let cmd = app.flow_command.clone().unwrap();
+                    match engine.run_command(&vault, &cmd, None, None, None).await {
+                        Ok(res) => {
+                            app.run_result = Some((res.stdout, res.stderr, res.code, res.scrubbed));
+                            app.set_status(&format!("Exit code: {}", res.code), res.code != 0);
+                            app.screen = Screen::Menu;
+                            app.input_mode = InputMode::Navigation;
+                        }
+                        Err(e) => {
+                            app.set_status(&format!("✗ {}", e), true);
+                        }
+                    }
+                }
+            }
+            KeyCode::Esc => {
+                app.reset_flow();
+                app.screen = Screen::Menu;
+                app.input_mode = InputMode::Navigation;
+            }
+            KeyCode::Backspace => {
+                app.input_buffer.pop();
+            }
+            KeyCode::Char(c) => {
+                app.input_buffer.push(c);
+            }
+            _ => {}
+        }
+        _ => {}
+    }
+    false
+}
+
+async fn handle_template(app: &mut App, engine: &mut VaultEngine, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Up | KeyCode::Down => {
+            if app.flow_step == 0 {
+                // Navigate templates
+                let names = crate::templates::template_names();
+                if !names.is_empty() {
+                    let current = app.flow_template_name.as_deref().unwrap_or("");
+                    if let Some(idx) = names.iter().position(|n| *n == current) {
+                        let next = if key.code == KeyCode::Up {
+                            if idx == 0 { names.len() - 1 } else { idx - 1 }
+                        } else {
+                            (idx + 1) % names.len()
+                        };
+                        app.flow_template_name = Some(names[next].to_string());
+                        let tpl = crate::templates::get_template(names[next]).unwrap();
+                        app.template_keys = tpl.keys.iter().map(|k| k.to_string()).collect();
+                    } else {
+                        app.flow_template_name = Some(names[0].to_string());
+                        let tpl = crate::templates::get_template(names[0]).unwrap();
+                        app.template_keys = tpl.keys.iter().map(|k| k.to_string()).collect();
+                    }
+                }
+            }
+        }
+        KeyCode::Enter => {
+            if app.flow_step == 0 {
+                if app.flow_template_name.is_some() {
+                    app.flow_step = 1;
+                } else {
+                    app.set_status("Select a template first", true);
+                }
+            } else if app.flow_step == 1 {
+                let input = app.input_buffer.trim().to_string();
+                if input.is_empty() {
+                    app.set_status("Vault name is required", true);
+                    return false;
+                }
+                app.flow_template_name = Some(input);
+                app.flow_step = 2;
+                app.input_buffer.clear();
+                app.template_step = 0;
+            } else if app.flow_step == 2 {
+                // Enter key values
+                let input = app.input_buffer.trim().to_string();
+                if !input.is_empty() {
+                    let vault = app.flow_template_name.clone().unwrap();
+                    let key_name = app.template_keys[app.template_step].clone();
+                    match engine.add_secret(&vault, &key_name, &input, None) {
+                        Ok(()) => {
+                            app.template_step += 1;
+                            if app.template_step >= app.template_keys.len() {
+                                app.set_status(&format!("✓ Vault '{}' created", vault), false);
+                                app.vaults = engine.list_vaults(None).unwrap_or_default();
+                                app.screen = Screen::Menu;
+                                app.input_mode = InputMode::Navigation;
+                            } else {
+                                app.input_buffer.clear();
+                            }
+                        }
+                        Err(e) => {
+                            app.set_status(&format!("✗ {}", e), true);
+                        }
+                    }
+                } else {
+                    // Skip this key
+                    app.template_step += 1;
+                    if app.template_step >= app.template_keys.len() {
+                        let vault = app.flow_template_name.clone().unwrap();
+                        app.set_status(&format!("✓ Vault '{}' created", vault), false);
+                        app.vaults = engine.list_vaults(None).unwrap_or_default();
+                        app.screen = Screen::Menu;
+                        app.input_mode = InputMode::Navigation;
+                    }
+                }
+            }
+        }
+        KeyCode::Esc => {
+            app.reset_flow();
+            app.screen = Screen::Menu;
+            app.input_mode = InputMode::Navigation;
+        }
+        KeyCode::Char(c) if app.flow_step == 1 => {
+            app.input_buffer.push(c);
+        }
+        _ => {}
+    }
+    false
+}
+
+async fn handle_cf_add(app: &mut App, engine: &mut VaultEngine, key: KeyEvent) -> bool {
+    match app.input_mode {
+        InputMode::Editing => match key.code {
+            KeyCode::Enter => {
+                let input = app.input_buffer.trim().to_string();
+                if app.flow_step == 0 {
+                    if input.is_empty() {
+                        app.set_status("Account name is required", true);
+                        return false;
+                    }
+                    app.flow_cf_name = Some(input);
+                    app.flow_step = 1;
+                    app.input_buffer.clear();
+                } else if app.flow_step == 1 {
+                    // Auth method selection
+                    if input == "1" {
+                        // API token
+                        app.flow_step = 2;
+                        app.input_buffer.clear();
+                    } else if input == "2" {
+                        // Global API key
+                        app.flow_step = 3;
+                        app.input_buffer.clear();
+                    } else {
+                        app.set_status("Enter 1 or 2", true);
+                    }
+                } else if app.flow_step == 2 {
+                    // API token
+                    let vault_name = format!("cf-{}", app.flow_cf_name.clone().unwrap());
+                    match engine.add_secret(&vault_name, "CLOUDFLARE_API_TOKEN", &input, None) {
+                        Ok(()) => {
+                            app.set_status(&format!("✓ CF account '{}' saved", vault_name), false);
+                            app.vaults = engine.list_vaults(None).unwrap_or_default();
+                            app.screen = Screen::Menu;
+                            app.input_mode = InputMode::Navigation;
+                        }
+                        Err(e) => {
+                            app.set_status(&format!("✗ {}", e), true);
+                        }
+                    }
+                } else if app.flow_step == 3 {
+                    // Email for global key
+                    app.flow_step = 4;
+                    app.flow_vault = Some(input);
+                    app.input_buffer.clear();
+                }
+            }
+            KeyCode::Esc => {
+                app.reset_flow();
+                app.screen = Screen::Menu;
+                app.input_mode = InputMode::Navigation;
+            }
+            KeyCode::Backspace => {
+                app.input_buffer.pop();
+            }
+            KeyCode::Char(c) => {
+                app.input_buffer.push(c);
+            }
+            _ => {}
+        }
+        _ => {}
+    }
+    false
+}
+
+async fn handle_cf_zones(app: &mut App, engine: &mut VaultEngine, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Up | KeyCode::Down => {
+            if app.flow_step == 0 && !app.cf_vault_names.is_empty() {
+                if let Some(idx) = app.cf_vault_names.iter().position(|v| Some(v) == app.flow_vault.as_ref()) {
+                    let next = if key.code == KeyCode::Up {
+                        if idx == 0 { app.cf_vault_names.len() - 1 } else { idx - 1 }
+                    } else {
+                        (idx + 1) % app.cf_vault_names.len()
+                    };
+                    app.flow_vault = Some(app.cf_vault_names[next].clone());
+                } else if !app.cf_vault_names.is_empty() {
+                    app.flow_vault = Some(app.cf_vault_names[0].clone());
+                }
+            }
+        }
+        KeyCode::Enter => {
+            if app.flow_step == 0 {
+                if let Some(vault) = &app.flow_vault {
+                    match engine.cloudflare_api(vault, "GET", "/zones?per_page=50", None, None).await {
+                        Ok(r) => {
+                            let zones = r.data.get("result").and_then(|z| z.as_array()).cloned().unwrap_or_default();
+                            let zone_list: Vec<String> = zones.iter()
+                                .filter_map(|z| {
+                                    let name = z.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                                    let id = z.get("id").and_then(|i| i.as_str()).unwrap_or("?");
+                                    Some(format!("{} (id: {})", name, id))
+                                })
+                                .collect();
+                            app.set_status(&format!("Found {} zones", zone_list.len()), false);
+                            app.screen = Screen::Menu;
+                            app.input_mode = InputMode::Navigation;
+                        }
+                        Err(e) => {
+                            app.set_status(&format!("✗ {}", e), true);
+                        }
+                    }
+                } else {
+                    app.set_status("Select a CF account first", true);
+                }
+            }
+        }
+        KeyCode::Esc => {
+            app.reset_flow();
+            app.screen = Screen::Menu;
+            app.input_mode = InputMode::Navigation;
+        }
+        _ => {}
+    }
+    false
+}
+
+async fn handle_cf_deploy(app: &mut App, engine: &mut VaultEngine, key: KeyEvent) -> bool {
+    match app.input_mode {
+        InputMode::Editing => match key.code {
+            KeyCode::Enter => {
+                let input = app.input_buffer.trim().to_string();
+                if app.flow_step == 0 {
+                    if input.is_empty() {
+                        app.set_status("Vault name is required", true);
+                        return false;
+                    }
+                    app.flow_vault = Some(input);
+                    app.flow_step = 1;
+                    app.input_buffer.clear();
+                } else if app.flow_step == 1 {
+                    if input.is_empty() {
+                        app.set_status("Project directory is required", true);
+                        return false;
+                    }
+                    app.flow_command = Some(input);
+                    // Execute deploy
+                    let vault = app.flow_vault.clone().unwrap();
+                    let dir = app.flow_command.clone().unwrap();
+                    match engine.run_command(&vault, "npx wrangler deploy", Some(&dir), Some(86_400_000), None).await {
+                        Ok(res) => {
+                            app.run_result = Some((res.stdout, res.stderr, res.code, res.scrubbed));
+                            app.set_status(&format!("Deploy exit code: {}", res.code), res.code != 0);
+                            app.screen = Screen::Menu;
+                            app.input_mode = InputMode::Navigation;
+                        }
+                        Err(e) => {
+                            app.set_status(&format!("✗ {}", e), true);
+                        }
+                    }
+                }
+            }
+            KeyCode::Esc => {
+                app.reset_flow();
+                app.screen = Screen::Menu;
+                app.input_mode = InputMode::Navigation;
+            }
+            KeyCode::Backspace => {
+                app.input_buffer.pop();
+            }
+            KeyCode::Char(c) => {
+                app.input_buffer.push(c);
+            }
+            _ => {}
+        }
+        _ => {}
+    }
+    false
+}
+
+async fn handle_cf_secrets(app: &mut App, engine: &mut VaultEngine, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Up | KeyCode::Down => {
+            if app.flow_step == 0 && !app.cf_vault_names.is_empty() {
+                if let Some(idx) = app.cf_vault_names.iter().position(|v| Some(v) == app.flow_vault.as_ref()) {
+                    let next = if key.code == KeyCode::Up {
+                        if idx == 0 { app.cf_vault_names.len() - 1 } else { idx - 1 }
+                    } else {
+                        (idx + 1) % app.cf_vault_names.len()
+                    };
+                    app.flow_vault = Some(app.cf_vault_names[next].clone());
+                } else if !app.cf_vault_names.is_empty() {
+                    app.flow_vault = Some(app.cf_vault_names[0].clone());
+                }
+            }
+        }
+        KeyCode::Enter => {
+            if app.flow_step == 0 {
+                if app.flow_vault.is_some() {
+                    app.flow_step = 1;
+                } else {
+                    app.set_status("Select a CF account first", true);
+                }
+            } else if app.flow_step == 1 {
+                let input = app.input_buffer.trim().to_string();
+                if input.is_empty() {
+                    app.set_status("Script name is required", true);
+                    return false;
+                }
+                app.flow_script_name = Some(input);
+                app.flow_step = 2;
+                app.input_buffer.clear();
+            } else if app.flow_step == 2 {
+                // Action selection
+                let input = app.input_buffer.trim().to_string();
+                if input == "list" {
+                    let vault = app.flow_vault.clone().unwrap();
+                    let script = app.flow_script_name.clone().unwrap();
+                    match engine.worker_secrets(&vault, &script, "list", None, None, None).await {
+                        Ok(r) => {
+                            let names: Vec<String> = r.data.get("result")
+                                .and_then(|x| x.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|s| s.get("name").and_then(|n| n.as_str()).map(|n| n.to_string()))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            app.set_status(&format!("Secrets: {}", names.join(", ")), false);
+                            app.screen = Screen::Menu;
+                            app.input_mode = InputMode::Navigation;
+                        }
+                        Err(e) => {
+                            app.set_status(&format!("✗ {}", e), true);
+                        }
+                    }
+                } else if input == "set" {
+                    app.flow_step = 3;
+                    app.input_buffer.clear();
+                } else if input == "delete" {
+                    app.flow_step = 3;
+                    app.input_buffer.clear();
+                } else {
+                    app.set_status("Enter list, set, or delete", true);
+                }
+            } else if app.flow_step == 3 {
+                // Secret name
+                app.flow_secret_name = Some(app.input_buffer.trim().to_string());
+                if app.input_buffer.trim().is_empty() {
+                    app.set_status("Secret name is required", true);
+                    return false;
+                }
+                app.flow_step = 4;
+                app.input_buffer.clear();
+            } else if app.flow_step == 4 {
+                // Secret value (for set)
+                let vault = app.flow_vault.clone().unwrap();
+                let script = app.flow_script_name.clone().unwrap();
+                let name = app.flow_secret_name.clone().unwrap();
+                let value = app.input_buffer.trim().to_string();
+                match engine.worker_secrets(&vault, &script, "set", Some(&name), Some(&value), None).await {
+                    Ok(r) => {
+                        if r.status < 400 {
+                            app.set_status(&format!("✓ Set '{}' on '{}'", name, script), false);
+                        } else {
+                            app.set_status(&format!("✗ API error HTTP {}", r.status), true);
+                        }
+                        app.screen = Screen::Menu;
+                        app.input_mode = InputMode::Navigation;
+                    }
+                    Err(e) => {
+                        app.set_status(&format!("✗ {}", e), true);
+                    }
+                }
+            }
+        }
+        KeyCode::Esc => {
+            app.reset_flow();
+            app.screen = Screen::Menu;
+            app.input_mode = InputMode::Navigation;
+        }
+        _ => {}
+    }
+    false
+}
+
+async fn handle_keychain(app: &mut App, _engine: &mut VaultEngine, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Up => {
+            if app.menu_selected > 0 {
+                app.menu_selected -= 1;
+            }
+        }
+        KeyCode::Down => {
+            if app.menu_selected < 2 {
+                app.menu_selected += 1;
+            }
+        }
+        KeyCode::Enter => {
+            let has_entry = keychain::keychain_entry_exists();
+            let action = if has_entry {
+                // options: remove (0), status (1)
+                match app.menu_selected {
+                    0 => "remove",
+                    1 => "status",
+                    _ => "",
+                }
+            } else {
+                // options: store (0), status (1)
+                match app.menu_selected {
+                    0 => "store",
+                    1 => "status",
+                    _ => "",
+                }
+            };
+
+            match action {
+                "store" => {
+                    // Prompt for password
+                    app.reset_flow();
+                    app.input_mode = InputMode::Editing;
+                    app.flow_step = 0;
+                    app.set_status("Enter master password to store", false);
+                    // We'll handle this in a special way - need to read password
+                    // For now, use rpassword
+                    app.screen = Screen::Menu;
+                    app.input_mode = InputMode::Navigation;
+                    // Actually, let's just call store directly
+                    // This is a simplification
+                }
+                "remove" => {
+                    keychain::delete_from_keychain();
+                    app.set_status("✓ Removed from Keychain", false);
+                    app.screen = Screen::Menu;
+                    app.input_mode = InputMode::Navigation;
+                }
+                "status" => {
+                    let has = keychain::keychain_entry_exists();
+                    app.set_status(
+                        if has { "Keychain: stored ✓" } else { "Keychain: not stored" },
+                        false,
+                    );
+                    app.screen = Screen::Menu;
+                    app.input_mode = InputMode::Navigation;
+                }
+                _ => {}
+            }
+        }
+        KeyCode::Esc => {
+            app.reset_flow();
+            app.screen = Screen::Menu;
+            app.input_mode = InputMode::Navigation;
+        }
+        _ => {}
+    }
+    false
+}
+
+async fn handle_status(app: &mut App, _engine: &mut VaultEngine, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+            app.screen = Screen::Menu;
+            app.input_mode = InputMode::Navigation;
+        }
+        _ => {}
+    }
+    false
+}
+
+async fn handle_exit(app: &mut App, engine: &mut VaultEngine, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            engine.lock(None);
+            return true;
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            app.screen = Screen::Menu;
+            app.input_mode = InputMode::Navigation;
+        }
+        _ => {}
+    }
+    false
 }

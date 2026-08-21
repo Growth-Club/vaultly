@@ -17,7 +17,8 @@ shell-words.workspace = true
 clap.workspace = true
 colored.workspace = true
 rpassword.workspace = true
-inquire.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
