@@ -19,5 +19,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+      - run: cargo fmt --check
       - run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets -- -D warnings

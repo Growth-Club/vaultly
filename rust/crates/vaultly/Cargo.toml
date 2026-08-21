@@ -5,16 +5,27 @@ edition.workspace = true
 license.workspace = true
 description = "Vaultly CLI + TUI — agent-first encrypted credential manager"
 
+# cargo-binstall metadata: locates prebuilt binaries in GitHub Releases.
+# Replace OWNER with the real GitHub org/user. Artifact layout matches
+# .github/workflows/release.yml (vaultly-<target>-v<version>.tar.gz).
+[package.metadata.binstall]
+pkg-url = "https://github.com/OWNER/vaultly/releases/download/v{ version }/vaultly-{ target }-v{ version }.tar.gz"
+bin-dir = "vaultly-{ target }-v{ version }/{ bin }{ binary-ext }"
+
 [dependencies]
 vaultly-core = { path = "../vaultly-core" }
 vaultly-mcp = { path = "../vaultly-mcp" }
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
 tokio.workspace = true
+axum.workspace = true
 reqwest.workspace = true
 dirs.workspace = true
 shell-words.workspace = true
 clap.workspace = true
+clap_complete.workspace = true
+chrono.workspace = true
 colored.workspace = true
 rpassword.workspace = true
 ratatui.workspace = true

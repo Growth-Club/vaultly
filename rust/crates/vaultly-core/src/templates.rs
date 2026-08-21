@@ -1,4 +1,4 @@
-//! Vault templates — shared by CLI (`vaultly template`) and TUI.
+//! Vault templates — shared by the CLI (`vaultly template`), TUI, and MCP.
 //! Mirrors src/templates.ts exactly.
 
 pub struct VaultTemplate {

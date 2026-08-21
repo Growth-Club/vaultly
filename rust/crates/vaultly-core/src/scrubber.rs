@@ -36,14 +36,15 @@ fn escape_regex(value: &str) -> String {
 /// Scrub all known secret values from output text.
 /// Handles: exact, URL-encoded, base64, quoted, prefix/suffix partials,
 /// and dense interior windows of long whitespace-free secrets.
-pub fn scrub_output(output: &str, secret_values: &[String]) -> String {
+/// Takes `&[&str]` (not `&[String]`) to avoid cloning secret values.
+pub fn scrub_output(output: &str, secret_values: &[&str]) -> String {
     if output.is_empty() || secret_values.is_empty() {
         return output.to_string();
     }
 
     let mut scrubbed = output.to_string();
 
-    for value in secret_values {
+    for &value in secret_values {
         if value.is_empty() || value.len() < 4 {
             continue;
         }
@@ -121,8 +122,8 @@ pub fn scrub_output(output: &str, secret_values: &[String]) -> String {
 mod tests {
     use super::*;
 
-    fn s(v: &str) -> String {
-        v.to_string()
+    fn s(v: &str) -> &str {
+        v
     }
 
     #[test]
@@ -205,10 +206,79 @@ mod tests {
     }
 
     #[test]
+    fn unicode_secret_scrubbed() {
+        let secret = "pässwörd-über-sicher";
+        let out = scrub_output(&format!("token={}", secret), &[s(secret)]);
+        assert!(!out.contains(secret));
+        assert!(out.contains(REDACTED));
+    }
+
+    #[test]
+    fn multiple_secrets_all_scrubbed() {
+        let s1 = "sk-live-abcdef1234567890ghijklmnop";
+        let s2 = "ghp_1234567890abcdef1234567890abcdef";
+        let out = scrub_output(&format!("a={} b={}", s1, s2), &[s(s1), s(s2)]);
+        assert!(!out.contains(s1));
+        assert!(!out.contains(s2));
+    }
+
+    #[test]
+    fn overlapping_secret_values() {
+        // A value that is a substring of another must not leave the tail.
+        let short = "abcdefghijklmnopqr";
+        let long = format!("{}stuvwxyz", short);
+        let out = scrub_output(&format!("x={}", long), &[s(&long), s(short)]);
+        assert!(!out.contains(&long));
+        // After scrubbing `long`, the short remnant should also be gone.
+        assert!(!out.contains("nopqr"));
+    }
+
+    #[test]
+    fn empty_output_noop() {
+        assert_eq!(scrub_output("", &[s("secret")]), "");
+    }
+
+    #[test]
     fn regex_special_chars_are_escaped() {
         let secret = "tok.en+x?$^{}|()[]\\*";
         let out = scrub_output(&format!("x={}", secret), &[s(secret)]);
         assert!(!out.contains(&secret[..5]));
         assert!(out.contains(REDACTED));
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// For any non-empty secret (>=10 chars) and any output containing it,
+        /// the scrubbed output must not contain the secret.
+        #[test]
+        fn proptest_scrub_removes_secret(
+            secret in "[a-zA-Z0-9._~+/=-]{10,80}",
+            prefix in "\\PC{0,40}",
+            suffix in "\\PC{0,40}",
+        ) {
+            let output = format!("{}{}{}", prefix, secret, suffix);
+            let scrubbed = scrub_output(&output, &[secret.as_str()]);
+            prop_assert!(!scrubbed.contains(&secret),
+                "secret leaked after scrubbing: {}", scrubbed);
+        }
+
+        /// URL-encoded form of the secret must also be scrubbed.
+        #[test]
+        fn proptest_scrub_removes_url_encoded(
+            secret in "[a-zA-Z0-9._~+/=-]{10,80}",
+        ) {
+            let encoded = encode_uri_component(&secret);
+            if encoded != secret {
+                let output = format!("url={}", encoded);
+                let scrubbed = scrub_output(&output, &[secret.as_str()]);
+                prop_assert!(!scrubbed.contains(&encoded),
+                    "url-encoded secret leaked: {}", scrubbed);
+            }
+        }
     }
 }

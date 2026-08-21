@@ -11,6 +11,11 @@ and handle Cloudflare — all without ever seeing raw secret values.
 | `vault_keys` | List key names in a vault | ❌ Names only |
 | `vault_add` | Store a new secret (write-only) | ❌ Can't read back |
 | `vault_delete` | Delete a secret | ❌ No |
+| `vault_import` | Import secrets from JSON (write-only) | ❌ Can't read back |
+| `vault_import_encrypted` | Import an encrypted export blob | ❌ No values exposed |
+| `vault_export_encrypted` | Export vault as encrypted blob | ❌ No plaintext |
+| `vault_generate` | Generate a random secret | ❌ Value never shown |
+| `vault_rotate` | Rotate a secret to a new random value | ❌ Value never shown |
 | `vault_run` | Run command with injected env vars | ❌ Sees output only |
 | `vault_lock` | Lock session — wipes key from memory | ❌ No |
 | `vault_unlock` | Re-open via macOS Keychain | ❌ No |

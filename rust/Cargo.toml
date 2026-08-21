@@ -15,13 +15,17 @@ base64 = "0.22"
 regex = "1"
 thiserror = "1"
 chrono = { version = "0.4", features = ["serde"] }
-tokio = { version = "1", features = ["rt-multi-thread", "process", "time", "io-util", "io-std", "macros", "sync", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "process", "time", "io-util", "io-std", "macros", "sync", "net", "signal"] }
+axum = { version = "0.8", features = ["json"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 dirs = "5"
 shell-words = "1"
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+serde_yaml = "0.9"
 colored = "2"
 rpassword = "7"
+zeroize = "1"
 ratatui = "0.28"
 crossterm = { version = "0.27", features = ["events"] }
 

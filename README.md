@@ -8,7 +8,7 @@
 
 [![Rust](https://img.shields.io/badge/Rust-1.96-000000?logo=rust&logoColor=white)](https://rust-lang.org)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![MCP](https://img.shields.io/badge/MCP-17_tools-8A2BE2)](#ai-agent-integration-mcp)
+[![MCP](https://img.shields.io/badge/MCP-28_tools-8A2BE2)](#ai-agent-integration-mcp)
 [![Cloudflare](https://img.shields.io/badge/Cloudflare-Workers-F38020?logo=cloudflare&logoColor=white)](https://workers.cloudflare.com)
 [![Security](https://img.shields.io/badge/encryption-AES--256--GCM-red)](#security)
 
@@ -16,11 +16,11 @@
 
 ---
 
-## ✨ Why Vaultly?
+## ✨ Overview
 
-Your AI agents need credentials to deploy, call APIs, and manage infrastructure. But you don't want them **reading** your tokens.
-
-Vaultly sits between your agents and your secrets:
+Your AI agents need credentials to deploy, call APIs, and manage infrastructure —
+but you don't want them **reading** your tokens. Vaultly sits between your agents
+and your secrets:
 
 ```
 Agent: "Deploy my Worker to Cloudflare"
@@ -34,73 +34,74 @@ Agent: "Deploy my Worker to Cloudflare"
      never sees: token ●    scrubs output      response
 ```
 
-## 🚀 Quick Start
+Agents run real commands with your secrets injected into the environment —
+and every trace of those secrets is scrubbed from the output they see. The
+policy engine lets you grant agents fine-grained access without ever exposing
+a raw value.
+
+## 🚀 Quickstart
 
 ```bash
-# Install (Rust)
+# 1. Install (Rust)
 git clone https://github.com/Growth-Club/vaultly.git
 cd vaultly/rust && cargo build --release
-cp target/release/vaultly target/release/vaultly-mcp ~/.local/bin/   # (or anywhere on PATH)
+cp target/release/vaultly target/release/vaultly-mcp ~/.local/bin/   # or anywhere on PATH
 
-# Setup (interactive — creates password, adds accounts)
-bash setup.sh
-
-# Or manual
+# 2. Initialize your master password
 vaultly init
-vaultly cf add personal        # prompts for API token
+
+# 3. Add a credential
 vaultly add github -k GITHUB_TOKEN -v "ghp_xxx"
+
+# 4. Read it back (humans only — blocked in agent mode)
+vaultly get github GITHUB_TOKEN
+
+# 5. Let an agent use it
+vaultly run github -- git push       # injects env, scrubs output
+
+# 6. Set up the MCP server for your AI tool
+vaultly mcp                          # add to your tool's MCP config (see below)
 ```
 
-## ☁️ Cloudflare Management
+For a guided setup — Cloudflare accounts, templates, macOS Keychain — run `bash setup.sh`.
 
-Manage **unlimited** Cloudflare accounts dynamically — with **API tokens** (scoped, recommended) or **Global API keys** (email + key):
+## 📖 Command Cheat-Sheet
 
-```bash
-vaultly cf add personal                          # prompts: token or global key
-vaultly cf add work -t "token" -a "account-id"   # or pass flags (token auth)
-vaultly cf add legacy -e "you@mail.com" -k "key" -a "account-id"   # global key auth
-vaultly cf list                                  # list all accounts
-vaultly cf use work                              # switch active account
-vaultly cf deploy personal ~/my-project          # deploy a Worker
-vaultly cf zones personal                        # list domains
-vaultly cf secrets personal my-worker --list                    # Worker secret names
-vaultly cf secrets personal my-worker --set API_KEY --value sk-xxx  # set (write-only)
-vaultly cf secrets personal my-worker --delete API_KEY          # delete
-vaultly cf remove old-client                     # remove account
 ```
-
-## 📦 Templates
-
-Spin up vaults for any service in seconds:
-
-```bash
-vaultly template github        # GITHUB_TOKEN, GITHUB_USERNAME
-vaultly template aws           # AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
-vaultly template stripe        # STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET
-vaultly template --list        # see all 14 templates
+vaultly init                              Create master password
+vaultly add <vault> -k KEY -v VALUE       Add a secret (--ttl/--expires for expiry)
+vaultly get <vault> <key>                 Get a secret value (human only)
+vaultly list [vault] [--json]             List vaults or key names
+vaultly inspect <vault>                   Vault metadata + key names (no values)
+vaultly stats                             Aggregated key counts (metadata only)
+vaultly delete <vault> [key]              Delete a secret or vault
+vaultly env <vault>                       Output shell export statements (human only)
+vaultly export <vault> <file>             Export plaintext (--encrypted for portable blob)
+vaultly import <file> [--vault name]      Import .env/.json/.yaml/.csv (--encrypted for blob)
+vaultly run <vault> -- <cmd>              Run with injected env (scrubbed, --force to override expiry)
+vaultly gen [-l LENGTH] [-s]              Generate a random secret
+vaultly rotate <vault> <key> [--expired]  Rotate a secret (or all expired) to a new random value
+vaultly copy <vault> <key>                Copy secret to macOS clipboard
+vaultly rename <old> <new>                Rename a vault
+vaultly mv <vault> <key> <to_vault>       Move a secret to another vault
+vaultly cp <vault> <key> <to_vault>       Copy a secret to another vault
+vaultly serve [--bind ADDR] [--token T]   Start local HTTP/REST server (agent-first)
+vaultly doctor [--json]                   Environment diagnostics + health checks
+vaultly template [name] [--list]          Create vault from a template (14 built-in)
+vaultly completions <SHELL> [--install]   Generate shell completions (bash/zsh/fish)
+vaultly cf add|list|use|deploy|secrets|remove|zones|dns-delete  Cloudflare management
+vaultly keychain store|remove|status      macOS Keychain lock/unlock
+vaultly backup -u URL -t TOKEN            Push encrypted backup (ciphertext only)
+vaultly restore -u URL -t TOKEN           Pull encrypted backup
+vaultly protect [dir]                     Add AI-tool ignore rules
+vaultly mcp                               Start the MCP server (28 agent tools)
+vaultly lock                              Wipe key from memory
+vaultly unlock                            Re-open via Keychain
+vaultly kill                              Emergency lock + clear Keychain
+vaultly status                            Session and vault info
+vaultly version                           Print version
+vaultly tui                               Interactive menu (human only)
 ```
-
-<details>
-<summary><b>All 14 templates</b></summary>
-
-| Template | Keys |
-|----------|------|
-| ☁️ `cloudflare` | CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID |
-| 🐙 `github` | GITHUB_TOKEN, GITHUB_USERNAME |
-| 🟠 `aws` | AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION |
-| 🔵 `gcp` | GOOGLE_APPLICATION_CREDENTIALS, GCP_PROJECT_ID |
-| ▲ `vercel` | VERCEL_TOKEN, VERCEL_ORG_ID, VERCEL_PROJECT_ID |
-| 🗄️ `database` | DATABASE_URL, DATABASE_PASSWORD |
-| 💳 `stripe` | STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, STRIPE_PUBLISHABLE_KEY |
-| 🤖 `openai` | OPENAI_API_KEY, ANTHROPIC_API_KEY, GOOGLE_AI_KEY |
-| 📧 `smtp` | SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD |
-| 🐳 `docker` | DOCKER_USERNAME, DOCKER_PASSWORD, DOCKER_REGISTRY |
-| 📦 `npm` | NPM_TOKEN |
-| 🖥️ `ssh` | SERVER_HOST, SERVER_USER, SERVER_PASSWORD, SERVER_SSH_KEY |
-| 📱 `social-media` | META_ACCESS_TOKEN, TWITTER_BEARER_TOKEN, LINKEDIN_ACCESS_TOKEN |
-| 🎨 `custom` | Define your own keys |
-
-</details>
 
 ## 🤖 AI Agent Integration (MCP)
 
@@ -117,70 +118,40 @@ Add to your AI tool's MCP config:
 }
 ```
 
-> 💡 With macOS Keychain (`vaultly keychain store`), no password needed in config.
+> 💡 With macOS Keychain (`vaultly keychain store`), no password is needed in config.
 
-### 17 MCP Tools
+The 17 MCP tools cover vault operations (`vault_list`, `vault_keys`,
+`vault_add`, `vault_delete`, `vault_run`, `vault_status`, `vault_lock`,
+`vault_unlock`, `vault_audit`) and Cloudflare management (`cf_api`, `cf_zones`,
+`cf_dns_list`, `cf_dns_upsert`, `cf_workers_list`, `cf_secrets`, `cf_deploy`,
+`cf_health`).
 
-| Tool | Description |
-|------|-------------|
-| 📋 `vault_list` | List all vaults |
-| 🔑 `vault_keys` | List key names in a vault |
-| ✍️ `vault_add` | Store a secret (**write-only**) |
-| 🗑️ `vault_delete` | Delete a secret |
-| ▶️ `vault_run` | Run command with injected env (**output scrubbed**) |
-| 📊 `vault_status` | Session status, TTL, vault count |
-| 🔒 `vault_lock` | Lock session — wipe key from memory |
-| 🔓 `vault_unlock` | Re-open via macOS Keychain (agent never sees password) |
-| 📜 `vault_audit` | Recent audit log entries |
-| 🌐 `cf_api` | Call any Cloudflare API endpoint |
-| 🏠 `cf_zones` | List zones (domains) |
-| 📡 `cf_dns_list` | List DNS records |
-| ✏️ `cf_dns_upsert` | Create/update DNS record |
-| ⚡ `cf_workers_list` | List deployed Workers |
-| 🔐 `cf_secrets` | Manage Worker secrets (list/set/delete, **write-only values**) |
-| 🚀 `cf_deploy` | Deploy a Worker project |
-| 💚 `cf_health` | Verify API credentials (token **or** global key) |
+> 🚫 **Write-only for agents.** No MCP tool ever returns a raw secret value;
+> agent-facing `vault_add`/`cf_secrets` store what you give them, and
+> `vault_run` surfaces only scrubbed output.
 
-> 🚫 **No MCP tool ever returns a raw secret value.**
-
-## 🛡️ Security
+## 🛡️ Security Model
 
 | Feature | Details |
 |---------|---------|
-| 🔒 Encryption | AES-256-GCM + PBKDF2-SHA256 (600,000 iterations) |
-| 🧹 Output scrubbing | Secrets redacted from ALL command output (exact, URL, base64, partial) |
-| ⏱️ Session TTL | Auto-lock after 120 minutes |
-| 🔑 macOS Keychain | Hardware-backed auto-unlock |
-| 🚨 Killswitch | `vaultly kill` — instant lock + keychain wipe |
-| 📊 Rate limiting | 60 operations/minute per agent |
-| 📝 Audit trail | Structured JSON log of every operation |
-| ☁️ Zero-knowledge backup | Cloudflare stores ciphertext only |
+| Encryption | AES-256-GCM + PBKDF2-SHA256 (600,000 iterations) |
+| Output scrubbing | Secrets redacted from ALL command output (exact, URL, base64, partial) |
+| Session TTL | Auto-lock after 120 minutes |
+| Policy engine | Per-agent allowed ops + rate limiting (60 ops/min default) |
+| Audit trail | Hash-chained, structured JSON log of every operation |
+| Zero-knowledge backup | Cloudflare stores ciphertext only |
+
+**The core invariant:** agents get *use*, never *read*. `get`, `env`, and raw
+value access are excluded from default agent policies and blocked in agent
+mode (`VAULTLY_AGENT_MODE=1`).
+
+Useful commands:
 
 ```bash
 vaultly keychain store     # auto-unlock via macOS Keychain
 vaultly kill               # 🚨 emergency lock
 vaultly status             # session info
-```
-
-### 🖥️ Interactive TUI
-
-Forget the flags — just run `vaultly` (or `vaultly tui`) and pick from a menu:
-
-```bash
-vaultly          # → opens interactive menu
-vaultly tui      # same thing, explicit
-```
-
-Sections: **Secrets** (list/add/read/delete/run/template), **Cloudflare** (add account, zones, deploy, worker secrets), **System** (keychain, status, lock & exit). Human-only — refused in agent mode. All actions route through the same engine (audited, encrypted).
-
-### Agent Mode
-
-```bash
-export VAULTLY_AGENT_MODE=1
-
-vaultly run github -- git push   # ✅ allowed (scrubbed)
-vaultly get github TOKEN         # ❌ blocked
-vaultly env github               # ❌ blocked
+vaultly tui                # interactive menu (human only)
 ```
 
 ## 📁 Storage
@@ -189,43 +160,21 @@ vaultly env github               # ❌ blocked
 ~/.vaultly/
 ├── config.json          # salt + verifier (no secrets)
 ├── audit.log            # structured JSON audit trail
-└── vaults/
-    ├── cf-personal.vault     # encrypted
-    ├── cf-work.vault         # encrypted
-    ├── github.vault          # encrypted
-    └── anything.vault        # unlimited, any name
+└── vaults/              # one AES-256-GCM file per vault
 ```
 
-## 📖 All Commands
+See [docs/config.md](docs/config.md) for the full config reference (fields, env
+vars, theme, validation) and [docs/example-config.json](docs/example-config.json)
+for an annotated `config.json`.
 
-```
-vaultly init                              Create master password
-vaultly add <vault> -k KEY -v VALUE       Add a secret
-vaultly get <vault> <key>                 Get a secret value
-vaultly list [vault]                      List vaults or keys
-vaultly delete <vault> [key]              Delete a secret or vault
-vaultly env <vault>                       Output shell export statements
-vaultly run <vault> -- <cmd>              Run with injected env (scrubbed)
-vaultly import <file> [--vault name]      Import from plaintext file
-vaultly template [name]                   Create vault from template
-vaultly cf add|list|use|deploy|secrets|remove|zones
-vaultly keychain store|remove|status      macOS Keychain management
-vaultly backup -u URL -t TOKEN            Push encrypted backup
-vaultly restore -u URL -t TOKEN           Pull encrypted backup
-vaultly protect [dir]                     Add AI-tool ignore rules
-vaultly mcp                               Start MCP server
-vaultly kill                              Emergency lock
-vaultly status                            Session and vault info
-vaultly tui                               Interactive menu (no flags to remember)
-```
+## 🏗️ Documentation
 
-## 🏗️ Architecture
-
-See [ARCHITECTURE.md](ARCHITECTURE.md) for full system diagrams.
-
-```
-7,210 LOC Rust · 3 crates · 8 modules · 46 tests · 0 dependencies
-```
+- [docs/config.md](docs/config.md) — configuration, environment variables, TUI theme, validation
+- [docs/example-config.json](docs/example-config.json) — annotated `config.json` example
+- [ARCHITECTURE.md](ARCHITECTURE.md) — system design and diagrams
+- [CONTRIBUTING.md](CONTRIBUTING.md) — developer setup and PR checklist
+- [CHANGELOG.md](CHANGELOG.md) — release history
+- [PLAN.md](PLAN.md) — roadmap
 
 ---
 

@@ -12,21 +12,34 @@ const PASSWORD: &str = "mcp-test-password";
 const SECRET_VALUE: &str = "sk-e2e-super-secret-token-1234567890";
 const SECRET_KEY: &str = "E2E_SECRET_KEY";
 
-const EXPECTED_TOOLS: [&str; 17] = [
+const EXPECTED_TOOLS: [&str; 30] = [
     "cf_api",
     "cf_deploy",
+    "cf_dns_delete",
     "cf_dns_list",
     "cf_dns_upsert",
     "cf_health",
     "cf_secrets",
     "cf_workers_list",
+    "cf_workers_versions",
     "cf_zones",
+    "policy_info",
+    "template_apply",
+    "template_list",
     "vault_add",
     "vault_audit",
     "vault_delete",
+    "vault_export",
+    "vault_export_encrypted",
+    "vault_generate",
+    "vault_import",
+    "vault_import_encrypted",
     "vault_keys",
     "vault_list",
     "vault_lock",
+    "vault_meta",
+    "vault_policy",
+    "vault_rotate",
     "vault_run",
     "vault_status",
     "vault_unlock",
@@ -194,4 +207,279 @@ async fn mcp_e2e_security_surface() {
     })
     .await
     .expect("MCP e2e test timed out");
+}
+
+const MARKER_VALUE: &str = "sk-mcp-write-read-marker-9f8e7d6c5b4a";
+
+async fn new_client(dir: &std::path::Path) -> McpClient {
+    // Initialize a vault so the server unlocks with VAULTLY_MASTER_PASSWORD.
+    let store = vaultly_core::vault::VaultStore::with_dir(dir.to_path_buf());
+    store.init_vault(PASSWORD).unwrap();
+    McpClient::start(dir).await
+}
+
+#[tokio::test]
+async fn mcp_vault_write_read_cycle_no_leak() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mcp = new_client(dir.path()).await;
+
+        // vault_list is empty before anything is stored.
+        let res = mcp.call_tool(2, "vault_list", json!({})).await;
+        let text = mcp.result_text(&res);
+        assert!(text.contains("No vaults"), "{}", text);
+
+        // vault_add stores a secret bearing a distinctive marker value.
+        let res = mcp
+            .call_tool(
+                3,
+                "vault_add",
+                json!({ "vaultName": "e2e", "key": SECRET_KEY, "value": MARKER_VALUE }),
+            )
+            .await;
+        let add_text = serde_json::to_string(&res).unwrap();
+        assert!(!add_text.contains(MARKER_VALUE), "{}", add_text);
+        assert!(add_text.contains("Stored"), "{}", add_text);
+
+        // vault_keys returns only the key NAME.
+        let res = mcp
+            .call_tool(4, "vault_keys", json!({ "vaultName": "e2e" }))
+            .await;
+        let keys_text = serde_json::to_string(&res).unwrap();
+        assert!(keys_text.contains(SECRET_KEY), "{}", keys_text);
+        // The marker VALUE must never appear in any response.
+        assert!(!keys_text.contains(MARKER_VALUE), "{}", keys_text);
+
+        // Clean up: vault_delete removes the secret.
+        let res = mcp
+            .call_tool(
+                5,
+                "vault_delete",
+                json!({ "vaultName": "e2e", "key": SECRET_KEY }),
+            )
+            .await;
+        let del_text = serde_json::to_string(&res).unwrap();
+        assert!(del_text.contains("Deleted"), "{}", del_text);
+        assert!(!del_text.contains(MARKER_VALUE), "{}", del_text);
+
+        // Final sweep: every response captured above is free of the marker.
+        for t in [add_text, keys_text, del_text] {
+            assert!(!t.contains(MARKER_VALUE), "secret leaked: {}", t);
+        }
+    })
+    .await
+    .expect("mcp_vault_write_read_cycle_no_leak timed out");
+}
+
+#[tokio::test]
+async fn mcp_policy_limits_info() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mcp = new_client(dir.path()).await;
+
+        // policy_info reports the security-policy limits without erroring.
+        let res = mcp.call_tool(2, "policy_info", json!({})).await;
+        assert!(
+            res.get("result").and_then(|r| r.get("isError")).is_none(),
+            "policy_info unexpectedly errored: {}",
+            res
+        );
+        let text = mcp.result_text(&res);
+        // Exact output shape from lib.rs: session TTL, command timeout, max output.
+        assert!(text.contains("Session TTL"), "{}", text);
+        assert!(text.contains("Command timeout"), "{}", text);
+        assert!(text.contains("Max response output"), "{}", text);
+        // No secret value can appear in a policy summary.
+        assert!(!text.contains(SECRET_VALUE), "{}", text);
+        assert!(!text.contains(MARKER_VALUE), "{}", text);
+    })
+    .await
+    .expect("mcp_policy_limits_info timed out");
+}
+
+#[tokio::test]
+async fn mcp_audit_records_and_chain() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mcp = new_client(dir.path()).await;
+
+        // Perform a handful of actions so the audit log has recorded entries.
+        mcp.call_tool(
+            2,
+            "vault_add",
+            json!({ "vaultName": "e2e", "key": SECRET_KEY, "value": MARKER_VALUE }),
+        )
+        .await;
+        mcp.call_tool(
+            3,
+            "vault_generate",
+            json!({ "vaultName": "e2e", "key": "E2E_ROTATED", "length": 40 }),
+        )
+        .await;
+        mcp.call_tool(
+            4,
+            "vault_delete",
+            json!({ "vaultName": "e2e", "key": "E2E_ROTATED" }),
+        )
+        .await;
+
+        let res = mcp
+            .call_tool(5, "vault_audit", json!({ "lines": 50 }))
+            .await;
+        let text = mcp.result_text(&res);
+        // The audit log records the action names we just performed.
+        assert!(text.contains("\"action\":\"ADD\""), "{}", text);
+        // The tamper-evidence hash chain is verified intact.
+        assert!(text.contains("audit chain intact"), "{}", text);
+        // Audit (and every response) never exposes the secret value.
+        assert!(!text.contains(MARKER_VALUE), "{}", text);
+        assert!(!text.contains(SECRET_VALUE), "{}", text);
+    })
+    .await
+    .expect("mcp_audit_records_and_chain timed out");
+}
+
+#[tokio::test]
+async fn mcp_generate_rotates_and_shape() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mcp = new_client(dir.path()).await;
+
+        // vault_generate is local (no Cloudflare account needed): it creates a
+        // random secret client-side and stores it encrypted.
+        let res = mcp
+            .call_tool(
+                2,
+                "vault_generate",
+                json!({ "vaultName": "e2e", "key": SECRET_KEY, "length": 40 }),
+            )
+            .await;
+        let gen_text = serde_json::to_string(&res).unwrap();
+        assert!(gen_text.contains("Generated"), "{}", gen_text);
+        assert!(gen_text.contains("value not shown"), "{}", gen_text);
+
+        // vault_rotate replaces the existing value; still no value leaked.
+        let res = mcp
+            .call_tool(
+                3,
+                "vault_rotate",
+                json!({ "vaultName": "e2e", "key": SECRET_KEY, "length": 48 }),
+            )
+            .await;
+        let rot_text = serde_json::to_string(&res).unwrap();
+        assert!(rot_text.contains("Rotated"), "{}", rot_text);
+        assert!(rot_text.contains("New value not shown"), "{}", rot_text);
+
+        for t in [gen_text, rot_text] {
+            assert!(!t.contains(MARKER_VALUE), "{}", t);
+            assert!(!t.contains(SECRET_VALUE), "{}", t);
+        }
+    })
+    .await
+    .expect("mcp_generate_rotates_and_shape timed out");
+}
+
+#[tokio::test]
+async fn mcp_encrypted_export_import_roundtrip() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let dir = tempfile::tempdir().unwrap();
+        let export_dir = tempfile::tempdir().unwrap();
+        let mut mcp = new_client(dir.path()).await;
+
+        // 1. Add secrets
+        mcp.call_tool(
+            1,
+            "vault_add",
+            json!({ "vaultName": "xport", "key": "API_KEY", "value": SECRET_VALUE }),
+        )
+        .await;
+        mcp.call_tool(
+            2,
+            "vault_add",
+            json!({ "vaultName": "xport", "key": "TOKEN", "value": "another-secret-12345" }),
+        )
+        .await;
+
+        // 2. Encrypted export — must NOT contain plaintext
+        let export_file = export_dir.path().join("blob.vaultly");
+        let res = mcp
+            .call_tool(
+                3,
+                "vault_export_encrypted",
+                json!({ "vaultName": "xport", "file": export_file.to_str().unwrap() }),
+            )
+            .await;
+        assert!(
+            mcp.result_text(&res).contains("Encrypted export"),
+            "export failed: {}",
+            res
+        );
+
+        let raw = std::fs::read_to_string(&export_file).unwrap();
+        assert!(
+            !raw.contains(SECRET_VALUE),
+            "encrypted export leaked plaintext: {}",
+            raw
+        );
+
+        // 3. Encrypted import into a new vault
+        let res = mcp
+            .call_tool(
+                4,
+                "vault_import_encrypted",
+                json!({ "file": export_file.to_str().unwrap(), "vaultName": "imported" }),
+            )
+            .await;
+        assert!(
+            mcp.result_text(&res).contains("Imported"),
+            "import failed: {}",
+            res
+        );
+
+        // 4. Verify the imported keys are listed (names only, no values)
+        let res = mcp
+            .call_tool(5, "vault_keys", json!({ "vaultName": "imported" }))
+            .await;
+        let text = mcp.result_text(&res);
+        assert!(
+            text.contains("API_KEY"),
+            "API_KEY missing after import: {}",
+            text
+        );
+        assert!(
+            text.contains("TOKEN"),
+            "TOKEN missing after import: {}",
+            text
+        );
+        assert!(
+            !text.contains(SECRET_VALUE),
+            "value leaked via vault_keys: {}",
+            text
+        );
+    })
+    .await
+    .expect("mcp_encrypted_export_import_roundtrip timed out");
+}
+
+#[tokio::test]
+async fn mcp_unknown_tool_returns_error() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mcp = new_client(dir.path()).await;
+
+        // A bogus tool name must yield a structured error, not a crash.
+        let res = mcp
+            .call_tool(2, "vault_get_raw_value", json!({ "vaultName": "e2e" }))
+            .await;
+        assert_eq!(res["result"]["isError"], true, "{}", res);
+        assert!(mcp.result_text(&res).contains("Unknown tool"), "{}", res);
+
+        // The server survives the error and keeps serving subsequent calls.
+        let ping = mcp.call(3, "ping", json!({})).await;
+        assert!(ping.get("result").is_some(), "{}", ping);
+        let res = mcp.call_tool(4, "vault_status", json!({})).await;
+        assert!(mcp.result_text(&res).contains("Unlocked"), "{}", res);
+    })
+    .await
+    .expect("mcp_unknown_tool_returns_error timed out");
 }

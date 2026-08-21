@@ -12,12 +12,123 @@ use pbkdf2::pbkdf2;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use std::collections::BTreeMap;
+use std::fmt;
+use zeroize::Zeroizing;
 
 pub const KEY_LENGTH: usize = 32; // 256 bits
 pub const IV_LENGTH: usize = 16; // must match TS (node crypto allows 16)
 pub const SALT_LENGTH: usize = 32;
 pub const PBKDF2_ITERATIONS: u32 = 600_000; // OWASP 2023 for PBKDF2-SHA256
 pub const AUTH_TAG_LENGTH: usize = 16;
+
+/// Current on-disk vault format version. v1 = bare string per secret; v2 =
+/// per-secret `SecretEntry` objects carrying created/updated/expiry metadata.
+/// Newer builds read both transparently (see `SecretEntry::from_value`), and
+/// old files are migrated on their next write.
+pub const FORMAT_VERSION: u32 = 2;
+
+/// Encrypted per-secret payload: the plaintext plus metadata (created/updated
+/// timestamps, optional expiry). Stored as `{"value":..,"createdAt":..,
+/// "updatedAt":..,"expiresAt":..}` inside a vault's encrypted `data` blob for
+/// format version 2. Format version 1 files store a bare string per key;
+/// `from_value`/`to_value` bridge the two.
+/// Encrypted per-secret payload. NOTE: `Debug` is manually implemented to
+/// REDACT the secret `value` — never derive Debug on a type that holds
+/// plaintext secrets (a `{:?}` log/panic would leak it).
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SecretEntry {
+    pub value: String,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+}
+
+impl fmt::Debug for SecretEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SecretEntry")
+            .field("value", &"[REDACTED]")
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+impl SecretEntry {
+    pub fn new(value: &str, now: &str) -> Self {
+        Self {
+            value: value.to_string(),
+            created_at: now.to_string(),
+            updated_at: now.to_string(),
+            expires_at: None,
+        }
+    }
+
+    pub fn plaintext(&self) -> &str {
+        &self.value
+    }
+
+    pub fn to_value(&self) -> serde_json::Value {
+        serde_json::to_value(self).expect("SecretEntry always serializes to an object")
+    }
+
+    /// Parse a single decrypted value — either a v1 bare string or a v2
+    /// `SecretEntry` object. v1 strings carry no timestamps (empty strings).
+    pub fn from_value(key: &str, v: &serde_json::Value) -> Result<Self> {
+        match v {
+            serde_json::Value::String(s) => Ok(Self::new(s, "")),
+            serde_json::Value::Object(_) => serde_json::from_value(v.clone()).map_err(|e| {
+                VaultError::Decrypt(format!("Invalid secret entry for '{}': {}", key, e))
+            }),
+            other => Err(VaultError::Decrypt(format!(
+                "Invalid secret value type for '{}': {}",
+                key, other
+            ))),
+        }
+    }
+
+    pub fn is_expired(&self, now: &chrono::DateTime<chrono::Utc>) -> bool {
+        match self.expires_at.as_deref() {
+            Some(iso) => chrono::DateTime::parse_from_rfc3339(iso)
+                .map(|t| t.with_timezone(&chrono::Utc) < *now)
+                .unwrap_or(false),
+            None => false,
+        }
+    }
+}
+
+/// Agent-safe secret metadata — deliberately NO value. Returned by meta APIs
+/// so agents and the TUI can surface per-secret timestamps and expiry without
+/// ever seeing the plaintext.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SecretMeta {
+    pub key: String,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    pub expired: bool,
+    /// true when timestamps are unknown (a v1-origin secret not yet rewritten)
+    pub unknown_timestamps: bool,
+}
+
+impl SecretMeta {
+    pub fn from_entry(key: &str, e: &SecretEntry, now: &chrono::DateTime<chrono::Utc>) -> Self {
+        let unknown_timestamps = e.created_at.is_empty() && e.updated_at.is_empty();
+        Self {
+            key: key.to_string(),
+            created_at: e.created_at.clone(),
+            updated_at: e.updated_at.clone(),
+            expires_at: e.expires_at.clone(),
+            expired: e.is_expired(now),
+            unknown_timestamps,
+        }
+    }
+}
 
 type Aes256Gcm16 = AesGcm<Aes256, aes_gcm::aead::generic_array::typenum::U16>;
 
@@ -57,6 +168,10 @@ pub struct VaultConfig {
     pub created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backup: Option<BackupMeta>,
+    /// Idle auto-lock: wipe the key after this many minutes of inactivity.
+    /// `None` disables idle auto-lock (session TTL still applies).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_lock_minutes: Option<u64>,
 }
 
 /// Cryptographically secure random hex salt
@@ -66,17 +181,18 @@ pub fn generate_salt() -> String {
     hex::encode(bytes)
 }
 
-/// Derive a 256-bit key from password + salt using PBKDF2-SHA256
-pub fn derive_key(password: &str, salt_hex: &str) -> Result<Vec<u8>> {
+/// Derive a 256-bit key from password + salt using PBKDF2-SHA256.
+/// Returns a `Zeroizing` buffer so the key bytes are wiped on drop.
+pub fn derive_key(password: &str, salt_hex: &str) -> Result<Zeroizing<Vec<u8>>> {
     let salt = hex::decode(salt_hex)
         .map_err(|e| VaultError::Crypto(format!("Invalid salt hex: {}", e)))?;
     let mut key = [0u8; KEY_LENGTH];
     pbkdf2::<Hmac<Sha256>>(password.as_bytes(), &salt, PBKDF2_ITERATIONS, &mut key)
-        .expect("PBKDF2 should not fail");
-    Ok(key.to_vec())
+        .map_err(|e| VaultError::KeyDerivation(e.to_string()))?;
+    Ok(Zeroizing::new(key.to_vec()))
 }
 
-fn now_iso() -> String {
+pub(crate) fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
@@ -102,14 +218,17 @@ pub fn encrypt(plaintext: &str, key: &[u8]) -> Result<EncryptedPayload> {
 pub fn decrypt(payload: &EncryptedPayload, key: &[u8]) -> Result<String> {
     let cipher = Aes256Gcm16::new(GenericArray::from_slice(key));
     let iv = hex::decode(&payload.iv).map_err(|_| VaultError::Crypto("Invalid IV".into()))?;
-    let mut ct = hex::decode(&payload.ciphertext).map_err(|_| VaultError::Crypto("Invalid ciphertext".into()))?;
-    let tag = hex::decode(&payload.auth_tag).map_err(|_| VaultError::Crypto("Invalid auth tag".into()))?;
+    let mut ct = hex::decode(&payload.ciphertext)
+        .map_err(|_| VaultError::Crypto("Invalid ciphertext".into()))?;
+    let tag = hex::decode(&payload.auth_tag)
+        .map_err(|_| VaultError::Crypto("Invalid auth tag".into()))?;
     ct.extend_from_slice(&tag);
 
     let plaintext = cipher
         .decrypt(GenericArray::from_slice(&iv), ct.as_slice())
         .map_err(|_| VaultError::Decrypt("Decryption failed (wrong key)".into()))?;
-    String::from_utf8(plaintext).map_err(|_| VaultError::Decrypt("Decrypted data is not UTF-8".into()))
+    String::from_utf8(plaintext)
+        .map_err(|_| VaultError::Decrypt("Decrypted data is not UTF-8".into()))
 }
 
 /// Encrypt a key-value map into a VaultFile
@@ -119,7 +238,7 @@ pub fn encrypt_vault(
 ) -> Result<VaultFile> {
     let payload = encrypt(&serde_json::to_string(data)?, key)?;
     Ok(VaultFile {
-        version: 1,
+        version: FORMAT_VERSION,
         iv: payload.iv,
         auth_tag: payload.auth_tag,
         data: payload.ciphertext,
@@ -144,13 +263,67 @@ pub fn decrypt_vault(
         .map_err(|e| VaultError::Decrypt(format!("Invalid decrypted JSON: {}", e)))?
     {
         serde_json::Value::Object(map) => Ok(map),
-        _ => Err(VaultError::Decrypt("Decrypted vault is not an object".into())),
+        _ => Err(VaultError::Decrypt(
+            "Decrypted vault is not an object".into(),
+        )),
     }
 }
 
 /// Verifier encrypts a known string to check the password later
 pub fn create_verifier(key: &[u8]) -> Result<EncryptedPayload> {
     encrypt("vaultly-ok", key)
+}
+
+/// Portable encrypted export blob. Self-contained: carries its own salt so it
+/// can be imported by any vaultly instance that knows the master password.
+/// Format: `{"version":1,"salt":<hex>,"iv":<hex>,"authTag":<hex>,"ciphertext":<hex>}`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct EncryptedExport {
+    pub version: u32,
+    pub salt: String, // hex
+    #[serde(flatten)]
+    pub payload: EncryptedPayload,
+}
+
+/// Format version for `EncryptedExport`. Bumped if the on-disk format changes.
+pub const EXPORT_FORMAT_VERSION: u32 = 1;
+
+/// Serialize secret entries into an encrypted, portable export blob.
+/// `password` is used to derive a fresh key (with a new random salt) and is
+/// never stored. The returned blob can be written to disk and imported on any
+/// vaultly instance with the same master password.
+pub fn encrypt_export(
+    entries: &BTreeMap<String, SecretEntry>,
+    password: &str,
+) -> Result<EncryptedExport> {
+    let salt = generate_salt();
+    let key = derive_key(password, &salt)?;
+    let json = serde_json::to_string(entries)
+        .map_err(|e| VaultError::Crypto(format!("Export serialization failed: {e}")))?;
+    let payload = encrypt(&json, &key)?;
+    Ok(EncryptedExport {
+        version: EXPORT_FORMAT_VERSION,
+        salt,
+        payload,
+    })
+}
+
+/// Decrypt an `EncryptedExport` blob back into secret entries.
+pub fn decrypt_export(
+    blob: &EncryptedExport,
+    password: &str,
+) -> Result<BTreeMap<String, SecretEntry>> {
+    if blob.version != EXPORT_FORMAT_VERSION {
+        return Err(VaultError::Decrypt(format!(
+            "Unsupported export version {} (expected {})",
+            blob.version, EXPORT_FORMAT_VERSION
+        )));
+    }
+    let key = derive_key(password, &blob.salt)?;
+    let json = decrypt(&blob.payload, &key)?;
+    serde_json::from_str(&json)
+        .map_err(|e| VaultError::Decrypt(format!("Export deserialization failed: {e}")))
 }
 /// Verify the master password against the stored verifier
 pub fn verify_password(verifier: &EncryptedPayload, key: &[u8]) -> bool {
@@ -162,6 +335,29 @@ pub fn verify_password(verifier: &EncryptedPayload, key: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_entry_debug_redacts_value() {
+        let entry = SecretEntry::new("super-secret-value-12345", "2024-01-01T00:00:00Z");
+        let debug = format!("{:?}", entry);
+        assert!(
+            !debug.contains("super-secret-value-12345"),
+            "SecretEntry Debug must not contain the secret value: {debug}"
+        );
+        assert!(debug.contains("[REDACTED]"));
+        // Metadata should still be present.
+        assert!(debug.contains("2024-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn secret_entry_debug_with_expiry() {
+        let mut entry = SecretEntry::new("hidden", "2024-01-01T00:00:00Z");
+        entry.expires_at = Some("2025-01-01T00:00:00Z".into());
+        let debug = format!("{:?}", entry);
+        assert!(!debug.contains("hidden"));
+        assert!(debug.contains("2025-01-01T00:00:00Z"));
+        assert!(debug.contains("[REDACTED]"));
+    }
 
     #[test]
     fn encrypt_decrypt_roundtrip() {
@@ -244,5 +440,81 @@ mod tests {
         // And it parses back
         let parsed: VaultFile = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, file);
+    }
+
+    #[test]
+    fn encrypted_export_roundtrip() {
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            "API_KEY".into(),
+            SecretEntry::new("sk-live-abcdef123456", "2024-01-01T00:00:00Z"),
+        );
+        entries.insert(
+            "TOKEN".into(),
+            SecretEntry::new("ghp_xxx", "2024-02-02T00:00:00Z"),
+        );
+
+        let blob = encrypt_export(&entries, "master-pw").unwrap();
+        assert_eq!(blob.version, EXPORT_FORMAT_VERSION);
+        assert!(!blob.salt.is_empty());
+
+        // Same password → decrypts.
+        let decrypted = decrypt_export(&blob, "master-pw").unwrap();
+        assert_eq!(decrypted, entries);
+
+        // Wrong password → fails.
+        assert!(decrypt_export(&blob, "wrong-pw").is_err());
+    }
+
+    #[test]
+    fn encrypted_export_wrong_version_rejected() {
+        let mut entries = BTreeMap::new();
+        entries.insert("K".into(), SecretEntry::new("v", "2024-01-01T00:00:00Z"));
+        let mut blob = encrypt_export(&entries, "pw").unwrap();
+        blob.version = 99;
+        assert!(decrypt_export(&blob, "pw").is_err());
+    }
+
+    proptest::proptest! {
+        /// Arbitrary strings (incl. multi-byte unicode) must round-trip through
+        /// AES-256-GCM untouched.
+        #[test]
+        fn proptest_encrypt_decrypt_roundtrip(s in "\\PC*") {
+            let key = vec![42u8; 32];
+            let payload = encrypt(&s, &key).unwrap();
+            assert_eq!(decrypt(&payload, &key).unwrap(), s);
+        }
+
+        /// Ciphertext is authenticated and never equal to the plaintext bytes
+        /// for non-empty inputs (empty input legitimately maps to empty
+        /// AES-GCM output, so it is excluded here).
+        #[test]
+        fn proptest_ciphertext_differs_from_plaintext(s in "[a-z0-9_]{1,96}") {
+            let key = vec![9u8; 32];
+            let payload = encrypt(&s, &key).unwrap();
+            let ct = hex::decode(&payload.ciphertext).unwrap();
+            assert_ne!(ct, s.as_bytes(), "ciphertext echoes plaintext");
+        }
+
+        /// SecretEntry (value + metadata) must round-trip through JSON with the
+        /// value intact and the Debug/redactor never interfering.
+        #[test]
+        fn proptest_secret_entry_roundtrip(
+            value in "[a-zA-Z0-9._~+/-]{1,120}",
+            created in "\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z",
+            updated in "\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z",
+        ) {
+            let entry = SecretEntry {
+                value: value.clone(),
+                created_at: created,
+                updated_at: updated,
+                expires_at: None,
+            };
+            let json = serde_json::to_value(&entry).unwrap();
+            let parsed: SecretEntry = serde_json::from_value(json).unwrap();
+            assert_eq!(parsed.value, value);
+            // Debug must never surface the value regardless of content.
+            assert!(!format!("{:?}", parsed).contains(&value));
+        }
     }
 }

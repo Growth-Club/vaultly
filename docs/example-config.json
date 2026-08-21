@@ -1,0 +1,44 @@
+{
+  // Vaultly master config — written to ~/.vaultly/config.json (or $VAULTLY_DIR/config.json).
+  //
+  // This file holds the KDF parameters used to derive your encryption key and a
+  // verifier that proves the master password is correct — it NEVER contains a raw
+  // secret. Secret values live only inside per-vault AES-256-GCM ciphertext files
+  // (see ~/.vaultly/vaults/*.vault).
+  //
+  // All hex strings below are PUBLIC, non-secret example placeholders (zeroed).
+  // Use them as a shape reference only — never copy them into a real vault.
+  // The struct source of truth is rust/crates/vaultly-core/src/crypto.rs (VaultConfig).
+
+  // Config format version. Currently always 1.
+  "version": 1,
+
+  // 32 random bytes (64 hex chars), generated once at `vaultly init` and shared
+  // by every vault under this install. Combined with the master password it is
+  // fed to PBKDF2-SHA256 (600,000 iterations) to derive the 256-bit key.
+  "salt": "0000000000000000000000000000000000000000000000000000000000000000",
+
+  // Encrypted snapshot of the derived 256-bit key, used to verify the password
+  // on unlock WITHOUT storing the key itself. Same AES-256-GCM as vault files.
+  "verifier": {
+    "iv": "00000000000000000000000000000000",
+    "authTag": "00000000000000000000000000000000",
+    "ciphertext": "00000000000000000000000000000000"
+  },
+
+  // ISO-8601 timestamp when the vault was initialized (UTC, millisecond precision).
+  "createdAt": "2026-01-01T00:00:00.000Z",
+
+  // Written by `vaultly backup -u <url>`; absent until the first backup (omitted,
+  // not null). workerUrl points at the Cloudflare Worker that stores ciphertext-only.
+  "backup": {
+    "workerUrl": "https://vaultly-backup.example.workers.dev",
+    "lastBackupAt": "2026-01-02T03:04:05.000Z"
+  }
+
+  // NOTE: There is no per-vault "updatedAt" here — each secret lives in its OWN
+  // *.vault file (VaultFile) which carries its own "updatedAt". The policy engine
+  // (allowed operations / max ops per minute) is NOT stored in this file; it is
+  // applied in-memory per agent and tuned via the VAULTLY_MAX_OPS_PER_MINUTE env
+  // var. See docs/config.md for full details.
+}

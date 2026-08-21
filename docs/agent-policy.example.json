@@ -1,0 +1,22 @@
+{
+  "deploy-bot": {
+    "allowed_vaults": ["cf-personal", "ci"],
+    "allowed_operations": ["list", "read_keys", "run", "write", "cf_api"],
+    "roles": {
+      "readonly": ["list", "read_keys"],
+      "deploy": ["list", "read_keys", "run", "cf_api"]
+    },
+    "vault_roles": {
+      "ci": "readonly",
+      "cf-personal": "deploy"
+    },
+    "max_ops_per_minute": 120,
+    "created_at": "2026-01-01T00:00:00Z"
+  },
+  "ci-writer": {
+    "allowed_vaults": ["ci"],
+    "allowed_operations": ["list", "read_keys", "write"],
+    "max_ops_per_minute": 60,
+    "created_at": "2026-01-01T00:00:00Z"
+  }
+}

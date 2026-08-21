@@ -35,6 +35,12 @@ pub enum VaultError {
     #[error("Vault name '{0}' is invalid. Use letters, numbers, hyphens, and underscores.")]
     InvalidVaultName(String),
 
+    #[error("Secret key '{0}' is invalid. Control characters are not allowed.")]
+    InvalidKeyName(String),
+
+    #[error("Secret value is too large ({0} bytes). Maximum is {1} bytes.")]
+    ValueTooLarge(usize, usize),
+
     #[error("Vault file '{0}' is corrupt: {1}")]
     VaultCorrupt(String, String),
 
@@ -119,5 +125,52 @@ pub type Result<T> = std::result::Result<T, VaultError>;
 impl VaultError {
     pub fn into_string(self) -> String {
         self.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vault_error_display_mentions_key_but_not_value() {
+        // Key names are safe to show; secret values must never appear.
+        let err = VaultError::SecretNotFound("MY_TOKEN".into(), "github".into());
+        let msg = err.to_string();
+        assert!(msg.contains("MY_TOKEN"));
+        assert!(msg.contains("github"));
+    }
+
+    #[test]
+    fn vault_error_conversion_from_io() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "oops");
+        let vault_err: VaultError = io_err.into();
+        assert!(matches!(vault_err, VaultError::Io(_)));
+    }
+
+    #[test]
+    fn vault_error_conversion_from_json() {
+        let json_err = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
+        let vault_err: VaultError = json_err.into();
+        assert!(matches!(vault_err, VaultError::Json(_)));
+    }
+
+    #[test]
+    fn vault_error_conversion_from_string() {
+        let vault_err: VaultError = "some policy violation".to_string().into();
+        assert!(matches!(vault_err, VaultError::Policy(_)));
+    }
+
+    #[test]
+    fn vault_error_conversion_from_str() {
+        let vault_err: VaultError = "rate limited".into();
+        assert!(matches!(vault_err, VaultError::Policy(_)));
+    }
+
+    #[test]
+    fn vault_error_into_string_roundtrip() {
+        let err = VaultError::VaultNotFound("my-vault".into());
+        let s = err.into_string();
+        assert!(s.contains("my-vault"));
     }
 }

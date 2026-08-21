@@ -22,3 +22,7 @@ tokio.workspace = true
 reqwest.workspace = true
 dirs.workspace = true
 shell-words.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+proptest = "1"
