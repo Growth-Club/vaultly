@@ -40,6 +40,59 @@ const MENU_OPTIONS: [&str; 13] = [
     "🚪  Lock & exit",
 ];
 
+// ─── Theme ─────────────────────────────────────────────────
+
+const FG: Color = Color::White;
+const ACCENT: Color = Color::Cyan;
+const SUCCESS: Color = Color::Green;
+const ERROR: Color = Color::Red;
+const WARN: Color = Color::Yellow;
+const DIM: Color = Color::DarkGray;
+const SELECTED_BG: Color = Color::Cyan;
+const SELECTED_FG: Color = Color::Black;
+
+fn title_style() -> Style {
+    Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)
+}
+
+fn selected_style() -> Style {
+    Style::new().fg(SELECTED_FG).bg(SELECTED_BG).add_modifier(Modifier::BOLD)
+}
+
+fn normal_style() -> Style {
+    Style::new().fg(FG)
+}
+
+fn dim_style() -> Style {
+    Style::new().fg(DIM)
+}
+
+fn success_style() -> Style {
+    Style::new().fg(SUCCESS)
+}
+
+fn error_style() -> Style {
+    Style::new().fg(ERROR)
+}
+
+fn warn_style() -> Style {
+    Style::new().fg(WARN)
+}
+
+fn bordered_block(title: &str) -> Block<'static> {
+    Block::new()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(ACCENT))
+        .title(Span::styled(format!(" {} ", title), Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)))
+}
+
+fn focused_block(title: &str) -> Block<'static> {
+    Block::new()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(WARN))
+        .title(Span::styled(format!(" {} ", title), Style::new().fg(WARN).add_modifier(Modifier::BOLD)))
+}
+
 // ─── App State ─────────────────────────────────────────────
 
 #[derive(PartialEq, Clone, Copy)]
@@ -73,12 +126,10 @@ struct App {
     status_msg: Option<String>,
     status_is_error: bool,
     vaults: Vec<String>,
-    
     cf_vault_names: Vec<String>,
     template_keys: Vec<String>,
     template_step: usize,
     run_result: Option<(String, String, i32, bool)>,
-    // Multi-step flow tracking
     flow_step: usize,
     flow_vault: Option<String>,
     flow_key: Option<String>,
@@ -101,12 +152,11 @@ impl App {
             status_msg: None,
             status_is_error: false,
             vaults: Vec::new(),
-
             cf_vault_names: Vec::new(),
             template_keys: Vec::new(),
             template_step: 0,
             run_result: None,
-flow_step: 0,
+            flow_step: 0,
             flow_vault: None,
             flow_key: None,
             flow_value: None,
@@ -199,8 +249,8 @@ pub async fn start_tui() {
     // Main loop
     loop {
         if terminal.draw(|frame| render(frame, &mut app, &mut engine)).is_err() {
-        break;
-    }
+            break;
+        }
 
         if event::poll(std::time::Duration::from_millis(100)).ok() == Some(true) {
             if let Ok(Event::Key(key)) = event::read() {
@@ -236,15 +286,19 @@ fn cleanup_terminal() {
 fn render(frame: &mut Frame, app: &mut App, engine: &mut VaultEngine) {
     let area = frame.area();
 
-    // Main layout: content + status bar
+    // Outer border
+    let outer = Block::new()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(ACCENT));
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+
+    // Content + footer
     let chunks = Layout::new(
         Direction::Vertical,
-        [
-            Constraint::Min(0),
-            Constraint::Length(3),
-        ],
+        [Constraint::Min(0), Constraint::Length(2)],
     )
-    .split(area);
+    .split(inner);
 
     match app.screen {
         Screen::Menu => render_menu(frame, chunks[0], app),
@@ -262,30 +316,22 @@ fn render(frame: &mut Frame, app: &mut App, engine: &mut VaultEngine) {
         Screen::Exit => render_exit(frame, chunks[0]),
     }
 
-    // Status bar
-    render_status_bar(frame, chunks[1], app);
+    // Footer
+    render_footer(frame, chunks[1], app);
 }
 
-fn render_status_bar(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
-    let text = if app.input_mode == InputMode::Editing {
-        Line::from(vec![
-            Span::styled(" Type text, ", Style::new().fg(Color::Black).bg(Color::Cyan)),
-            Span::styled("Enter to confirm, ", Style::new().fg(Color::White)),
-            Span::styled("Esc to cancel", Style::new().fg(Color::White)),
-        ])
+fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+    let (help, help_style) = if app.input_mode == InputMode::Editing {
+        ("Type to enter • Enter to confirm • Esc to cancel", warn_style())
     } else {
-        Line::from(vec![
-            Span::styled(" ↑↓ navigate, ", Style::new().fg(Color::Yellow)),
-            Span::styled("Enter select, ", Style::new().fg(Color::White)),
-            Span::styled("Esc back, ", Style::new().fg(Color::White)),
-            Span::styled("Q quit", Style::new().fg(Color::White)),
-        ])
+        ("↑↓ navigate • Enter select • Esc back • q quit", dim_style())
     };
 
     let status = if let Some(msg) = &app.status_msg {
-        let color = if app.status_is_error { Color::Red } else { Color::Green };
+        let style = if app.status_is_error { error_style() } else { success_style() };
         Line::from(vec![
-            Span::styled(format!(" {} ", msg), Style::new().fg(color).add_modifier(Modifier::BOLD)),
+            Span::styled(" ", dim_style()),
+            Span::styled(msg, style.add_modifier(Modifier::BOLD)),
         ])
     } else {
         Line::from("")
@@ -297,7 +343,10 @@ fn render_status_bar(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) 
     )
     .split(area);
 
-    frame.render_widget(Paragraph::new(text), chunks[0]);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(help, help_style))),
+        chunks[0],
+    );
     frame.render_widget(Paragraph::new(status), chunks[1]);
 }
 
@@ -307,104 +356,83 @@ fn render_menu(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         .enumerate()
         .map(|(i, opt)| {
             let style = if i == app.menu_selected {
-                Style::new().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+                selected_style()
             } else {
-                Style::new().fg(Color::White)
+                normal_style()
             };
             ListItem::new(Line::from(Span::styled(*opt, style)))
         })
         .collect();
 
     let list = List::new(items)
-        .block(Block::new().borders(Borders::ALL).title(" Vaultly — Interactive "));
+        .block(Block::new().borders(Borders::ALL).title(" Vaultly — Interactive "))
+        .highlight_style(Style::new());
     frame.render_widget(list, area);
 }
+
+// ─── Action Screens ────────────────────────────────────────
 
 fn render_add_secret(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     let chunks = Layout::new(
         Direction::Vertical,
-        [
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Min(0),
-        ],
+        [Constraint::Length(3), Constraint::Length(3), Constraint::Length(3), Constraint::Min(0)],
     )
     .split(area);
 
-    // Title
     frame.render_widget(
         Paragraph::new("➕  Add / Update Secret")
-            .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
-            .block(Block::new().borders(Borders::BOTTOM)),
+            .style(title_style())
+            .block(Block::new().borders(Borders::BOTTOM).border_style(dim_style())),
         chunks[0],
     );
 
-    // Vault
-    let vault_text = app
-        .flow_vault
-        .as_deref()
-        .map(|v| format!("Vault: {}", v))
-        .unwrap_or_else(|| "Enter vault name:".to_string());
-    let vault_style = if app.flow_step == 0 {
-        Style::new().fg(Color::Yellow)
+    // Vault field
+    let vault_val = app.flow_vault.as_deref().unwrap_or("");
+    let vault_display = if app.flow_step == 0 {
+        format!("Vault name: {}", vault_val)
     } else {
-        Style::new().fg(Color::White)
+        format!("Vault: {}", vault_val)
+    };
+    let vault_block = if app.flow_step == 0 {
+        focused_block(" Vault ")
+    } else {
+        bordered_block(" Vault ")
     };
     frame.render_widget(
-        Paragraph::new(vault_text).style(vault_style).block(
-            Block::new()
-                .borders(Borders::ALL)
-                .title(" Vault ")
-                .border_style(if app.flow_step == 0 {
-                    Color::Yellow
-                } else {
-                    Color::Gray
-                }),
-        ),
+        Paragraph::new(vault_display).style(normal_style()).block(vault_block),
         chunks[1],
     );
 
-    // Key
-    let key_text = app.flow_key.as_deref().unwrap_or("");
-    let key_prompt = if app.flow_step == 1 {
-        format!("Secret name (e.g. GITHUB_TOKEN): {}", key_text)
-    } else if app.flow_step == 2 {
-        format!("Secret name: {}", key_text)
+    // Key field
+    let key_val = app.flow_key.as_deref().unwrap_or("");
+    let key_display = if app.flow_step <= 1 {
+        format!("Secret name (e.g. GITHUB_TOKEN): {}", key_val)
     } else {
-        "Enter secret name".to_string()
+        format!("Secret name: {}", key_val)
+    };
+    let key_block = if app.flow_step == 1 {
+        focused_block(" Key ")
+    } else {
+        bordered_block(" Key ")
     };
     frame.render_widget(
-        Paragraph::new(key_prompt).style(Style::new().fg(Color::White)).block(
-            Block::new()
-                .borders(Borders::ALL)
-                .title(" Key ")
-                .border_style(if app.flow_step == 1 {
-                    Color::Yellow
-                } else {
-                    Color::Gray
-                }),
-        ),
+        Paragraph::new(key_display).style(normal_style()).block(key_block),
         chunks[2],
     );
 
-    // Value
-    let value_text = if app.flow_step == 2 {
+    // Value field
+    let val_display = if app.flow_step == 2 {
         format!("Value (hidden): {}", "*".repeat(app.input_buffer.len()))
     } else {
-        "Enter value".to_string()
+        "Value (hidden)".to_string()
+    };
+    let val_block = if app.flow_step == 2 {
+        focused_block(" Value ")
+    } else {
+        bordered_block(" Value ")
     };
     frame.render_widget(
-        Paragraph::new(value_text).style(Style::new().fg(Color::White)).block(
-            Block::new()
-                .borders(Borders::ALL)
-                .title(" Value ")
-                .border_style(if app.flow_step == 2 {
-                    Color::Yellow
-                } else {
-                    Color::Gray
-                }),
-        ),
+        Paragraph::new(val_display).style(normal_style()).block(val_block),
         chunks[3],
     );
 }
@@ -418,47 +446,40 @@ fn render_get_secret(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) 
 
     frame.render_widget(
         Paragraph::new("🔑  Read Secret Value")
-            .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
-            .block(Block::new().borders(Borders::BOTTOM)),
+            .style(title_style())
+            .block(Block::new().borders(Borders::BOTTOM).border_style(dim_style())),
         chunks[0],
     );
 
-    let vault_text = app
-        .flow_vault
-        .as_deref()
-        .map(|v| format!("Vault: {}", v))
-        .unwrap_or_else(|| "Select vault:".to_string());
+    let vault_val = app.flow_vault.as_deref().unwrap_or("");
+    let vault_display = if app.flow_step == 0 {
+        format!("Select vault: {}", vault_val)
+    } else {
+        format!("Vault: {}", vault_val)
+    };
+    let vault_block = if app.flow_step == 0 {
+        focused_block(" Vault ")
+    } else {
+        bordered_block(" Vault ")
+    };
     frame.render_widget(
-        Paragraph::new(vault_text).style(Style::new().fg(Color::White)).block(
-            Block::new()
-                .borders(Borders::ALL)
-                .title(" Vault ")
-                .border_style(if app.flow_step == 0 {
-                    Color::Yellow
-                } else {
-                    Color::Gray
-                }),
-        ),
+        Paragraph::new(vault_display).style(normal_style()).block(vault_block),
         chunks[1],
     );
 
-    let key_text = app.flow_key.as_deref().unwrap_or("");
-    let key_prompt = if app.flow_step == 1 {
-        format!("Select key: {}", key_text)
+    let key_val = app.flow_key.as_deref().unwrap_or("");
+    let key_display = if app.flow_step <= 1 {
+        format!("Select key: {}", key_val)
     } else {
-        "Select key".to_string()
+        format!("Key: {}", key_val)
+    };
+    let key_block = if app.flow_step == 1 {
+        focused_block(" Key ")
+    } else {
+        bordered_block(" Key ")
     };
     frame.render_widget(
-        Paragraph::new(key_prompt).style(Style::new().fg(Color::White)).block(
-            Block::new()
-                .borders(Borders::ALL)
-                .title(" Key ")
-                .border_style(if app.flow_step == 1 {
-                    Color::Yellow
-                } else {
-                    Color::Gray
-                }),
-        ),
+        Paragraph::new(key_display).style(normal_style()).block(key_block),
         chunks[2],
     );
 }
@@ -472,47 +493,40 @@ fn render_delete_secret(frame: &mut Frame, area: ratatui::layout::Rect, app: &Ap
 
     frame.render_widget(
         Paragraph::new("🗑️  Delete Secret or Vault")
-            .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
-            .block(Block::new().borders(Borders::BOTTOM)),
+            .style(title_style())
+            .block(Block::new().borders(Borders::BOTTOM).border_style(dim_style())),
         chunks[0],
     );
 
-    let vault_text = app
-        .flow_vault
-        .as_deref()
-        .map(|v| format!("Vault: {}", v))
-        .unwrap_or_else(|| "Select vault:".to_string());
+    let vault_val = app.flow_vault.as_deref().unwrap_or("");
+    let vault_display = if app.flow_step == 0 {
+        format!("Select vault: {}", vault_val)
+    } else {
+        format!("Vault: {}", vault_val)
+    };
+    let vault_block = if app.flow_step == 0 {
+        focused_block(" Vault ")
+    } else {
+        bordered_block(" Vault ")
+    };
     frame.render_widget(
-        Paragraph::new(vault_text).style(Style::new().fg(Color::White)).block(
-            Block::new()
-                .borders(Borders::ALL)
-                .title(" Vault ")
-                .border_style(if app.flow_step == 0 {
-                    Color::Yellow
-                } else {
-                    Color::Gray
-                }),
-        ),
+        Paragraph::new(vault_display).style(normal_style()).block(vault_block),
         chunks[1],
     );
 
-    let key_text = app.flow_key.as_deref().unwrap_or("");
-    let prompt = if app.flow_step == 1 {
-        format!("Select key to delete, or choose whole vault: {}", key_text)
+    let key_val = app.flow_key.as_deref().unwrap_or("");
+    let prompt = if app.flow_step <= 1 {
+        format!("Select key to delete, or choose whole vault: {}", key_val)
     } else {
-        "Select key or vault".to_string()
+        format!("Delete: {}", key_val)
+    };
+    let block = if app.flow_step == 1 {
+        focused_block(" Delete ")
+    } else {
+        bordered_block(" Delete ")
     };
     frame.render_widget(
-        Paragraph::new(prompt).style(Style::new().fg(Color::White)).block(
-            Block::new()
-                .borders(Borders::ALL)
-                .title(" Delete ")
-                .border_style(if app.flow_step == 1 {
-                    Color::Yellow
-                } else {
-                    Color::Gray
-                }),
-        ),
+        Paragraph::new(prompt).style(normal_style()).block(block),
         chunks[2],
     );
 }
@@ -526,47 +540,40 @@ fn render_run_command(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
 
     frame.render_widget(
         Paragraph::new("▶️  Run Command with Secrets")
-            .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
-            .block(Block::new().borders(Borders::BOTTOM)),
+            .style(title_style())
+            .block(Block::new().borders(Borders::BOTTOM).border_style(dim_style())),
         chunks[0],
     );
 
-    let vault_text = app
-        .flow_vault
-        .as_deref()
-        .map(|v| format!("Vault: {}", v))
-        .unwrap_or_else(|| "Select vault:".to_string());
+    let vault_val = app.flow_vault.as_deref().unwrap_or("");
+    let vault_display = if app.flow_step == 0 {
+        format!("Vault name: {}", vault_val)
+    } else {
+        format!("Vault: {}", vault_val)
+    };
+    let vault_block = if app.flow_step == 0 {
+        focused_block(" Vault ")
+    } else {
+        bordered_block(" Vault ")
+    };
     frame.render_widget(
-        Paragraph::new(vault_text).style(Style::new().fg(Color::White)).block(
-            Block::new()
-                .borders(Borders::ALL)
-                .title(" Vault ")
-                .border_style(if app.flow_step == 0 {
-                    Color::Yellow
-                } else {
-                    Color::Gray
-                }),
-        ),
+        Paragraph::new(vault_display).style(normal_style()).block(vault_block),
         chunks[1],
     );
 
-    let cmd_text = app.flow_command.as_deref().unwrap_or("");
-    let prompt = if app.flow_step == 1 {
-        format!("Command (e.g. npx wrangler deploy): {}", cmd_text)
+    let cmd_val = app.flow_command.as_deref().unwrap_or("");
+    let cmd_display = if app.flow_step <= 1 {
+        format!("Command (e.g. npx wrangler deploy): {}", cmd_val)
     } else {
-        "Enter command".to_string()
+        format!("Command: {}", cmd_val)
+    };
+    let cmd_block = if app.flow_step == 1 {
+        focused_block(" Command ")
+    } else {
+        bordered_block(" Command ")
     };
     frame.render_widget(
-        Paragraph::new(prompt).style(Style::new().fg(Color::White)).block(
-            Block::new()
-                .borders(Borders::ALL)
-                .title(" Command ")
-                .border_style(if app.flow_step == 1 {
-                    Color::Yellow
-                } else {
-                    Color::Gray
-                }),
-        ),
+        Paragraph::new(cmd_display).style(normal_style()).block(cmd_block),
         chunks[2],
     );
 }
@@ -580,33 +587,26 @@ fn render_template(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
 
     frame.render_widget(
         Paragraph::new("📦  Create Vault from Template")
-            .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
-            .block(Block::new().borders(Borders::BOTTOM)),
+            .style(title_style())
+            .block(Block::new().borders(Borders::BOTTOM).border_style(dim_style())),
         chunks[0],
     );
 
-    let name_text = app
-        .flow_template_name
-        .as_deref()
-        .unwrap_or("");
+    let name_val = app.flow_template_name.as_deref().unwrap_or("");
     let prompt = if app.flow_step == 0 {
-        format!("Select template: {}", name_text)
+        format!("Select template: {}", name_val)
     } else if app.flow_step == 1 {
-        format!("Vault name: {}", name_text)
+        format!("Vault name: {}", name_val)
     } else {
-        "Enter key values".to_string()
+        format!("Vault: {}", name_val)
+    };
+    let block = if app.flow_step < 2 {
+        focused_block(" Template ")
+    } else {
+        bordered_block(" Template ")
     };
     frame.render_widget(
-        Paragraph::new(prompt).style(Style::new().fg(Color::White)).block(
-            Block::new()
-                .borders(Borders::ALL)
-                .title(" Template ")
-                .border_style(if app.flow_step < 2 {
-                    Color::Yellow
-                } else {
-                    Color::Gray
-                }),
-        ),
+        Paragraph::new(prompt).style(normal_style()).block(block),
         chunks[1],
     );
 
@@ -620,17 +620,13 @@ fn render_template(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             app.template_keys.len()
         )
     };
+    let keys_block = if app.flow_step == 2 {
+        focused_block(" Keys ")
+    } else {
+        bordered_block(" Keys ")
+    };
     frame.render_widget(
-        Paragraph::new(keys_info).style(Style::new().fg(Color::White)).block(
-            Block::new()
-                .borders(Borders::ALL)
-                .title(" Keys ")
-                .border_style(if app.flow_step == 2 {
-                    Color::Yellow
-                } else {
-                    Color::Gray
-                }),
-        ),
+        Paragraph::new(keys_info).style(normal_style()).block(keys_block),
         chunks[2],
     );
 }
@@ -644,49 +640,36 @@ fn render_cf_add(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
 
     frame.render_widget(
         Paragraph::new("☁️  Add Cloudflare Account")
-            .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
-            .block(Block::new().borders(Borders::BOTTOM)),
+            .style(title_style())
+            .block(Block::new().borders(Borders::BOTTOM).border_style(dim_style())),
         chunks[0],
     );
 
-    let name_text = app.flow_cf_name.as_deref().unwrap_or("");
+    let name_val = app.flow_cf_name.as_deref().unwrap_or("");
     let prompt = if app.flow_step == 0 {
-        format!("Account name (e.g. personal, work): {}", name_text)
+        format!("Account name (e.g. personal, work): {}", name_val)
     } else if app.flow_step == 1 {
         "Select auth method".to_string()
     } else {
-        format!("Enter credentials (step {})", app.flow_step)
+        format!("Step {} of credentials", app.flow_step)
+    };
+    let block = if app.flow_step < 3 {
+        focused_block(" Cloudflare ")
+    } else {
+        bordered_block(" Cloudflare ")
     };
     frame.render_widget(
-        Paragraph::new(prompt).style(Style::new().fg(Color::White)).block(
-            Block::new()
-                .borders(Borders::ALL)
-                .title(" Cloudflare ")
-                .border_style(if app.flow_step < 3 {
-                    Color::Yellow
-                } else {
-                    Color::Gray
-                }),
-        ),
+        Paragraph::new(prompt).style(normal_style()).block(block),
         chunks[1],
     );
 
     let info = if app.flow_step == 1 {
-        "1) API token (recommended)\n2) Global API key (email + key)"
+        "1) API token (recommended, scoped)\n2) Global API key (email + key)"
     } else {
         "Fill in the credentials for the selected auth method"
     };
     frame.render_widget(
-        Paragraph::new(info).style(Style::new().fg(Color::White)).block(
-            Block::new()
-                .borders(Borders::ALL)
-                .title(" Auth ")
-                .border_style(if app.flow_step == 1 {
-                    Color::Yellow
-                } else {
-                    Color::Gray
-                }),
-        ),
+        Paragraph::new(info).style(dim_style()).block(bordered_block(" Auth ")),
         chunks[2],
     );
 }
@@ -700,27 +683,24 @@ fn render_cf_zones(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
 
     frame.render_widget(
         Paragraph::new("🌐  List Accounts & Zones")
-            .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
-            .block(Block::new().borders(Borders::BOTTOM)),
+            .style(title_style())
+            .block(Block::new().borders(Borders::BOTTOM).border_style(dim_style())),
         chunks[0],
     );
 
-    let vault_text = app
-        .flow_vault
-        .as_deref()
-        .map(|v| format!("Vault: {}", v))
-        .unwrap_or_else(|| "Select Cloudflare account:".to_string());
+    let vault_val = app.flow_vault.as_deref().unwrap_or("");
+    let display = if app.flow_step == 0 {
+        format!("Select Cloudflare account: {}", vault_val)
+    } else {
+        format!("Account: {}", vault_val)
+    };
+    let block = if app.flow_step == 0 {
+        focused_block(" Account ")
+    } else {
+        bordered_block(" Account ")
+    };
     frame.render_widget(
-        Paragraph::new(vault_text).style(Style::new().fg(Color::White)).block(
-            Block::new()
-                .borders(Borders::ALL)
-                .title(" Account ")
-                .border_style(if app.flow_step == 0 {
-                    Color::Yellow
-                } else {
-                    Color::Gray
-                }),
-        ),
+        Paragraph::new(display).style(normal_style()).block(block),
         chunks[1],
     );
 }
@@ -734,47 +714,40 @@ fn render_cf_deploy(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
 
     frame.render_widget(
         Paragraph::new("🚀  Deploy a Worker")
-            .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
-            .block(Block::new().borders(Borders::BOTTOM)),
+            .style(title_style())
+            .block(Block::new().borders(Borders::BOTTOM).border_style(dim_style())),
         chunks[0],
     );
 
-    let vault_text = app
-        .flow_vault
-        .as_deref()
-        .map(|v| format!("Vault: {}", v))
-        .unwrap_or_else(|| "Select Cloudflare account:".to_string());
+    let vault_val = app.flow_vault.as_deref().unwrap_or("");
+    let vault_display = if app.flow_step == 0 {
+        format!("Select Cloudflare account: {}", vault_val)
+    } else {
+        format!("Account: {}", vault_val)
+    };
+    let vault_block = if app.flow_step == 0 {
+        focused_block(" Account ")
+    } else {
+        bordered_block(" Account ")
+    };
     frame.render_widget(
-        Paragraph::new(vault_text).style(Style::new().fg(Color::White)).block(
-            Block::new()
-                .borders(Borders::ALL)
-                .title(" Account ")
-                .border_style(if app.flow_step == 0 {
-                    Color::Yellow
-                } else {
-                    Color::Gray
-                }),
-        ),
+        Paragraph::new(vault_display).style(normal_style()).block(vault_block),
         chunks[1],
     );
 
-    let dir_text = app.flow_command.as_deref().unwrap_or("");
-    let prompt = if app.flow_step == 1 {
-        format!("Worker project directory: {}", dir_text)
+    let dir_val = app.flow_command.as_deref().unwrap_or("");
+    let dir_display = if app.flow_step <= 1 {
+        format!("Worker project directory: {}", dir_val)
     } else {
-        "Enter project directory".to_string()
+        format!("Directory: {}", dir_val)
+    };
+    let dir_block = if app.flow_step == 1 {
+        focused_block(" Directory ")
+    } else {
+        bordered_block(" Directory ")
     };
     frame.render_widget(
-        Paragraph::new(prompt).style(Style::new().fg(Color::White)).block(
-            Block::new()
-                .borders(Borders::ALL)
-                .title(" Directory ")
-                .border_style(if app.flow_step == 1 {
-                    Color::Yellow
-                } else {
-                    Color::Gray
-                }),
-        ),
+        Paragraph::new(dir_display).style(normal_style()).block(dir_block),
         chunks[2],
     );
 }
@@ -788,35 +761,32 @@ fn render_cf_secrets(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) 
 
     frame.render_widget(
         Paragraph::new("🔐  Worker Secrets")
-            .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
-            .block(Block::new().borders(Borders::BOTTOM)),
+            .style(title_style())
+            .block(Block::new().borders(Borders::BOTTOM).border_style(dim_style())),
         chunks[0],
     );
 
-    let vault_text = app
-        .flow_vault
-        .as_deref()
-        .map(|v| format!("Vault: {}", v))
-        .unwrap_or_else(|| "Select Cloudflare account:".to_string());
+    let vault_val = app.flow_vault.as_deref().unwrap_or("");
+    let vault_display = if app.flow_step == 0 {
+        format!("Select Cloudflare account: {}", vault_val)
+    } else {
+        format!("Account: {}", vault_val)
+    };
+    let vault_block = if app.flow_step == 0 {
+        focused_block(" Account ")
+    } else {
+        bordered_block(" Account ")
+    };
     frame.render_widget(
-        Paragraph::new(vault_text).style(Style::new().fg(Color::White)).block(
-            Block::new()
-                .borders(Borders::ALL)
-                .title(" Account ")
-                .border_style(if app.flow_step == 0 {
-                    Color::Yellow
-                } else {
-                    Color::Gray
-                }),
-        ),
+        Paragraph::new(vault_display).style(normal_style()).block(vault_block),
         chunks[1],
     );
 
-    let script_text = app.flow_script_name.as_deref().unwrap_or("");
-    let prompt = if app.flow_step == 1 {
-        format!("Worker script name: {}", script_text)
+    let script_val = app.flow_script_name.as_deref().unwrap_or("");
+    let prompt = if app.flow_step <= 1 {
+        format!("Worker script name: {}", script_val)
     } else if app.flow_step == 2 {
-        "Select action: list, set, delete".to_string()
+        "Action: list, set, or delete".to_string()
     } else if app.flow_step == 3 {
         format!("Secret name: {}", app.flow_secret_name.as_deref().unwrap_or(""))
     } else if app.flow_step == 4 {
@@ -824,17 +794,13 @@ fn render_cf_secrets(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) 
     } else {
         "Manage secrets".to_string()
     };
+    let block = if app.flow_step < 5 {
+        focused_block(" Secrets ")
+    } else {
+        bordered_block(" Secrets ")
+    };
     frame.render_widget(
-        Paragraph::new(prompt).style(Style::new().fg(Color::White)).block(
-            Block::new()
-                .borders(Borders::ALL)
-                .title(" Secrets ")
-                .border_style(if app.flow_step < 5 {
-                    Color::Yellow
-                } else {
-                    Color::Gray
-                }),
-        ),
+        Paragraph::new(prompt).style(normal_style()).block(block),
         chunks[2],
     );
 }
@@ -848,22 +814,16 @@ fn render_keychain(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
 
     frame.render_widget(
         Paragraph::new("🔒  Keychain (Auto-Unlock)")
-            .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
-            .block(Block::new().borders(Borders::BOTTOM)),
+            .style(title_style())
+            .block(Block::new().borders(Borders::BOTTOM).border_style(dim_style())),
         chunks[0],
     );
 
     let has_entry = keychain::keychain_entry_exists();
-    let options = if has_entry {
-        vec![
-            "🗑️  Remove entry (password needed every time)",
-            "📊  Status",
-        ]
+    let options: Vec<&str> = if has_entry {
+        vec!["🗑️  Remove entry", "📊  Status"]
     } else {
-        vec![
-            "🔒  Store master password (auto-unlock)",
-            "📊  Status",
-        ]
+        vec!["🔒  Store master password", "📊  Status"]
     };
 
     let items: Vec<ListItem> = options
@@ -871,16 +831,17 @@ fn render_keychain(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         .enumerate()
         .map(|(i, opt)| {
             let style = if i == app.menu_selected {
-                Style::new().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+                selected_style()
             } else {
-                Style::new().fg(Color::White)
+                normal_style()
             };
             ListItem::new(Line::from(Span::styled(*opt, style)))
         })
         .collect();
 
     let list = List::new(items)
-        .block(Block::new().borders(Borders::ALL).title(" Keychain "));
+        .block(Block::new().borders(Borders::ALL).title(" Keychain ").border_style(Style::new().fg(ACCENT)))
+        .highlight_style(Style::new());
     frame.render_widget(list, chunks[1]);
 }
 
@@ -899,12 +860,9 @@ fn render_status(frame: &mut Frame, area: ratatui::layout::Rect, _app: &App, eng
     .split(area);
 
     frame.render_widget(
-        Paragraph::new("📊  Vaultly Status").style(
-            Style::new()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
-        .block(Block::new().borders(Borders::BOTTOM)),
+        Paragraph::new("📊  Vaultly Status")
+            .style(title_style())
+            .block(Block::new().borders(Borders::BOTTOM).border_style(dim_style())),
         chunks[0],
     );
 
@@ -914,10 +872,12 @@ fn render_status(frame: &mut Frame, area: ratatui::layout::Rect, _app: &App, eng
     } else {
         vaults.join(", ")
     };
-
     frame.render_widget(
-        Paragraph::new(format!("  Vaults: {}", vaults_str))
-            .style(Style::new().fg(Color::White)),
+        Paragraph::new(Line::from(vec![
+            Span::styled("  Vaults: ", dim_style()),
+            Span::styled(vaults_str, normal_style()),
+        ]))
+        .block(bordered_block(" Info ")),
         chunks[1],
     );
 
@@ -928,15 +888,22 @@ fn render_status(frame: &mut Frame, area: ratatui::layout::Rect, _app: &App, eng
     } else {
         "not stored"
     };
+    let kc_style = if keychain::keychain_entry_exists() { success_style() } else { dim_style() };
     frame.render_widget(
-        Paragraph::new(format!("  Keychain: {}", kc))
-            .style(Style::new().fg(Color::White)),
+        Paragraph::new(Line::from(vec![
+            Span::styled("  Keychain: ", dim_style()),
+            Span::styled(kc, kc_style),
+        ]))
+        .block(bordered_block(" Info ")),
         chunks[2],
     );
 
     frame.render_widget(
-        Paragraph::new(format!("  Platform: {}", std::env::consts::OS))
-            .style(Style::new().fg(Color::White)),
+        Paragraph::new(Line::from(vec![
+            Span::styled("  Platform: ", dim_style()),
+            Span::styled(std::env::consts::OS, normal_style()),
+        ]))
+        .block(bordered_block(" Info ")),
         chunks[3],
     );
 
@@ -946,8 +913,11 @@ fn render_status(frame: &mut Frame, area: ratatui::layout::Rect, _app: &App, eng
         "off"
     };
     frame.render_widget(
-        Paragraph::new(format!("  Agent mode: {}", agent_mode))
-            .style(Style::new().fg(Color::White)),
+        Paragraph::new(Line::from(vec![
+            Span::styled("  Agent mode: ", dim_style()),
+            Span::styled(agent_mode, warn_style()),
+        ]))
+        .block(bordered_block(" Info ")),
         chunks[4],
     );
 }
@@ -956,8 +926,8 @@ fn render_exit(frame: &mut Frame, area: ratatui::layout::Rect) {
     let text = "🚪  Lock & exit?\n\n  Y — lock vault and exit\n  N — cancel";
     frame.render_widget(
         Paragraph::new(text)
-            .style(Style::new().fg(Color::White))
-            .block(Block::new().borders(Borders::ALL).title(" Exit ")),
+            .style(normal_style())
+            .block(Block::new().borders(Borders::ALL).border_style(Style::new().fg(WARN)).title(" Exit ").title_style(warn_style())),
         area,
     );
 }
@@ -969,7 +939,6 @@ async fn handle_event(
     engine: &mut VaultEngine,
     key: KeyEvent,
 ) -> bool {
-    // Returns true if should quit
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return true;
     }
@@ -1004,91 +973,70 @@ async fn handle_menu(app: &mut App, _engine: &mut VaultEngine, key: KeyEvent) ->
             }
         }
         KeyCode::Enter => {
-            let selected = app.menu_selected;
-            match selected {
-                0 => {
-                    // List vaults & keys
-                    app.screen = Screen::Status;
-                    app.set_status(&format!("{} vaults", app.vaults.len()), false);
-                }
+            match app.menu_selected {
+                0 => { app.screen = Screen::Status; }
                 1 => {
-                    // Add secret
                     app.reset_flow();
                     app.screen = Screen::AddSecret;
                     app.input_mode = InputMode::Editing;
                     app.flow_step = 0;
                 }
                 2 => {
-                    // Get secret
                     app.reset_flow();
                     app.screen = Screen::GetSecret;
                     app.input_mode = InputMode::Navigation;
                     app.flow_step = 0;
                 }
                 3 => {
-                    // Delete secret
                     app.reset_flow();
                     app.screen = Screen::DeleteSecret;
                     app.input_mode = InputMode::Navigation;
                     app.flow_step = 0;
                 }
                 4 => {
-                    // Run command
                     app.reset_flow();
                     app.screen = Screen::RunCommand;
                     app.input_mode = InputMode::Navigation;
                     app.flow_step = 0;
                 }
                 5 => {
-                    // Template
                     app.reset_flow();
                     app.screen = Screen::Template;
                     app.input_mode = InputMode::Navigation;
                     app.flow_step = 0;
                 }
                 6 => {
-                    // CF add
                     app.reset_flow();
                     app.screen = Screen::CfAdd;
                     app.input_mode = InputMode::Editing;
                     app.flow_step = 0;
                 }
                 7 => {
-                    // CF zones
                     app.reset_flow();
                     app.screen = Screen::CfZones;
                     app.input_mode = InputMode::Navigation;
                     app.flow_step = 0;
                 }
                 8 => {
-                    // CF deploy
                     app.reset_flow();
                     app.screen = Screen::CfDeploy;
                     app.input_mode = InputMode::Navigation;
                     app.flow_step = 0;
                 }
                 9 => {
-                    // CF secrets
                     app.reset_flow();
                     app.screen = Screen::CfSecrets;
                     app.input_mode = InputMode::Navigation;
                     app.flow_step = 0;
                 }
                 10 => {
-                    // Keychain
                     app.reset_flow();
                     app.screen = Screen::Keychain;
                     app.input_mode = InputMode::Navigation;
                     app.menu_selected = 0;
                 }
-                11 => {
-                    // Status
-                    app.screen = Screen::Status;
-                }
-                12 => {
-                    // Exit
-                    app.screen = Screen::Exit;
-                }
+                11 => { app.screen = Screen::Status; }
+                12 => { app.screen = Screen::Exit; }
                 _ => {}
             }
         }
@@ -1101,68 +1049,61 @@ async fn handle_menu(app: &mut App, _engine: &mut VaultEngine, key: KeyEvent) ->
 }
 
 async fn handle_add_secret(app: &mut App, engine: &mut VaultEngine, key: KeyEvent) -> bool {
-    match app.input_mode {
-        InputMode::Editing => match key.code {
-            KeyCode::Enter => {
-                let input = app.input_buffer.trim().to_string();
-                if app.flow_step == 0 {
-                    // Vault name
-                    if input.is_empty() {
-                        app.set_status("Vault name is required", true);
-                        return false;
+    if app.input_mode != InputMode::Editing {
+        return false;
+    }
+    match key.code {
+        KeyCode::Enter => {
+            let input = app.input_buffer.trim().to_string();
+            if app.flow_step == 0 {
+                if input.is_empty() {
+                    app.set_status("Vault name is required", true);
+                    return false;
+                }
+                app.flow_vault = Some(input);
+                app.flow_step = 1;
+                app.input_buffer.clear();
+            } else if app.flow_step == 1 {
+                if input.is_empty() {
+                    app.set_status("Secret name is required", true);
+                    return false;
+                }
+                app.flow_key = Some(input);
+                app.flow_step = 2;
+                app.input_buffer.clear();
+            } else if app.flow_step == 2 {
+                if input.is_empty() {
+                    app.set_status("Value is required", true);
+                    return false;
+                }
+                app.flow_value = Some(input);
+                let vault = app.flow_vault.clone().unwrap();
+                let key_name = app.flow_key.clone().unwrap();
+                let value = app.flow_value.clone().unwrap();
+                match engine.add_secret(&vault, &key_name, &value, None) {
+                    Ok(()) => {
+                        app.set_status(&format!("✓ Stored '{}' in '{}'", key_name, vault), false);
+                        app.vaults = engine.list_vaults(None).unwrap_or_default();
+                        app.reset_flow();
+                        app.screen = Screen::Menu;
+                        app.input_mode = InputMode::Navigation;
                     }
-                    app.flow_vault = Some(input);
-                    app.flow_step = 1;
-                    app.input_buffer.clear();
-                } else if app.flow_step == 1 {
-                    // Key name
-                    if input.is_empty() {
-                        app.set_status("Secret name is required", true);
-                        return false;
-                    }
-                    app.flow_key = Some(input);
-                    app.flow_step = 2;
-                    app.input_buffer.clear();
-                } else if app.flow_step == 2 {
-                    // Value
-                    if input.is_empty() {
-                        app.set_status("Value is required", true);
-                        return false;
-                    }
-                    app.flow_value = Some(input);
-                    // Execute
-                    let vault = app.flow_vault.clone().unwrap();
-                    let key_name = app.flow_key.clone().unwrap();
-                    let value = app.flow_value.clone().unwrap();
-                    match engine.add_secret(&vault, &key_name, &value, None) {
-                        Ok(()) => {
-                            app.set_status(&format!("✓ Stored '{}' in '{}'", key_name, vault), false);
-                            // Refresh vault list
-                            app.vaults = engine.list_vaults(None).unwrap_or_default();
-                            app.screen = Screen::Menu;
-                            app.input_mode = InputMode::Navigation;
-                        }
-                        Err(e) => {
-                            app.set_status(&format!("✗ {}", e), true);
-                            app.flow_step = 2; // Stay on value step
-                        }
+                    Err(e) => {
+                        app.set_status(&format!("✗ {}", e), true);
                     }
                 }
             }
-            KeyCode::Esc => {
-                app.reset_flow();
-                app.screen = Screen::Menu;
-                app.input_mode = InputMode::Navigation;
-            }
-            KeyCode::Backspace => {
-                app.input_buffer.pop();
-            }
-            KeyCode::Char(c) => {
-                if !key.modifiers.contains(KeyModifiers::SHIFT) || c.is_alphabetic() {
-                    app.input_buffer.push(c);
-                }
-            }
-            _ => {}
+        }
+        KeyCode::Esc => {
+            app.reset_flow();
+            app.screen = Screen::Menu;
+            app.input_mode = InputMode::Navigation;
+        }
+        KeyCode::Backspace => {
+            app.input_buffer.pop();
+        }
+        KeyCode::Char(c) => {
+            app.input_buffer.push(c);
         }
         _ => {}
     }
@@ -1171,23 +1112,15 @@ async fn handle_add_secret(app: &mut App, engine: &mut VaultEngine, key: KeyEven
 
 async fn handle_get_secret(app: &mut App, engine: &mut VaultEngine, key: KeyEvent) -> bool {
     match key.code {
-        KeyCode::Up => {
+        KeyCode::Up | KeyCode::Down => {
             if app.flow_step == 0 && !app.vaults.is_empty() {
-                // Navigate vaults
-                if let Some(idx) = app.vaults.iter().position(|v| Some(v) == app.flow_vault.as_ref()) {
-                    let next = (idx + 1) % app.vaults.len();
-                    app.flow_vault = Some(app.vaults[next].clone());
-                } else if !app.vaults.is_empty() {
-                    app.flow_vault = Some(app.vaults[0].clone());
-                }
-            }
-        }
-        KeyCode::Down => {
-            if app.flow_step == 0 && !app.vaults.is_empty() {
-                if let Some(idx) = app.vaults.iter().position(|v| Some(v) == app.flow_vault.as_ref()) {
-                    let next = if idx == 0 { app.vaults.len() - 1 } else { idx - 1 };
-                    app.flow_vault = Some(app.vaults[next].clone());
-                }
+                let idx = app.vaults.iter().position(|v| Some(v) == app.flow_vault.as_ref()).unwrap_or(0);
+                let next = if key.code == KeyCode::Up {
+                    if idx == 0 { app.vaults.len() - 1 } else { idx - 1 }
+                } else {
+                    (idx + 1) % app.vaults.len()
+                };
+                app.flow_vault = Some(app.vaults[next].clone());
             }
         }
         KeyCode::Enter => {
@@ -1203,6 +1136,7 @@ async fn handle_get_secret(app: &mut App, engine: &mut VaultEngine, key: KeyEven
                 match engine.get_secret_value(&vault, &key_name, None) {
                     Ok(value) => {
                         app.set_status(&format!("{}: {}", key_name, value), false);
+                        app.reset_flow();
                         app.screen = Screen::Menu;
                         app.input_mode = InputMode::Navigation;
                     }
@@ -1226,16 +1160,13 @@ async fn handle_delete_secret(app: &mut App, engine: &mut VaultEngine, key: KeyE
     match key.code {
         KeyCode::Up | KeyCode::Down => {
             if app.flow_step == 0 && !app.vaults.is_empty() {
-                if let Some(idx) = app.vaults.iter().position(|v| Some(v) == app.flow_vault.as_ref()) {
-                    let next = if key.code == KeyCode::Up {
-                        if idx == 0 { app.vaults.len() - 1 } else { idx - 1 }
-                    } else {
-                        (idx + 1) % app.vaults.len()
-                    };
-                    app.flow_vault = Some(app.vaults[next].clone());
-                } else if !app.vaults.is_empty() {
-                    app.flow_vault = Some(app.vaults[0].clone());
-                }
+                let idx = app.vaults.iter().position(|v| Some(v) == app.flow_vault.as_ref()).unwrap_or(0);
+                let next = if key.code == KeyCode::Up {
+                    if idx == 0 { app.vaults.len() - 1 } else { idx - 1 }
+                } else {
+                    (idx + 1) % app.vaults.len()
+                };
+                app.flow_vault = Some(app.vaults[next].clone());
             }
         }
         KeyCode::Enter => {
@@ -1251,6 +1182,7 @@ async fn handle_delete_secret(app: &mut App, engine: &mut VaultEngine, key: KeyE
                     match engine.delete_secret(&vault, key_name, None) {
                         Ok(true) => {
                             app.set_status(&format!("✓ Deleted '{}' from '{}'", key_name, vault), false);
+                            app.reset_flow();
                             app.screen = Screen::Menu;
                             app.input_mode = InputMode::Navigation;
                         }
@@ -1262,11 +1194,11 @@ async fn handle_delete_secret(app: &mut App, engine: &mut VaultEngine, key: KeyE
                         }
                     }
                 } else {
-                    // Delete whole vault
                     match engine.delete_vault(&vault, None) {
                         Ok(true) => {
                             app.set_status(&format!("✓ Deleted vault '{}'", vault), false);
                             app.vaults = engine.list_vaults(None).unwrap_or_default();
+                            app.reset_flow();
                             app.screen = Screen::Menu;
                             app.input_mode = InputMode::Navigation;
                         }
@@ -1291,52 +1223,52 @@ async fn handle_delete_secret(app: &mut App, engine: &mut VaultEngine, key: KeyE
 }
 
 async fn handle_run_command(app: &mut App, engine: &mut VaultEngine, key: KeyEvent) -> bool {
-    match app.input_mode {
-        InputMode::Editing => match key.code {
-            KeyCode::Enter => {
-                let input = app.input_buffer.trim().to_string();
-                if app.flow_step == 0 {
-                    if input.is_empty() {
-                        app.set_status("Vault name is required", true);
-                        return false;
+    if app.input_mode != InputMode::Editing {
+        return false;
+    }
+    match key.code {
+        KeyCode::Enter => {
+            let input = app.input_buffer.trim().to_string();
+            if app.flow_step == 0 {
+                if input.is_empty() {
+                    app.set_status("Vault name is required", true);
+                    return false;
+                }
+                app.flow_vault = Some(input);
+                app.flow_step = 1;
+                app.input_buffer.clear();
+            } else if app.flow_step == 1 {
+                if input.is_empty() {
+                    app.set_status("Command is required", true);
+                    return false;
+                }
+                app.flow_command = Some(input);
+                let vault = app.flow_vault.clone().unwrap();
+                let cmd = app.flow_command.clone().unwrap();
+                match engine.run_command(&vault, &cmd, None, None, None).await {
+                    Ok(res) => {
+                        app.run_result = Some((res.stdout, res.stderr, res.code, res.scrubbed));
+                        app.set_status(&format!("Exit code: {}", res.code), res.code != 0);
+                        app.reset_flow();
+                        app.screen = Screen::Menu;
+                        app.input_mode = InputMode::Navigation;
                     }
-                    app.flow_vault = Some(input);
-                    app.flow_step = 1;
-                    app.input_buffer.clear();
-                } else if app.flow_step == 1 {
-                    if input.is_empty() {
-                        app.set_status("Command is required", true);
-                        return false;
-                    }
-                    app.flow_command = Some(input);
-                    // Execute
-                    let vault = app.flow_vault.clone().unwrap();
-                    let cmd = app.flow_command.clone().unwrap();
-                    match engine.run_command(&vault, &cmd, None, None, None).await {
-                        Ok(res) => {
-                            app.run_result = Some((res.stdout, res.stderr, res.code, res.scrubbed));
-                            app.set_status(&format!("Exit code: {}", res.code), res.code != 0);
-                            app.screen = Screen::Menu;
-                            app.input_mode = InputMode::Navigation;
-                        }
-                        Err(e) => {
-                            app.set_status(&format!("✗ {}", e), true);
-                        }
+                    Err(e) => {
+                        app.set_status(&format!("✗ {}", e), true);
                     }
                 }
             }
-            KeyCode::Esc => {
-                app.reset_flow();
-                app.screen = Screen::Menu;
-                app.input_mode = InputMode::Navigation;
-            }
-            KeyCode::Backspace => {
-                app.input_buffer.pop();
-            }
-            KeyCode::Char(c) => {
-                app.input_buffer.push(c);
-            }
-            _ => {}
+        }
+        KeyCode::Esc => {
+            app.reset_flow();
+            app.screen = Screen::Menu;
+            app.input_mode = InputMode::Navigation;
+        }
+        KeyCode::Backspace => {
+            app.input_buffer.pop();
+        }
+        KeyCode::Char(c) => {
+            app.input_buffer.push(c);
         }
         _ => {}
     }
@@ -1347,24 +1279,18 @@ async fn handle_template(app: &mut App, engine: &mut VaultEngine, key: KeyEvent)
     match key.code {
         KeyCode::Up | KeyCode::Down => {
             if app.flow_step == 0 {
-                // Navigate templates
                 let names = crate::templates::template_names();
                 if !names.is_empty() {
                     let current = app.flow_template_name.as_deref().unwrap_or("");
-                    if let Some(idx) = names.iter().position(|n| *n == current) {
-                        let next = if key.code == KeyCode::Up {
-                            if idx == 0 { names.len() - 1 } else { idx - 1 }
-                        } else {
-                            (idx + 1) % names.len()
-                        };
-                        app.flow_template_name = Some(names[next].to_string());
-                        let tpl = crate::templates::get_template(names[next]).unwrap();
-                        app.template_keys = tpl.keys.iter().map(|k| k.to_string()).collect();
+                    let idx = names.iter().position(|n| *n == current).unwrap_or(0);
+                    let next = if key.code == KeyCode::Up {
+                        if idx == 0 { names.len() - 1 } else { idx - 1 }
                     } else {
-                        app.flow_template_name = Some(names[0].to_string());
-                        let tpl = crate::templates::get_template(names[0]).unwrap();
-                        app.template_keys = tpl.keys.iter().map(|k| k.to_string()).collect();
-                    }
+                        (idx + 1) % names.len()
+                    };
+                    app.flow_template_name = Some(names[next].to_string());
+                    let tpl = crate::templates::get_template(names[next]).unwrap();
+                    app.template_keys = tpl.keys.iter().map(|k| k.to_string()).collect();
                 }
             }
         }
@@ -1386,10 +1312,9 @@ async fn handle_template(app: &mut App, engine: &mut VaultEngine, key: KeyEvent)
                 app.input_buffer.clear();
                 app.template_step = 0;
             } else if app.flow_step == 2 {
-                // Enter key values
                 let input = app.input_buffer.trim().to_string();
+                let vault = app.flow_template_name.clone().unwrap();
                 if !input.is_empty() {
-                    let vault = app.flow_template_name.clone().unwrap();
                     let key_name = app.template_keys[app.template_step].clone();
                     match engine.add_secret(&vault, &key_name, &input, None) {
                         Ok(()) => {
@@ -1397,6 +1322,7 @@ async fn handle_template(app: &mut App, engine: &mut VaultEngine, key: KeyEvent)
                             if app.template_step >= app.template_keys.len() {
                                 app.set_status(&format!("✓ Vault '{}' created", vault), false);
                                 app.vaults = engine.list_vaults(None).unwrap_or_default();
+                                app.reset_flow();
                                 app.screen = Screen::Menu;
                                 app.input_mode = InputMode::Navigation;
                             } else {
@@ -1408,12 +1334,11 @@ async fn handle_template(app: &mut App, engine: &mut VaultEngine, key: KeyEvent)
                         }
                     }
                 } else {
-                    // Skip this key
                     app.template_step += 1;
                     if app.template_step >= app.template_keys.len() {
-                        let vault = app.flow_template_name.clone().unwrap();
                         app.set_status(&format!("✓ Vault '{}' created", vault), false);
                         app.vaults = engine.list_vaults(None).unwrap_or_default();
+                        app.reset_flow();
                         app.screen = Screen::Menu;
                         app.input_mode = InputMode::Navigation;
                     }
@@ -1434,64 +1359,60 @@ async fn handle_template(app: &mut App, engine: &mut VaultEngine, key: KeyEvent)
 }
 
 async fn handle_cf_add(app: &mut App, engine: &mut VaultEngine, key: KeyEvent) -> bool {
-    match app.input_mode {
-        InputMode::Editing => match key.code {
-            KeyCode::Enter => {
-                let input = app.input_buffer.trim().to_string();
-                if app.flow_step == 0 {
-                    if input.is_empty() {
-                        app.set_status("Account name is required", true);
-                        return false;
-                    }
-                    app.flow_cf_name = Some(input);
-                    app.flow_step = 1;
-                    app.input_buffer.clear();
-                } else if app.flow_step == 1 {
-                    // Auth method selection
-                    if input == "1" {
-                        // API token
-                        app.flow_step = 2;
-                        app.input_buffer.clear();
-                    } else if input == "2" {
-                        // Global API key
-                        app.flow_step = 3;
-                        app.input_buffer.clear();
-                    } else {
-                        app.set_status("Enter 1 or 2", true);
-                    }
-                } else if app.flow_step == 2 {
-                    // API token
-                    let vault_name = format!("cf-{}", app.flow_cf_name.clone().unwrap());
-                    match engine.add_secret(&vault_name, "CLOUDFLARE_API_TOKEN", &input, None) {
-                        Ok(()) => {
-                            app.set_status(&format!("✓ CF account '{}' saved", vault_name), false);
-                            app.vaults = engine.list_vaults(None).unwrap_or_default();
-                            app.screen = Screen::Menu;
-                            app.input_mode = InputMode::Navigation;
-                        }
-                        Err(e) => {
-                            app.set_status(&format!("✗ {}", e), true);
-                        }
-                    }
-                } else if app.flow_step == 3 {
-                    // Email for global key
-                    app.flow_step = 4;
-                    app.flow_vault = Some(input);
-                    app.input_buffer.clear();
+    if app.input_mode != InputMode::Editing {
+        return false;
+    }
+    match key.code {
+        KeyCode::Enter => {
+            let input = app.input_buffer.trim().to_string();
+            if app.flow_step == 0 {
+                if input.is_empty() {
+                    app.set_status("Account name is required", true);
+                    return false;
                 }
+                app.flow_cf_name = Some(input);
+                app.flow_step = 1;
+                app.input_buffer.clear();
+            } else if app.flow_step == 1 {
+                if input == "1" {
+                    app.flow_step = 2;
+                    app.input_buffer.clear();
+                } else if input == "2" {
+                    app.flow_step = 3;
+                    app.input_buffer.clear();
+                } else {
+                    app.set_status("Enter 1 or 2", true);
+                }
+            } else if app.flow_step == 2 {
+                let vault_name = format!("cf-{}", app.flow_cf_name.clone().unwrap());
+                match engine.add_secret(&vault_name, "CLOUDFLARE_API_TOKEN", &input, None) {
+                    Ok(()) => {
+                        app.set_status(&format!("✓ CF account '{}' saved", vault_name), false);
+                        app.vaults = engine.list_vaults(None).unwrap_or_default();
+                        app.reset_flow();
+                        app.screen = Screen::Menu;
+                        app.input_mode = InputMode::Navigation;
+                    }
+                    Err(e) => {
+                        app.set_status(&format!("✗ {}", e), true);
+                    }
+                }
+            } else if app.flow_step == 3 {
+                app.flow_step = 4;
+                app.flow_vault = Some(input);
+                app.input_buffer.clear();
             }
-            KeyCode::Esc => {
-                app.reset_flow();
-                app.screen = Screen::Menu;
-                app.input_mode = InputMode::Navigation;
-            }
-            KeyCode::Backspace => {
-                app.input_buffer.pop();
-            }
-            KeyCode::Char(c) => {
-                app.input_buffer.push(c);
-            }
-            _ => {}
+        }
+        KeyCode::Esc => {
+            app.reset_flow();
+            app.screen = Screen::Menu;
+            app.input_mode = InputMode::Navigation;
+        }
+        KeyCode::Backspace => {
+            app.input_buffer.pop();
+        }
+        KeyCode::Char(c) => {
+            app.input_buffer.push(c);
         }
         _ => {}
     }
@@ -1502,16 +1423,13 @@ async fn handle_cf_zones(app: &mut App, engine: &mut VaultEngine, key: KeyEvent)
     match key.code {
         KeyCode::Up | KeyCode::Down => {
             if app.flow_step == 0 && !app.cf_vault_names.is_empty() {
-                if let Some(idx) = app.cf_vault_names.iter().position(|v| Some(v) == app.flow_vault.as_ref()) {
-                    let next = if key.code == KeyCode::Up {
-                        if idx == 0 { app.cf_vault_names.len() - 1 } else { idx - 1 }
-                    } else {
-                        (idx + 1) % app.cf_vault_names.len()
-                    };
-                    app.flow_vault = Some(app.cf_vault_names[next].clone());
-                } else if !app.cf_vault_names.is_empty() {
-                    app.flow_vault = Some(app.cf_vault_names[0].clone());
-                }
+                let idx = app.cf_vault_names.iter().position(|v| Some(v) == app.flow_vault.as_ref()).unwrap_or(0);
+                let next = if key.code == KeyCode::Up {
+                    if idx == 0 { app.cf_vault_names.len() - 1 } else { idx - 1 }
+                } else {
+                    (idx + 1) % app.cf_vault_names.len()
+                };
+                app.flow_vault = Some(app.cf_vault_names[next].clone());
             }
         }
         KeyCode::Enter => {
@@ -1520,14 +1438,9 @@ async fn handle_cf_zones(app: &mut App, engine: &mut VaultEngine, key: KeyEvent)
                     match engine.cloudflare_api(vault, "GET", "/zones?per_page=50", None, None).await {
                         Ok(r) => {
                             let zones = r.data.get("result").and_then(|z| z.as_array()).cloned().unwrap_or_default();
-                            let zone_list: Vec<String> = zones.iter()
-                                .filter_map(|z| {
-                                    let name = z.get("name").and_then(|n| n.as_str()).unwrap_or("?");
-                                    let id = z.get("id").and_then(|i| i.as_str()).unwrap_or("?");
-                                    Some(format!("{} (id: {})", name, id))
-                                })
-                                .collect();
-                            app.set_status(&format!("Found {} zones", zone_list.len()), false);
+                            let count = zones.len();
+                            app.set_status(&format!("✓ Found {} zones", count), false);
+                            app.reset_flow();
                             app.screen = Screen::Menu;
                             app.input_mode = InputMode::Navigation;
                         }
@@ -1551,52 +1464,52 @@ async fn handle_cf_zones(app: &mut App, engine: &mut VaultEngine, key: KeyEvent)
 }
 
 async fn handle_cf_deploy(app: &mut App, engine: &mut VaultEngine, key: KeyEvent) -> bool {
-    match app.input_mode {
-        InputMode::Editing => match key.code {
-            KeyCode::Enter => {
-                let input = app.input_buffer.trim().to_string();
-                if app.flow_step == 0 {
-                    if input.is_empty() {
-                        app.set_status("Vault name is required", true);
-                        return false;
+    if app.input_mode != InputMode::Editing {
+        return false;
+    }
+    match key.code {
+        KeyCode::Enter => {
+            let input = app.input_buffer.trim().to_string();
+            if app.flow_step == 0 {
+                if input.is_empty() {
+                    app.set_status("Vault name is required", true);
+                    return false;
+                }
+                app.flow_vault = Some(input);
+                app.flow_step = 1;
+                app.input_buffer.clear();
+            } else if app.flow_step == 1 {
+                if input.is_empty() {
+                    app.set_status("Project directory is required", true);
+                    return false;
+                }
+                app.flow_command = Some(input);
+                let vault = app.flow_vault.clone().unwrap();
+                let dir = app.flow_command.clone().unwrap();
+                match engine.run_command(&vault, "npx wrangler deploy", Some(&dir), Some(86_400_000), None).await {
+                    Ok(res) => {
+                        app.run_result = Some((res.stdout, res.stderr, res.code, res.scrubbed));
+                        app.set_status(&format!("Deploy exit code: {}", res.code), res.code != 0);
+                        app.reset_flow();
+                        app.screen = Screen::Menu;
+                        app.input_mode = InputMode::Navigation;
                     }
-                    app.flow_vault = Some(input);
-                    app.flow_step = 1;
-                    app.input_buffer.clear();
-                } else if app.flow_step == 1 {
-                    if input.is_empty() {
-                        app.set_status("Project directory is required", true);
-                        return false;
-                    }
-                    app.flow_command = Some(input);
-                    // Execute deploy
-                    let vault = app.flow_vault.clone().unwrap();
-                    let dir = app.flow_command.clone().unwrap();
-                    match engine.run_command(&vault, "npx wrangler deploy", Some(&dir), Some(86_400_000), None).await {
-                        Ok(res) => {
-                            app.run_result = Some((res.stdout, res.stderr, res.code, res.scrubbed));
-                            app.set_status(&format!("Deploy exit code: {}", res.code), res.code != 0);
-                            app.screen = Screen::Menu;
-                            app.input_mode = InputMode::Navigation;
-                        }
-                        Err(e) => {
-                            app.set_status(&format!("✗ {}", e), true);
-                        }
+                    Err(e) => {
+                        app.set_status(&format!("✗ {}", e), true);
                     }
                 }
             }
-            KeyCode::Esc => {
-                app.reset_flow();
-                app.screen = Screen::Menu;
-                app.input_mode = InputMode::Navigation;
-            }
-            KeyCode::Backspace => {
-                app.input_buffer.pop();
-            }
-            KeyCode::Char(c) => {
-                app.input_buffer.push(c);
-            }
-            _ => {}
+        }
+        KeyCode::Esc => {
+            app.reset_flow();
+            app.screen = Screen::Menu;
+            app.input_mode = InputMode::Navigation;
+        }
+        KeyCode::Backspace => {
+            app.input_buffer.pop();
+        }
+        KeyCode::Char(c) => {
+            app.input_buffer.push(c);
         }
         _ => {}
     }
@@ -1607,16 +1520,13 @@ async fn handle_cf_secrets(app: &mut App, engine: &mut VaultEngine, key: KeyEven
     match key.code {
         KeyCode::Up | KeyCode::Down => {
             if app.flow_step == 0 && !app.cf_vault_names.is_empty() {
-                if let Some(idx) = app.cf_vault_names.iter().position(|v| Some(v) == app.flow_vault.as_ref()) {
-                    let next = if key.code == KeyCode::Up {
-                        if idx == 0 { app.cf_vault_names.len() - 1 } else { idx - 1 }
-                    } else {
-                        (idx + 1) % app.cf_vault_names.len()
-                    };
-                    app.flow_vault = Some(app.cf_vault_names[next].clone());
-                } else if !app.cf_vault_names.is_empty() {
-                    app.flow_vault = Some(app.cf_vault_names[0].clone());
-                }
+                let idx = app.cf_vault_names.iter().position(|v| Some(v) == app.flow_vault.as_ref()).unwrap_or(0);
+                let next = if key.code == KeyCode::Up {
+                    if idx == 0 { app.cf_vault_names.len() - 1 } else { idx - 1 }
+                } else {
+                    (idx + 1) % app.cf_vault_names.len()
+                };
+                app.flow_vault = Some(app.cf_vault_names[next].clone());
             }
         }
         KeyCode::Enter => {
@@ -1636,7 +1546,6 @@ async fn handle_cf_secrets(app: &mut App, engine: &mut VaultEngine, key: KeyEven
                 app.flow_step = 2;
                 app.input_buffer.clear();
             } else if app.flow_step == 2 {
-                // Action selection
                 let input = app.input_buffer.trim().to_string();
                 if input == "list" {
                     let vault = app.flow_vault.clone().unwrap();
@@ -1652,6 +1561,7 @@ async fn handle_cf_secrets(app: &mut App, engine: &mut VaultEngine, key: KeyEven
                                 })
                                 .unwrap_or_default();
                             app.set_status(&format!("Secrets: {}", names.join(", ")), false);
+                            app.reset_flow();
                             app.screen = Screen::Menu;
                             app.input_mode = InputMode::Navigation;
                         }
@@ -1669,16 +1579,14 @@ async fn handle_cf_secrets(app: &mut App, engine: &mut VaultEngine, key: KeyEven
                     app.set_status("Enter list, set, or delete", true);
                 }
             } else if app.flow_step == 3 {
-                // Secret name
-                app.flow_secret_name = Some(app.input_buffer.trim().to_string());
                 if app.input_buffer.trim().is_empty() {
                     app.set_status("Secret name is required", true);
                     return false;
                 }
+                app.flow_secret_name = Some(app.input_buffer.trim().to_string());
                 app.flow_step = 4;
                 app.input_buffer.clear();
             } else if app.flow_step == 4 {
-                // Secret value (for set)
                 let vault = app.flow_vault.clone().unwrap();
                 let script = app.flow_script_name.clone().unwrap();
                 let name = app.flow_secret_name.clone().unwrap();
@@ -1690,6 +1598,7 @@ async fn handle_cf_secrets(app: &mut App, engine: &mut VaultEngine, key: KeyEven
                         } else {
                             app.set_status(&format!("✗ API error HTTP {}", r.status), true);
                         }
+                        app.reset_flow();
                         app.screen = Screen::Menu;
                         app.input_mode = InputMode::Navigation;
                     }
@@ -1724,34 +1633,19 @@ async fn handle_keychain(app: &mut App, _engine: &mut VaultEngine, key: KeyEvent
         KeyCode::Enter => {
             let has_entry = keychain::keychain_entry_exists();
             let action = if has_entry {
-                // options: remove (0), status (1)
-                match app.menu_selected {
-                    0 => "remove",
-                    1 => "status",
-                    _ => "",
-                }
+                match app.menu_selected { 0 => "remove", 1 => "status", _ => "" }
             } else {
-                // options: store (0), status (1)
-                match app.menu_selected {
-                    0 => "store",
-                    1 => "status",
-                    _ => "",
-                }
+                match app.menu_selected { 0 => "store", 1 => "status", _ => "" }
             };
 
             match action {
                 "store" => {
-                    // Prompt for password
                     app.reset_flow();
                     app.input_mode = InputMode::Editing;
                     app.flow_step = 0;
                     app.set_status("Enter master password to store", false);
-                    // We'll handle this in a special way - need to read password
-                    // For now, use rpassword
                     app.screen = Screen::Menu;
                     app.input_mode = InputMode::Navigation;
-                    // Actually, let's just call store directly
-                    // This is a simplification
                 }
                 "remove" => {
                     keychain::delete_from_keychain();
