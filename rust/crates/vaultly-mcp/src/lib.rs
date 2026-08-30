@@ -244,6 +244,28 @@ fn tools_list() -> Vec<Tool> {
             }),
         },
         Tool {
+            name: "cf_accounts",
+            description: "List which vaults hold Cloudflare credentials (account name, auth method, label, scope). Set health=true to also verify each credential is valid. Never exposes values.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "health": json!({ "type": "boolean", "description": "Verify each account's credential against Cloudflare (default false)" }),
+                }
+            }),
+        },
+        Tool {
+            name: "cf_account_label",
+            description: "Set, clear, or read a Cloudflare account's human-readable alias (label). Non-secret.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "vaultName": str_prop("Vault name"),
+                    "label": str_prop("Alias to set; omit to read, empty string to clear"),
+                },
+                "required": ["vaultName"]
+            }),
+        },
+        Tool {
             name: "cf_api",
             description: "Make an authenticated Cloudflare API call. Token injected from vault — you see the response, NEVER the token.",
             schema: json!({
@@ -481,6 +503,8 @@ async fn call_tool(engine: &mut VaultEngine, name: &str, args: &Value) -> Value 
         "vault_lock" => tool_vault_lock(engine, &ctx).await,
         "vault_unlock" => tool_vault_unlock(engine).await,
         "vault_audit" => tool_vault_audit(engine, args, &ctx).await,
+        "cf_accounts" => tool_cf_accounts(engine, args, &ctx).await,
+        "cf_account_label" => tool_cf_account_label(engine, args, &ctx).await,
         "cf_api" => tool_cf_api(engine, args, &ctx).await,
         "cf_zones" => tool_cf_zones(engine, args, &ctx).await,
         "cf_dns_list" => tool_cf_dns_list(engine, args, &ctx).await,
@@ -782,6 +806,105 @@ async fn tool_vault_audit(engine: &mut VaultEngine, args: &Value, _ctx: &CallerC
 }
 
 // ─── Cloudflare tools ────────────────────────────────────
+
+async fn tool_cf_accounts(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
+    let health = args
+        .get("health")
+        .and_then(|h| h.as_bool())
+        .unwrap_or(false);
+
+    // Health view: verify each credential live (may hit the network).
+    if health {
+        return match engine.cf_accounts_health(Some(ctx)).await {
+            Ok(accounts) => {
+                if accounts.is_empty() {
+                    return ok("No Cloudflare accounts found. Store CLOUDFLARE_API_TOKEN (or CLOUDFLARE_EMAIL + CLOUDFLARE_API_KEY) in a vault to register it.");
+                }
+                ok(format!(
+                    "Cloudflare accounts health ({}):\n{}",
+                    accounts.len(),
+                    accounts
+                        .iter()
+                        .map(|a| format!(
+                            "  - {} {}: {}",
+                            a.vault,
+                            if a.ok { "✓" } else { "✗" },
+                            a.message
+                        ))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ))
+            }
+            Err(e) => fail_err(&e),
+        };
+    }
+
+    match engine.list_cf_accounts(Some(ctx)) {
+        Ok(accounts) => {
+            if accounts.is_empty() {
+                return ok("No Cloudflare accounts found. Store CLOUDFLARE_API_TOKEN (or CLOUDFLARE_EMAIL + CLOUDFLARE_API_KEY) in a vault to register it.");
+            }
+            ok(format!(
+                "Cloudflare accounts ({}):\n{}",
+                accounts.len(),
+                accounts
+                    .iter()
+                    .map(|a| {
+                        let account_id = if a.has_account_id {
+                            "account-id ✓"
+                        } else {
+                            "no account-id"
+                        };
+                        let label = a
+                            .label
+                            .as_ref()
+                            .map(|l| format!(" [{}]", l))
+                            .unwrap_or_default();
+                        let scope = match (a.cf_api, a.deploy) {
+                            (true, true) => "cf-api+deploy",
+                            (true, false) => "cf-api (read/write)",
+                            (false, true) => "deploy only",
+                            (false, false) => "no access",
+                        };
+                        format!(
+                            "  - {}{} (auth: {}, {}, scope: {})",
+                            a.vault, label, a.auth, account_id, scope
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ))
+        }
+        Err(e) => fail_err(&e),
+    }
+}
+
+async fn tool_cf_account_label(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
+    require!(args, vault => "vaultName");
+    let label = args.get("label").and_then(|l| l.as_str());
+    match label {
+        // Read current label.
+        None => match engine.get_account_label(vault, Some(ctx)) {
+            Ok(l) => ok(match l {
+                Some(l) => format!("Label for '{}': {}", vault, l),
+                None => format!("No label set for '{}'.", vault),
+            }),
+            Err(e) => fail_err(&e),
+        },
+        // Set or clear (empty string clears).
+        Some(l) => {
+            let clear = l.is_empty();
+            match engine.set_account_label(vault, if clear { None } else { Some(l) }, Some(ctx)) {
+                Ok(()) => ok(if clear {
+                    format!("✓ Cleared label for '{}'.", vault)
+                } else {
+                    format!("✓ Set label for '{}' to: {}", vault, l)
+                }),
+                Err(e) => fail_err(&e),
+            }
+        }
+    }
+}
 
 async fn tool_cf_api(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
     require!(args, vault => "vaultName", method => "method", path => "path");

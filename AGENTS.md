@@ -19,7 +19,8 @@ and handle Cloudflare — all without ever seeing raw secret values.
 | `vault_run` | Run command with injected env vars | ❌ Sees output only |
 | `vault_lock` | Lock session — wipes key from memory | ❌ No |
 | `vault_unlock` | Re-open via macOS Keychain | ❌ No |
-| `vault_audit` | View audit log | ❌ No values logged |
+| `cf_accounts` | List which vaults hold Cloudflare credentials (auth method, label, scope; `health=true` verifies each is valid) | ❌ Names only |
+| `cf_account_label` | Set/clear/read a Cloudflare account's human-readable alias | ❌ Non-secret only |
 | `cf_api` | Cloudflare API calls (authenticated) | ❌ Sees response only |
 | `cf_zones` | List domains/zones | ❌ No |
 | `cf_dns_list` | List DNS records | ❌ No |
@@ -162,13 +163,18 @@ Agent does:
    → agent can NEVER read it back
 ```
 
-### "What credentials do I have?"
+### "Which Cloudflare accounts can I use, and are they healthy?"
 
 Agent does:
 ```
-1. vault_list → ["cf-personal", "cf-work", "personal"]
-2. vault_keys("cf-personal") → ["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID"]
-   → names only, no values
+1. cf_accounts → lists each CF vault, its auth method, label, and scope
+   (cf-api / deploy / none) — e.g. "cf-personal (auth: token, scope: cf-api+deploy)"
+2. cf_accounts(health=true) → verifies each credential live:
+   "cf-personal ✓: token active" / "cf-work ✗: token inactive"
+3. cf_account_label(vaultName="cf-personal", label="Personal") → set an alias
+   cf_account_label(vaultName="cf-personal") → read it back
+   cf_account_label(vaultName="cf-personal", label="") → clear it
+   → agent sees names/labels/health only, NEVER the credential values
 ```
 
 ---

@@ -11,9 +11,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 const PASSWORD: &str = "mcp-test-password";
 const SECRET_VALUE: &str = "sk-e2e-super-secret-token-1234567890";
 const SECRET_KEY: &str = "E2E_SECRET_KEY";
-
-const EXPECTED_TOOLS: [&str; 30] = [
+const EXPECTED_TOOLS: [&str; 32] = [
     "cf_api",
+    "cf_accounts",
+    "cf_account_label",
     "cf_deploy",
     "cf_dns_delete",
     "cf_dns_list",
@@ -269,6 +270,114 @@ async fn mcp_vault_write_read_cycle_no_leak() {
     })
     .await
     .expect("mcp_vault_write_read_cycle_no_leak timed out");
+}
+
+#[tokio::test]
+async fn mcp_cf_accounts_lists_without_values() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mcp = new_client(dir.path()).await;
+
+        // No CF credentials yet → cf_accounts reports none.
+        let res = mcp.call_tool(2, "cf_accounts", json!({})).await;
+        let text = mcp.result_text(&res);
+        assert!(text.contains("No Cloudflare accounts"), "{}", text);
+
+        // Store CF credentials (token + account id) for a personal account.
+        mcp.call_tool(
+            3,
+            "vault_add",
+            json!({ "vaultName": "cf-personal", "key": "CLOUDFLARE_API_TOKEN", "value": MARKER_VALUE }),
+        )
+        .await;
+        mcp.call_tool(
+            4,
+            "vault_add",
+            json!({ "vaultName": "cf-personal", "key": "CLOUDFLARE_ACCOUNT_ID", "value": "acc-123" }),
+        )
+        .await;
+
+        // cf_accounts now discovers the account: name + auth method + account-id,
+        // but NEVER the token value.
+        let res = mcp.call_tool(5, "cf_accounts", json!({})).await;
+        let full = serde_json::to_string(&res).unwrap();
+        let text = mcp.result_text(&res);
+        assert!(text.contains("cf-personal"), "{}", text);
+        assert!(text.contains("token"), "{}", text);
+        assert!(text.contains("account-id"), "{}", text);
+        // The credential VALUE must never appear in any response.
+        assert!(!full.contains(MARKER_VALUE), "secret leaked: {}", full);
+    })
+    .await
+    .expect("mcp_cf_accounts_lists_without_values timed out");
+}
+
+#[tokio::test]
+async fn mcp_cf_account_label_and_scope() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mcp = new_client(dir.path()).await;
+
+        // Store CF credentials for a personal account.
+        mcp.call_tool(
+            2,
+            "vault_add",
+            json!({ "vaultName": "cf-personal", "key": "CLOUDFLARE_API_TOKEN", "value": MARKER_VALUE }),
+        )
+        .await;
+        mcp.call_tool(
+            3,
+            "vault_add",
+            json!({ "vaultName": "cf-personal", "key": "CLOUDFLARE_ACCOUNT_ID", "value": "acc-123" }),
+        )
+        .await;
+
+        // Scope is surfaced: default agent policy grants cf-api + deploy.
+        let res = mcp.call_tool(4, "cf_accounts", json!({})).await;
+        let text = mcp.result_text(&res);
+        assert!(text.contains("cf-api+deploy"), "{}", text);
+        assert!(text.contains("account-id"), "{}", text);
+
+        // Set a label, then read it back.
+        let res = mcp
+            .call_tool(
+                5,
+                "cf_account_label",
+                json!({ "vaultName": "cf-personal", "label": "Personal" }),
+            )
+            .await;
+        let text = mcp.result_text(&res);
+        assert!(text.contains("Personal"), "{}", text);
+
+        let res = mcp
+            .call_tool(6, "cf_account_label", json!({ "vaultName": "cf-personal" }))
+            .await;
+        let text = mcp.result_text(&res);
+        assert!(text.contains("Personal"), "{}", text);
+
+        // The label now appears in cf_accounts, and no secret value leaks.
+        let res = mcp.call_tool(7, "cf_accounts", json!({})).await;
+        let full = serde_json::to_string(&res).unwrap();
+        let text = mcp.result_text(&res);
+        assert!(text.contains("[Personal]"), "{}", text);
+        assert!(!full.contains(MARKER_VALUE), "secret leaked: {}", full);
+
+        // Empty label clears it.
+        let res = mcp
+            .call_tool(
+                8,
+                "cf_account_label",
+                json!({ "vaultName": "cf-personal", "label": "" }),
+            )
+            .await;
+        let text = mcp.result_text(&res);
+        assert!(text.contains("Cleared"), "{}", text);
+        let res = mcp.call_tool(9, "cf_accounts", json!({})).await;
+        let text = mcp.result_text(&res);
+        assert!(!text.contains("Personal"), "{}", text);
+    })
+    .await
+    .expect("mcp_cf_account_label_and_scope timed out");
 }
 
 #[tokio::test]

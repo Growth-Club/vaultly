@@ -10,7 +10,7 @@ tool-only subset of MCP: `initialize`, `notifications/initialized`, `ping`,
 > `vault_import`) or happen inside a child process / authenticated API request
 > (`vault_run`, `cf_*`). `vault_export` is refused outright in the agent context.
 
-There are **30 tools**, grouped below. Start the server with your master
+There are **32 tools**, grouped below. Start the server with your master
 password available:
 
 ```json
@@ -111,6 +111,8 @@ reaches the agent.
 
 | Tool | Args | Returns |
 |---|---|---|
+| `cf_accounts` | `health`? (bool, default false) | Vaults holding Cloudflare credentials (auth method, label, scope; live health when `health=true`) |
+| `cf_account_label` | `vaultName`, `label`? (omit=read, empty=clear) | Read / set / clear a vault's human-readable alias |
 | `cf_api` | `vaultName`, `method` (GET/POST/PUT/PATCH/DELETE), `path`, `body`? | Auth'd response (scrubbed) |
 | `cf_health` | `vaultName` | Valid/invalid credential report |
 | `cf_zones` | `vaultName` | Zone list + IDs |

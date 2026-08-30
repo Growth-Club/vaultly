@@ -44,6 +44,32 @@ pub struct ApiResult {
     pub status: u16,
     pub data: Value,
 }
+/// Agent-safe summary of a vault that holds Cloudflare credentials.
+/// Deliberately NO secret values — only the vault name, auth method, and
+/// whether an account ID is present.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CfAccountInfo {
+    pub vault: String,
+    /// "token", "email+key", or "partial" (incomplete credential set).
+    pub auth: String,
+    pub has_account_id: bool,
+    /// Optional human-readable alias (set via cf_account_label).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Whether the current agent may perform Cloudflare API calls on this vault.
+    pub cf_api: bool,
+    /// Whether the current agent may deploy (run) on this vault.
+    pub deploy: bool,
+}
+/// Per-account live health result (from a Cloudflare verify call).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CfAccountHealth {
+    pub vault: String,
+    pub ok: bool,
+    pub message: String,
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AuditEntry {
@@ -303,6 +329,119 @@ impl VaultEngine {
         let vaults = self.store.list_vaults();
         self.audit("LIST_VAULTS", &format!("{} vaults", vaults.len()), ctx);
         Ok(vaults)
+    }
+    /// Agent-safe: which vaults hold Cloudflare credentials, and how they
+    /// authenticate. Inspects key NAMES only — never secret values.
+    pub fn list_cf_accounts(
+        &mut self,
+        ctx: Option<&CallerContext>,
+    ) -> Result<Vec<CfAccountInfo>> {
+        let mut accounts = Vec::new();
+        for vault in self.list_vaults(ctx)? {
+            // Skip vaults this agent isn't allowed to read keys from, so a
+            // scoped agent still gets a usable (filtered) account list.
+            if self.policy.check(ctx, Operation::ReadKeys, &vault).is_err() {
+                continue;
+            }
+            let keys = match self.list_keys(&vault, ctx) {
+                Ok(k) => k,
+                Err(_) => continue,
+            };
+            let has_token = keys.iter().any(|k| k == "CLOUDFLARE_API_TOKEN");
+            let has_email = keys.iter().any(|k| k == "CLOUDFLARE_EMAIL");
+            let has_key = keys.iter().any(|k| k == "CLOUDFLARE_API_KEY");
+            let has_account_id = keys.iter().any(|k| k == "CLOUDFLARE_ACCOUNT_ID");
+            if !has_token && !has_email && !has_key && !has_account_id {
+                continue;
+            }
+            let auth = if has_token {
+                "token".to_string()
+            } else if has_email && has_key {
+                "email+key".to_string()
+            } else {
+                "partial".to_string()
+            };
+            let label = self.store.get_vault_label(&vault).unwrap_or(None);
+            let cf_api = self.policy.check(ctx, Operation::CfApi, &vault).is_ok();
+            let deploy = self.policy.check(ctx, Operation::Run, &vault).is_ok();
+            accounts.push(CfAccountInfo {
+                vault,
+                auth,
+                has_account_id,
+                label,
+                cf_api,
+                deploy,
+            });
+        }
+        accounts.sort_by(|a, b| a.vault.cmp(&b.vault));
+        self.audit(
+            "CF_ACCOUNTS",
+            &format!("{} Cloudflare accounts", accounts.len()),
+            ctx,
+        );
+        Ok(accounts)
+    }
+    /// Live health for every Cloudflare account the current agent may use.
+    /// Verifies each token/credential against the Cloudflare API. Agent-safe —
+    /// returns only a boolean + message, never a credential value.
+    pub async fn cf_accounts_health(
+        &mut self,
+        ctx: Option<&CallerContext>,
+    ) -> Result<Vec<CfAccountHealth>> {
+        let accounts = self.list_cf_accounts(ctx)?;
+        let mut out = Vec::new();
+        for a in accounts {
+            if !a.cf_api {
+                out.push(CfAccountHealth {
+                    vault: a.vault,
+                    ok: false,
+                    message: "not permitted for this agent".to_string(),
+                });
+                continue;
+            }
+            match self.health_check(&a.vault, ctx).await {
+                Ok((ok, msg)) => out.push(CfAccountHealth {
+                    vault: a.vault,
+                    ok,
+                    message: msg,
+                }),
+                Err(e) => out.push(CfAccountHealth {
+                    vault: a.vault,
+                    ok: false,
+                    message: e.to_string(),
+                }),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Get a vault's human-readable label (agent-safe — non-secret).
+    pub fn get_account_label(
+        &mut self,
+        vault_name: &str,
+        ctx: Option<&CallerContext>,
+    ) -> Result<Option<String>> {
+        self.op(ctx, Operation::ReadKeys, vault_name)?;
+        self.store.get_vault_label(vault_name)
+    }
+
+    /// Set or clear a vault's human-readable label (used as a Cloudflare
+    /// account alias). `None` clears. Agent-safe — non-secret.
+    pub fn set_account_label(
+        &mut self,
+        vault_name: &str,
+        label: Option<&str>,
+        ctx: Option<&CallerContext>,
+    ) -> Result<()> {
+        self.op(ctx, Operation::Write, vault_name)?;
+        self.store
+            .set_vault_label(vault_name, label.map(|s| s.to_string()))?;
+        self.audit(
+            "CF_ACCOUNT_LABEL",
+            &format!("{}/{}", vault_name, label.unwrap_or("(cleared)")),
+            ctx,
+        );
+        Ok(())
     }
 
     pub fn list_keys(
@@ -1798,6 +1937,137 @@ mod tests {
             .add_secret("cf", "CLOUDFLARE_ACCOUNT_ID", "acc-123", Some(&agent_ctx()))
             .unwrap();
         (engine, dir)
+    }
+    #[tokio::test]
+    async fn engine_cf_accounts_detects_auth_methods_without_values() {
+        let (mut engine, _dir) = setup();
+        // token-based account
+        engine
+            .add_secret(
+                "cf-personal",
+                "CLOUDFLARE_API_TOKEN",
+                "tok-secret-1",
+                Some(&agent_ctx()),
+            )
+            .unwrap();
+        engine
+            .add_secret(
+                "cf-personal",
+                "CLOUDFLARE_ACCOUNT_ID",
+                "acc-1",
+                Some(&agent_ctx()),
+            )
+            .unwrap();
+        // email+key based account, no account id
+        engine
+            .add_secret(
+                "cf-work",
+                "CLOUDFLARE_EMAIL",
+                "admin@example.com",
+                Some(&agent_ctx()),
+            )
+            .unwrap();
+        engine
+            .add_secret(
+                "cf-work",
+                "CLOUDFLARE_API_KEY",
+                "key-secret-2",
+                Some(&agent_ctx()),
+            )
+            .unwrap();
+        // non-CF vault must be excluded
+        engine
+            .add_secret("github", "GITHUB_TOKEN", "ghp-3", Some(&agent_ctx()))
+            .unwrap();
+
+        let accounts = engine
+            .list_cf_accounts(Some(&agent_ctx()))
+            .unwrap();
+        assert_eq!(accounts.len(), 2);
+        let personal = accounts
+            .iter()
+            .find(|a| a.vault == "cf-personal")
+            .unwrap();
+        assert_eq!(personal.auth, "token");
+        assert!(personal.has_account_id);
+        let work = accounts.iter().find(|a| a.vault == "cf-work").unwrap();
+        assert_eq!(work.auth, "email+key");
+        assert!(!work.has_account_id);
+        // serialized output must never contain a secret value
+        let ser = serde_json::to_string(&accounts).unwrap();
+        assert!(!ser.contains("tok-secret-1"));
+        assert!(!ser.contains("key-secret-2"));
+        assert!(!ser.contains("ghp-3"));
+
+        // Default agent policy permits cf-api + deploy on every account.
+        assert!(personal.cf_api && personal.deploy);
+        assert!(work.cf_api && work.deploy);
+
+        // Set a label; it must surface and survive a subsequent write.
+        engine
+            .set_account_label("cf-personal", Some("Personal"), Some(&agent_ctx()))
+            .unwrap();
+        engine
+            .add_secret("cf-personal", "EXTRA", "v", Some(&agent_ctx()))
+            .unwrap();
+        let accounts = engine
+            .list_cf_accounts(Some(&agent_ctx()))
+            .unwrap();
+        let personal = accounts
+            .iter()
+            .find(|a| a.vault == "cf-personal")
+            .unwrap();
+        assert_eq!(personal.label.as_deref(), Some("Personal"));
+
+        // Clearing the label removes it.
+        engine
+            .set_account_label("cf-personal", None, Some(&agent_ctx()))
+            .unwrap();
+        let accounts = engine
+            .list_cf_accounts(Some(&agent_ctx()))
+            .unwrap();
+        let personal = accounts
+            .iter()
+            .find(|a| a.vault == "cf-personal")
+            .unwrap();
+        assert_eq!(personal.label, None);
+    }
+
+    #[tokio::test]
+    async fn engine_cf_accounts_surfaces_scope_and_filters() {
+        let (mut engine, _dir) = setup();
+        engine
+            .add_secret("cf-personal", "CLOUDFLARE_API_TOKEN", "t1", Some(&agent_ctx()))
+            .unwrap();
+        engine
+            .add_secret("cf-work", "CLOUDFLARE_API_TOKEN", "t2", Some(&agent_ctx()))
+            .unwrap();
+
+        use crate::policy::{AgentPolicy, AllowedOperations, AllowedVaults, Operation};
+        engine.set_agent_policies(vec![AgentPolicy {
+            name: "test-agent".into(),
+            allowed_vaults: AllowedVaults::List(vec!["cf-personal".into()]),
+            // Run (deploy) granted, CfApi deliberately NOT granted.
+            allowed_operations: AllowedOperations::List(vec![
+                Operation::List,
+                Operation::ReadKeys,
+                Operation::Write,
+                Operation::Delete,
+                Operation::Run,
+            ]),
+            roles: Default::default(),
+            vault_roles: Default::default(),
+            max_ops_per_minute: 60,
+            created_at: "2020-01-01T00:00:00Z".into(),
+        }]);
+
+        let accounts = engine.list_cf_accounts(Some(&agent_ctx())).unwrap();
+        // cf-work is outside the agent's allowed_vaults → filtered out.
+        assert_eq!(accounts.len(), 1);
+        let a = &accounts[0];
+        assert_eq!(a.vault, "cf-personal");
+        assert!(!a.cf_api, "CfApi not granted → cf_api must be false");
+        assert!(a.deploy, "Run granted → deploy must be true");
     }
 
     #[tokio::test]

@@ -8,7 +8,7 @@
 
 [![Rust](https://img.shields.io/badge/Rust-1.96-000000?logo=rust&logoColor=white)](https://rust-lang.org)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![MCP](https://img.shields.io/badge/MCP-28_tools-8A2BE2)](#ai-agent-integration-mcp)
+[![MCP](https://img.shields.io/badge/MCP-31_tools-8A2BE2)](#ai-agent-integration-mcp)
 [![Cloudflare](https://img.shields.io/badge/Cloudflare-Workers-F38020?logo=cloudflare&logoColor=white)](https://workers.cloudflare.com)
 [![Security](https://img.shields.io/badge/encryption-AES--256--GCM-red)](#security)
 
@@ -94,7 +94,7 @@ vaultly keychain store|remove|status      macOS Keychain lock/unlock
 vaultly backup -u URL -t TOKEN            Push encrypted backup (ciphertext only)
 vaultly restore -u URL -t TOKEN           Pull encrypted backup
 vaultly protect [dir]                     Add AI-tool ignore rules
-vaultly mcp                               Start the MCP server (28 agent tools)
+vaultly mcp                               Start the MCP server (31 agent tools)
 vaultly lock                              Wipe key from memory
 vaultly unlock                            Re-open via Keychain
 vaultly kill                              Emergency lock + clear Keychain
@@ -120,11 +120,11 @@ Add to your AI tool's MCP config:
 
 > 💡 With macOS Keychain (`vaultly keychain store`), no password is needed in config.
 
-The 17 MCP tools cover vault operations (`vault_list`, `vault_keys`,
+The 32 MCP tools cover vault operations (`vault_list`, `vault_keys`,
 `vault_add`, `vault_delete`, `vault_run`, `vault_status`, `vault_lock`,
-`vault_unlock`, `vault_audit`) and Cloudflare management (`cf_api`, `cf_zones`,
-`cf_dns_list`, `cf_dns_upsert`, `cf_workers_list`, `cf_secrets`, `cf_deploy`,
-`cf_health`).
+`vault_unlock`, `vault_audit`) and Cloudflare management (`cf_accounts`,
+`cf_account_label`, `cf_api`, `cf_zones`, `cf_dns_list`, `cf_dns_upsert`,
+`cf_workers_list`, `cf_secrets`, `cf_deploy`, `cf_health`).
 
 > 🚫 **Write-only for agents.** No MCP tool ever returns a raw secret value;
 > agent-facing `vault_add`/`cf_secrets` store what you give them, and

@@ -374,7 +374,36 @@ impl VaultStore {
 
     fn save_vault_file(&self, name: &str, vault: &VaultFile) -> Result<()> {
         self.ensure_dirs()?;
-        let json = serde_json::to_string_pretty(vault)?;
+        let mut vault = vault.clone();
+        // Preserve an existing label across re-encryption: `encrypt_vault`
+        // builds a fresh VaultFile without a label, so copy the on-disk label
+        // forward unless this write explicitly replaces it.
+        if vault.label.is_none() {
+            if let Ok(Some(existing)) = self.load_vault_file(name) {
+                vault.label = existing.label;
+            }
+        }
+        let json = serde_json::to_string_pretty(&vault)?;
+        self.with_write_lock(|| {
+            Self::write_secure(&self.vault_path(name)?, &json)?;
+            Ok(())
+        })
+    }
+    /// Non-secret human-readable label for a vault (used for Cloudflare
+    /// account aliases). `None` when unset or the vault doesn't exist.
+    pub fn get_vault_label(&self, name: &str) -> Result<Option<String>> {
+        Ok(self.load_vault_file(name)?.and_then(|vf| vf.label))
+    }
+
+    /// Set or clear a vault's label. Writes directly so an explicit clear
+    /// (label = None) isn't undone by `save_vault_file`'s label preservation.
+    pub fn set_vault_label(&self, name: &str, label: Option<String>) -> Result<()> {
+        let mut vf = self
+            .load_vault_file(name)?
+            .ok_or_else(|| VaultError::VaultNotFound(name.to_string()))?;
+        vf.label = label;
+        self.ensure_dirs()?;
+        let json = serde_json::to_string_pretty(&vf)?;
         self.with_write_lock(|| {
             Self::write_secure(&self.vault_path(name)?, &json)?;
             Ok(())
@@ -810,6 +839,42 @@ mod tests {
     }
 
     #[test]
+    fn label_set_get_clear_and_preserved_across_write() {
+        let dir = temp_dir();
+        let store = store_with(dir.clone());
+        let key = key_for(&store);
+        store.set_secret("github", "TOKEN", "v1", &key).unwrap();
+
+        // Unset by default.
+        assert_eq!(store.get_vault_label("github").unwrap(), None);
+
+        // Set and read back.
+        store
+            .set_vault_label("github", Some("Personal".into()))
+            .unwrap();
+        assert_eq!(
+            store.get_vault_label("github").unwrap().as_deref(),
+            Some("Personal")
+        );
+
+        store.set_secret("github", "TEMP", "x", &key).unwrap();
+        store.delete_secret("github", "TEMP", &key).unwrap();
+        assert_eq!(
+            store.get_vault_label("github").unwrap().as_deref(),
+            Some("Personal")
+        );
+
+        // Explicit clear works even though save_vault_file preserves labels.
+        store.set_vault_label("github", None).unwrap();
+        assert_eq!(store.get_vault_label("github").unwrap(), None);
+
+        // Setting a label on a missing vault errors.
+        assert!(store.set_vault_label("nope", Some("x".into())).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn restore_roundtrip_preserves_secrets() {
         let dir = temp_dir();
         let store = store_with(dir.clone());
@@ -1005,6 +1070,7 @@ mod tests {
             auth_tag: payload.auth_tag,
             data: payload.ciphertext,
             updated_at: "2020-01-01T00:00:00Z".into(),
+            label: None,
         };
         store.save_vault_file("v", &vf).unwrap();
 

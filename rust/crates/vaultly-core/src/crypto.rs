@@ -148,6 +148,10 @@ pub struct VaultFile {
     pub auth_tag: String,   // serialized as authTag
     pub data: String,       // encrypted JSON, hex-encoded
     pub updated_at: String, // ISO 8601 — serialized as updatedAt
+    /// Optional human-readable label for the vault (non-secret, stored in
+    /// plaintext alongside the encrypted data). Absent on older vaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -243,6 +247,7 @@ pub fn encrypt_vault(
         auth_tag: payload.auth_tag,
         data: payload.ciphertext,
         updated_at: now_iso(),
+        label: None,
     })
 }
 

@@ -16,8 +16,14 @@ removed). Highlights of the current unreleased feature set:
 - **CLI exports** — `vaultly env <vault>` emits shell export statements and
   `vaultly run <vault> -- <cmd>` runs a command with injected (then cleared)
   environment, with output scrubbed of any secret values.
-- **MCP server** (`vaultly mcp`) — 28 agent-safe tools covering vault
+- **MCP server** (`vaultly mcp`) — 32 agent-safe tools covering vault
   operations and Cloudflare management. No tool returns a raw secret value.
+- **`cf_accounts` MCP tool** — discover which vaults hold Cloudflare
+  credentials (account name + auth method + per-account scope), so agents can
+  pick an account without guessing vault names. Inspects key names only —
+  never values. `health=true` verifies each credential live.
+- **`cf_account_label` MCP tool** — set/clear/read a human-readable alias on a
+  Cloudflare account vault (non-secret, stored in plaintext).
 - **Interactive TUI** (`vaultly` / `vaultly tui`) — human-only menu UI built on
   ratatui, routing all actions through the same audited, encrypted engine.
 - **Cloudflare management** — dynamically add/manage unlimited accounts with
