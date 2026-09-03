@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 6c25e2d79ac0baafb702f5919a440f995c5acbc2b44461ccc497219ee2b79243 # shrinks to s = ""
+cc 995a0ab1523d113a1c97caf468d3306b5a53902ba46130a4bdece7addad76278 # shrinks to value = "C", created = "𞥐໐꧐𑣠-᪀𑄶-𞥐𑣠T𑜰०:꧐𖵰:𑛐𞓰Z", updated = "០𞥐𖩠𑇐-0૦-🯰꣐T𞋰𐒠:꩐０:𞓰۰Z"

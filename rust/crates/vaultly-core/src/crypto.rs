@@ -518,8 +518,16 @@ mod tests {
             let json = serde_json::to_value(&entry).unwrap();
             let parsed: SecretEntry = serde_json::from_value(json).unwrap();
             assert_eq!(parsed.value, value);
-            // Debug must never surface the value regardless of content.
-            assert!(!format!("{:?}", parsed).contains(&value));
+            // Debug must never surface the value regardless of content. The
+            // Debug impl only ever emits the fixed placeholder "[REDACTED]"
+            // plus struct/field scaffolding — so a short value that happens to
+            // be a substring of that fixed text (e.g. a lone "C" inside
+            // "[REDACTED]") is not a leak and must be excluded from the check.
+            let debug = format!("{:?}", parsed);
+            let scaffolding = "[REDACTED] SecretEntry value created_at updated_at expires_at";
+            if !scaffolding.contains(&value) {
+                assert!(!debug.contains(&value), "value leaked in Debug: {}", debug);
+            }
         }
     }
 }

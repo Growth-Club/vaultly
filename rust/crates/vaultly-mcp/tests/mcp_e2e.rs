@@ -11,7 +11,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 const PASSWORD: &str = "mcp-test-password";
 const SECRET_VALUE: &str = "sk-e2e-super-secret-token-1234567890";
 const SECRET_KEY: &str = "E2E_SECRET_KEY";
-const EXPECTED_TOOLS: [&str; 32] = [
+const EXPECTED_TOOLS: [&str; 61] = [
     "cf_api",
     "cf_accounts",
     "cf_account_label",
@@ -44,6 +44,35 @@ const EXPECTED_TOOLS: [&str; 32] = [
     "vault_run",
     "vault_status",
     "vault_unlock",
+    "cf_cache_purge",
+    "cf_r2_buckets",
+    "cf_r2_objects",
+    "cf_r2_object_put",
+    "cf_r2_object_get",
+    "cf_r2_object_delete",
+    "cf_kv_namespaces",
+    "cf_kv_keys",
+    "cf_kv_put",
+    "cf_kv_get",
+    "cf_kv_delete",
+    "cf_d1_databases",
+    "cf_d1_info",
+    "cf_d1_query",
+    "cf_pages_projects",
+    "cf_pages_deploy",
+    "cf_worker_bindings",
+    "cf_worker_triggers",
+    "cf_ssl_settings",
+    "cf_certificates",
+    "cf_certificate_order",
+    "cf_firewall_rules",
+    "cf_firewall_rule_create",
+    "cf_firewall_rule_delete",
+    "cf_lb_pools",
+    "cf_lb_list",
+    "cf_email_settings",
+    "cf_email_rules",
+    "cf_email_rule_create",
 ];
 
 struct McpClient {
@@ -113,7 +142,7 @@ async fn mcp_e2e_security_surface() {
 
         let mut mcp = McpClient::start(dir.path()).await;
 
-        // 1. Exposes exactly the 17 documented tools
+        // 1. Exposes exactly the documented tools
         let res = mcp.call(2, "tools/list", json!({})).await;
         let mut names: Vec<String> = res["result"]["tools"]
             .as_array()

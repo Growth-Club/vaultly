@@ -10,7 +10,7 @@ tool-only subset of MCP: `initialize`, `notifications/initialized`, `ping`,
 > `vault_import`) or happen inside a child process / authenticated API request
 > (`vault_run`, `cf_*`). `vault_export` is refused outright in the agent context.
 
-There are **32 tools**, grouped below. Start the server with your master
+There are **61 tools**, grouped below. Start the server with your master
 password available:
 
 ```json
@@ -123,6 +123,35 @@ reaches the agent.
 | `cf_workers_versions` | `vaultName`, `scriptName` | Worker deployment versions |
 | `cf_secrets` | `vaultName`, `scriptName`, `action` (list/set/delete), `name`?, `value`? | List names / set / delete; values write-only |
 | `cf_deploy` | `vaultName`, `projectDir`, `extraArgs`? | `npx wrangler deploy` result (scrubbed) |
+| `cf_cache_purge` | `vaultName`, `zoneId`, `purgeEverything`?, `urls`?, `files`?, `tags`? | Purge zone cache |
+| `cf_r2_buckets` | `vaultName` | R2 bucket list |
+| `cf_r2_objects` | `vaultName`, `bucket` | Objects in a bucket |
+| `cf_r2_object_put` | `vaultName`, `bucket`, `key`, `value` | Write an object (value = body) |
+| `cf_r2_object_get` | `vaultName`, `bucket`, `key` | Read an object |
+| `cf_r2_object_delete` | `vaultName`, `bucket`, `key` | Delete an object |
+| `cf_kv_namespaces` | `vaultName` | KV namespace list |
+| `cf_kv_keys` | `vaultName`, `namespaceId` | Keys in a namespace |
+| `cf_kv_put` | `vaultName`, `namespaceId`, `key`, `value` | Write a KV key |
+| `cf_kv_get` | `vaultName`, `namespaceId`, `key` | Read a KV key |
+| `cf_kv_delete` | `vaultName`, `namespaceId`, `key` | Delete a KV key |
+| `cf_d1_databases` | `vaultName` | D1 database list |
+| `cf_d1_info` | `vaultName`, `databaseId` | D1 database info |
+| `cf_d1_query` | `vaultName`, `databaseId`, `sql` | Run SQL against D1 |
+| `cf_pages_projects` | `vaultName` | Pages project list |
+| `cf_pages_deploy` | `vaultName`, `project`, `projectDir`, `extraArgs`? | Deploy a static site |
+| `cf_worker_bindings` | `vaultName`, `scriptName` | Worker bindings |
+| `cf_worker_triggers` | `vaultName`, `scriptName` | Worker triggers |
+| `cf_ssl_settings` | `vaultName`, `zoneId` | Zone SSL settings |
+| `cf_certificates` | `vaultName`, `zoneId` | Custom certificates |
+| `cf_certificate_order` | `vaultName`, `zoneId`, `hosts`?, `validationMethod`?, `certificateAuthority`? | Order a cert pack |
+| `cf_firewall_rules` | `vaultName`, `zoneId` | Firewall rule list |
+| `cf_firewall_rule_create` | `vaultName`, `zoneId`, `expression`, `action`, `description`? | Create a rule |
+| `cf_firewall_rule_delete` | `vaultName`, `zoneId`, `ruleId` | Delete a rule |
+| `cf_lb_pools` | `vaultName` | Load balancer pools |
+| `cf_lb_list` | `vaultName` | Load balancers |
+| `cf_email_settings` | `vaultName`, `zoneId` | Email routing settings |
+| `cf_email_rules` | `vaultName`, `zoneId` | Email routing rules |
+| `cf_email_rule_create` | `vaultName`, `zoneId`, `action`, `value`?, `enabled`? | Create an email rule |
 
 ## Health & error behavior
 

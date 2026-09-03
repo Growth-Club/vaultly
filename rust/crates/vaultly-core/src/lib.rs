@@ -11,6 +11,6 @@ pub mod scrubber;
 pub mod templates;
 pub mod vault;
 
-pub use engine::{ApiResult, RunOptions, RunResult, VaultEngine};
+pub use engine::{urlencode, ApiResult, RunOptions, RunResult, VaultEngine};
 pub use error::VaultError;
 pub use policy::{AgentPolicy, AllowedOperations, AllowedVaults, Caller, CallerContext, Operation};

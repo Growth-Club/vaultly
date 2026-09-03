@@ -353,6 +353,47 @@ enum CfCommand {
         zone_id: String,
         record_id: String,
     },
+    /// Purge a zone's cache (agent-safe)
+    CachePurge {
+        name: String,
+        zone_id: String,
+        #[arg(long, help = "Purge the entire zone cache")]
+        purge_everything: bool,
+    },
+    /// List R2 buckets, or objects in a bucket with --bucket
+    R2 {
+        name: String,
+        #[arg(long, help = "List objects in this bucket")]
+        bucket: Option<String>,
+    },
+    /// List KV namespaces, or keys in a namespace with --namespace
+    Kv {
+        name: String,
+        #[arg(long, help = "List keys in this namespace ID")]
+        namespace: Option<String>,
+    },
+    /// List D1 databases, or info for one with --database
+    D1 {
+        name: String,
+        #[arg(long, help = "Show info for this database ID")]
+        database: Option<String>,
+    },
+    /// List Cloudflare Pages projects
+    Pages { name: String },
+    /// List a Worker's bindings
+    Bindings { name: String, script_name: String },
+    /// List a Worker's triggers
+    Triggers { name: String, script_name: String },
+    /// Show a zone's SSL settings
+    Ssl { name: String, zone_id: String },
+    /// List a zone's custom certificates
+    Certificates { name: String, zone_id: String },
+    /// List a zone's firewall rules
+    Firewall { name: String, zone_id: String },
+    /// List load balancers and pools
+    Lb { name: String },
+    /// List a zone's email routing rules
+    Email { name: String, zone_id: String },
 }
 
 #[derive(Subcommand)]
@@ -625,6 +666,28 @@ async fn main() {
                 zone_id,
                 record_id,
             } => cmd_cf_dns_delete(&name, &zone_id, &record_id).await,
+            CfCommand::CachePurge {
+                name,
+                zone_id,
+                purge_everything,
+            } => cmd_cf_cache_purge(&name, &zone_id, purge_everything).await,
+            CfCommand::R2 { name, bucket } => cmd_cf_r2(&name, bucket.as_deref()).await,
+            CfCommand::Kv { name, namespace } => cmd_cf_kv(&name, namespace.as_deref()).await,
+            CfCommand::D1 { name, database } => cmd_cf_d1(&name, database.as_deref()).await,
+            CfCommand::Pages { name } => cmd_cf_pages(&name).await,
+            CfCommand::Bindings { name, script_name } => {
+                cmd_cf_bindings(&name, &script_name).await
+            }
+            CfCommand::Triggers { name, script_name } => {
+                cmd_cf_triggers(&name, &script_name).await
+            }
+            CfCommand::Ssl { name, zone_id } => cmd_cf_ssl(&name, &zone_id).await,
+            CfCommand::Certificates { name, zone_id } => {
+                cmd_cf_certificates(&name, &zone_id).await
+            }
+            CfCommand::Firewall { name, zone_id } => cmd_cf_firewall(&name, &zone_id).await,
+            CfCommand::Lb { name } => cmd_cf_lb(&name).await,
+            CfCommand::Email { name, zone_id } => cmd_cf_email(&name, &zone_id).await,
         },
         Some(Command::Template { name, list }) => {
             block_in_agent_mode("template");
@@ -2058,6 +2121,342 @@ async fn cmd_cf_dns_delete(name: &str, zone_id: &str, record_id: &str) {
         ),
         Err(e) => {
             eprintln!("{} Failed to delete DNS record: {}", "✗".red(), e);
+            exit(1);
+        }
+    }
+}
+
+// ─── cf helpers ─────────────────────────────────────────────
+
+fn print_cf_json(result: &vaultly_core::ApiResult) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&result.data).unwrap_or_else(|_| result.data.to_string())
+    );
+}
+
+fn cf_list_names(r: &vaultly_core::ApiResult, field: &str) -> Vec<String> {
+    r.data
+        .get("result")
+        .and_then(|x| x.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|b| b.get(field).and_then(|n| n.as_str()).map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+// ─── cf cache-purge ─────────────────────────────────────────
+
+async fn cmd_cf_cache_purge(name: &str, zone_id: &str, purge_everything: bool) {
+    let vault_name = cf_vault(name);
+    let mut engine = require_unlock();
+    if !purge_everything {
+        eprintln!(
+            "{} Pass --purge-everything to purge the whole zone cache (targeted purge is not exposed in the CLI).",
+            "✗".red()
+        );
+        exit(1);
+    }
+    let body = serde_json::json!({ "purge_everything": true });
+    match engine
+        .cloudflare_api(
+            &vault_name,
+            "POST",
+            &format!("/zones/{}/purge_cache", zone_id),
+            Some(body),
+            None,
+        )
+        .await
+    {
+        Ok(r) => print_cf_result(
+            &r,
+            &format!("Cache purge requested for zone '{}'", zone_id),
+        ),
+        Err(e) => {
+            eprintln!("{} Failed: {}", "✗".red(), e);
+            exit(1);
+        }
+    }
+}
+
+// ─── cf r2 ──────────────────────────────────────────────────
+
+async fn cmd_cf_r2(name: &str, bucket: Option<&str>) {
+    let vault_name = cf_vault(name);
+    let mut engine = require_unlock();
+    match bucket {
+        Some(b) => {
+            let path = format!("/r2/buckets/{}/objects", vaultly_core::urlencode(b));
+            match engine.cloudflare_account_api(&vault_name, "GET", &path, None, None).await {
+                Ok(r) => print_cf_json(&r),
+                Err(e) => {
+                    eprintln!("{} Failed: {}", "✗".red(), e);
+                    exit(1);
+                }
+            }
+        }
+        None => match engine
+            .cloudflare_account_api(&vault_name, "GET", "/r2/buckets", None, None)
+            .await
+        {
+            Ok(r) => {
+                let names = cf_list_names(&r, "name");
+                println!("☁️  R2 buckets for '{}' ({}):", name, names.len());
+                for n in &names {
+                    println!("  - {}", n.green());
+                }
+            }
+            Err(e) => {
+                eprintln!("{} Failed: {}", "✗".red(), e);
+                exit(1);
+            }
+        },
+    }
+}
+
+// ─── cf kv ──────────────────────────────────────────────────
+
+async fn cmd_cf_kv(name: &str, namespace: Option<&str>) {
+    let vault_name = cf_vault(name);
+    let mut engine = require_unlock();
+    match namespace {
+        Some(ns) => {
+            let path = format!("/storage/kv/namespaces/{}/keys", ns);
+            match engine.cloudflare_account_api(&vault_name, "GET", &path, None, None).await {
+                Ok(r) => print_cf_json(&r),
+                Err(e) => {
+                    eprintln!("{} Failed: {}", "✗".red(), e);
+                    exit(1);
+                }
+            }
+        }
+        None => match engine
+            .cloudflare_account_api(&vault_name, "GET", "/storage/kv/namespaces", None, None)
+            .await
+        {
+            Ok(r) => {
+                let names = cf_list_names(&r, "title");
+                println!("☁️  KV namespaces for '{}' ({}):", name, names.len());
+                for n in &names {
+                    println!("  - {}", n.green());
+                }
+            }
+            Err(e) => {
+                eprintln!("{} Failed: {}", "✗".red(), e);
+                exit(1);
+            }
+        },
+    }
+}
+
+// ─── cf d1 ──────────────────────────────────────────────────
+
+async fn cmd_cf_d1(name: &str, database: Option<&str>) {
+    let vault_name = cf_vault(name);
+    let mut engine = require_unlock();
+    match database {
+        Some(id) => {
+            let path = format!("/d1/database/{}", id);
+            match engine.cloudflare_account_api(&vault_name, "GET", &path, None, None).await {
+                Ok(r) => print_cf_json(&r),
+                Err(e) => {
+                    eprintln!("{} Failed: {}", "✗".red(), e);
+                    exit(1);
+                }
+            }
+        }
+        None => match engine
+            .cloudflare_account_api(&vault_name, "GET", "/d1/database", None, None)
+            .await
+        {
+            Ok(r) => {
+                let names = cf_list_names(&r, "name");
+                println!("☁️  D1 databases for '{}' ({}):", name, names.len());
+                for n in &names {
+                    println!("  - {}", n.green());
+                }
+            }
+            Err(e) => {
+                eprintln!("{} Failed: {}", "✗".red(), e);
+                exit(1);
+            }
+        },
+    }
+}
+
+// ─── cf pages ───────────────────────────────────────────────
+
+async fn cmd_cf_pages(name: &str) {
+    let vault_name = cf_vault(name);
+    let mut engine = require_unlock();
+    match engine
+        .cloudflare_account_api(&vault_name, "GET", "/pages/projects", None, None)
+        .await
+    {
+        Ok(r) => {
+            let names = cf_list_names(&r, "name");
+            println!("☁️  Pages projects for '{}' ({}):", name, names.len());
+            for n in &names {
+                println!("  - {}", n.green());
+            }
+        }
+        Err(e) => {
+            eprintln!("{} Failed: {}", "✗".red(), e);
+            exit(1);
+        }
+    }
+}
+
+// ─── cf bindings / triggers ─────────────────────────────────
+
+async fn cmd_cf_bindings(name: &str, script_name: &str) {
+    let vault_name = cf_vault(name);
+    let mut engine = require_unlock();
+    let path = format!(
+        "/workers/scripts/{}/bindings",
+        vaultly_core::urlencode(script_name)
+    );
+    match engine.cloudflare_account_api(&vault_name, "GET", &path, None, None).await {
+        Ok(r) => print_cf_json(&r),
+        Err(e) => {
+            eprintln!("{} Failed: {}", "✗".red(), e);
+            exit(1);
+        }
+    }
+}
+
+async fn cmd_cf_triggers(name: &str, script_name: &str) {
+    let vault_name = cf_vault(name);
+    let mut engine = require_unlock();
+    let path = format!(
+        "/workers/scripts/{}/triggers",
+        vaultly_core::urlencode(script_name)
+    );
+    match engine.cloudflare_account_api(&vault_name, "GET", &path, None, None).await {
+        Ok(r) => print_cf_json(&r),
+        Err(e) => {
+            eprintln!("{} Failed: {}", "✗".red(), e);
+            exit(1);
+        }
+    }
+}
+
+// ─── cf ssl / certificates ──────────────────────────────────
+
+async fn cmd_cf_ssl(name: &str, zone_id: &str) {
+    let vault_name = cf_vault(name);
+    let mut engine = require_unlock();
+    match engine
+        .cloudflare_api(
+            &vault_name,
+            "GET",
+            &format!("/zones/{}/settings/ssl", zone_id),
+            None,
+            None,
+        )
+        .await
+    {
+        Ok(r) => print_cf_json(&r),
+        Err(e) => {
+            eprintln!("{} Failed: {}", "✗".red(), e);
+            exit(1);
+        }
+    }
+}
+
+async fn cmd_cf_certificates(name: &str, zone_id: &str) {
+    let vault_name = cf_vault(name);
+    let mut engine = require_unlock();
+    match engine
+        .cloudflare_api(
+            &vault_name,
+            "GET",
+            &format!("/zones/{}/custom_certificates", zone_id),
+            None,
+            None,
+        )
+        .await
+    {
+        Ok(r) => print_cf_json(&r),
+        Err(e) => {
+            eprintln!("{} Failed: {}", "✗".red(), e);
+            exit(1);
+        }
+    }
+}
+
+// ─── cf firewall ────────────────────────────────────────────
+
+async fn cmd_cf_firewall(name: &str, zone_id: &str) {
+    let vault_name = cf_vault(name);
+    let mut engine = require_unlock();
+    match engine
+        .cloudflare_api(
+            &vault_name,
+            "GET",
+            &format!("/zones/{}/firewall/rules", zone_id),
+            None,
+            None,
+        )
+        .await
+    {
+        Ok(r) => print_cf_json(&r),
+        Err(e) => {
+            eprintln!("{} Failed: {}", "✗".red(), e);
+            exit(1);
+        }
+    }
+}
+
+// ─── cf lb ──────────────────────────────────────────────────
+
+async fn cmd_cf_lb(name: &str) {
+    let vault_name = cf_vault(name);
+    let mut engine = require_unlock();
+    println!("{}", "☁️  Load balancer pools:".bold());
+    match engine
+        .cloudflare_account_api(&vault_name, "GET", "/load_balancers/pools", None, None)
+        .await
+    {
+        Ok(r) => print_cf_json(&r),
+        Err(e) => {
+            eprintln!("{} Failed: {}", "✗".red(), e);
+            exit(1);
+        }
+    }
+    println!("{}", "☁️  Load balancers:".bold());
+    match engine
+        .cloudflare_account_api(&vault_name, "GET", "/load_balancers/load_balancers", None, None)
+        .await
+    {
+        Ok(r) => print_cf_json(&r),
+        Err(e) => {
+            eprintln!("{} Failed: {}", "✗".red(), e);
+            exit(1);
+        }
+    }
+}
+
+// ─── cf email ───────────────────────────────────────────────
+
+async fn cmd_cf_email(name: &str, zone_id: &str) {
+    let vault_name = cf_vault(name);
+    let mut engine = require_unlock();
+    match engine
+        .cloudflare_api(
+            &vault_name,
+            "GET",
+            &format!("/zones/{}/email/routing/rules", zone_id),
+            None,
+            None,
+        )
+        .await
+    {
+        Ok(r) => print_cf_json(&r),
+        Err(e) => {
+            eprintln!("{} Failed: {}", "✗".red(), e);
             exit(1);
         }
     }

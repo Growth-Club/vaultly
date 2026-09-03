@@ -16,8 +16,10 @@ removed). Highlights of the current unreleased feature set:
 - **CLI exports** — `vaultly env <vault>` emits shell export statements and
   `vaultly run <vault> -- <cmd>` runs a command with injected (then cleared)
   environment, with output scrubbed of any secret values.
-- **MCP server** (`vaultly mcp`) — 32 agent-safe tools covering vault
-  operations and Cloudflare management. No tool returns a raw secret value.
+- **MCP server** (`vaultly mcp`) — 61 agent-safe tools covering vault
+  operations and Cloudflare management (cache purge, R2, KV, D1, Pages,
+  Workers bindings/triggers, SSL/certs, WAF, load balancers, email routing).
+  No tool returns a raw secret value.
 - **`cf_accounts` MCP tool** — discover which vaults hold Cloudflare
   credentials (account name + auth method + per-account scope), so agents can
   pick an account without guessing vault names. Inspects key names only —
@@ -62,7 +64,7 @@ removed). Highlights of the current unreleased feature set:
   self-contained AES-256-GCM blob that carries its own salt, making it portable
   across any vaultly instance that knows the master password.
 - **MCP encrypted tools** — `vault_export_encrypted` and `vault_import_encrypted`
-  (2 new MCP tools, 30 total) let agents safely transfer vaults between instances
+  (2 new MCP tools, 32 total) let agents safely transfer vaults between instances
   without ever exposing plaintext values.
 
 ### Security & reliability

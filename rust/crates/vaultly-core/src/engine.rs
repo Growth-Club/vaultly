@@ -919,6 +919,76 @@ impl VaultEngine {
         Ok(ApiResult { status, data })
     }
 
+    /// Resolve the Cloudflare account ID for a vault (account-level endpoints).
+    pub fn cf_account_id(&mut self, vault_name: &str) -> Result<String> {
+        let secrets = self.read_secrets(vault_name)?;
+        secrets
+            .get("CLOUDFLARE_ACCOUNT_ID")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| {
+                VaultError::MissingAccountId(
+                    vault_name.to_string(),
+                    secrets.keys().cloned().collect::<Vec<_>>().join(", "),
+                )
+            })
+    }
+
+    /// Perform a Cloudflare API call scoped to the vault's account ID.
+    /// Resolves CLOUDFLARE_ACCOUNT_ID and prefixes the path with /accounts/{id}.
+    pub async fn cloudflare_account_api(
+        &mut self,
+        vault_name: &str,
+        method: &str,
+        api_path: &str,
+        body: Option<Value>,
+        ctx: Option<&CallerContext>,
+    ) -> Result<ApiResult> {
+        let account_id = self.cf_account_id(vault_name)?;
+        let full = format!("/accounts/{}{}", urlencode(&account_id), api_path);
+        self.cloudflare_api(vault_name, method, &full, body, ctx).await
+    }
+
+    /// Cloudflare API call with a raw text body and raw text response
+    /// (used by R2 object and KV key writes/reads where the payload is not JSON).
+    pub async fn cloudflare_raw(
+        &mut self,
+        vault_name: &str,
+        method: &str,
+        api_path: &str,
+        body: Option<&str>,
+        ctx: Option<&CallerContext>,
+    ) -> Result<ApiResult> {
+        self.op(ctx, Operation::CfApi, vault_name)?;
+        let secrets = self.read_secrets(vault_name)?;
+        let headers = Self::build_cf_headers(vault_name, &secrets)?;
+        self.audit(
+            "CF_API",
+            &format!("{} {} (vault={})", method, api_path, vault_name),
+            ctx,
+        );
+        let url = format!("{}{}", self.cf_base, api_path);
+        let client = reqwest::Client::new();
+        let method = reqwest::Method::from_bytes(method.as_bytes())
+            .map_err(|e| VaultError::Policy(e.to_string()))?;
+        let mut req = client.request(method, &url).headers(headers);
+        if let Some(b) = body {
+            req = req.body(b.to_string());
+        }
+        let res = send_with_retry(req)
+            .await
+            .map_err(|e| VaultError::Policy(format!("Cloudflare request failed: {}", e)))?;
+        let status = res.status().as_u16();
+        let text = res
+            .text()
+            .await
+            .map_err(|e| VaultError::Policy(format!("Invalid response: {}", e)))?;
+        let scrubbed = scrub_output(&text, &Self::cf_secret_values(&secrets));
+        let data: Value =
+            serde_json::from_str(&scrubbed).unwrap_or_else(|_| serde_json::json!({ "raw": scrubbed }));
+        Ok(ApiResult { status, data })
+    }
+
     /// Delete a DNS record from a zone (agent-safe — never returns values).
     pub async fn dns_delete(
         &mut self,
@@ -1396,7 +1466,7 @@ async fn send_with_retry(request: reqwest::RequestBuilder) -> Result<reqwest::Re
     }
 }
 
-fn urlencode(s: &str) -> String {
+pub fn urlencode(s: &str) -> String {
     s.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || "-_.~".contains(c) {

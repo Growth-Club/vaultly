@@ -31,8 +31,8 @@
 │  │  MCP SERVER       │  │  CLI + TUI        │  │  HTTP SERVER            │  │
 │  │  (vaultly-mcp)    │  │  (vaultly)        │  │  (vaultly serve)        │  │
 │  │                   │  │                   │  │                         │  │
-│  │  28 tools:        │  │  30 commands      │  │  REST edge for CI       │  │
-│  │                   │  │  + 9 cf subcmds   │  │                         │  │
+│  │  61 tools:        │  │  31 commands      │  │  REST edge for CI       │  │
+│  │                   │  │  + 20 cf subcmds  │  │                         │  │
 │  │  ┌─────────────┐  │  │  + 14 templates   │  │  AGENT-FIRST: no        │  │
 │  │  │VAULT TOOLS  │  │  │                   │  │  endpoint returns       │  │
 │  │  │ vault_list  │  │  │  ┌─────────────┐  │  │  raw secret values      │  │
@@ -392,7 +392,7 @@
   │   │   │   └── prompt.rs      24 LOC  Secure password input
   │   │   │                              ─────────
   │   │   │                      6,162 LOC total (cli)
-  │   │   └── vaultly-mcp/      MCP server: 28 agent tools (JSON-RPC stdio)
+  │  │   │   └── vaultly-mcp/      MCP server: 61 agent tools (JSON-RPC stdio)
   │   │       ├── lib.rs      1,566 LOC  Tool dispatch + schema + e2e tests
   │   │       └── main.rs         6 LOC  Binary entrypoint
   │   │                                  ─────────
