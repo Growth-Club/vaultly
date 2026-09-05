@@ -4,8 +4,8 @@ Vaultly's `backup` and `restore` commands push/pull the **encrypted vault set**
 to/from a Cloudflare Worker you run. They never transmit plaintext — only
 ciphertext leaves your machine.
 
-Both commands are interactive and are **blocked in agent mode**
-(`VAULTLY_AGENT_MODE=1`); run them as a human.
+Both commands are interactive and are **blocked in the default agent mode**;
+run them as a human with `VAULTLY_HUMAN_MODE=1`.
 
 ## Remote backup endpoint
 

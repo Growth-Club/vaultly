@@ -18,7 +18,17 @@ mod server;
 mod tui;
 
 fn agent_mode() -> bool {
-    std::env::var("VAULTLY_AGENT_MODE").as_deref() == Ok("1")
+    if std::env::var("VAULTLY_HUMAN_MODE").as_deref() == Ok("1") {
+        return false;
+    }
+    // Vaultly is agent-first: agent policy is the safe default. Keep the
+    // legacy VAULTLY_AGENT_MODE=0 opt-out, while human users get the clearer
+    // VAULTLY_HUMAN_MODE=1 escape hatch.
+    std::env::var("VAULTLY_AGENT_MODE").as_deref() != Ok("0")
+}
+
+fn non_interactive() -> bool {
+    agent_mode() || !std::io::stdin().is_terminal()
 }
 
 fn block_in_agent_mode(command_name: &str) {
@@ -56,8 +66,44 @@ fn require_unlock() -> VaultEngine {
         eprintln!("{} Vaultly not initialized. Run: vaultly init", "✗".red());
         exit(1);
     }
-    let password = std::env::var("VAULTLY_MASTER_PASSWORD")
-        .unwrap_or_else(|_| prompt::prompt_password("🔑 Master password: "));
+
+    // Non-interactive credentials are tried before prompting. This makes the
+    // CLI behave like MCP/server while preserving the human fallback prompt.
+    // Try both sources so a stale env var does not prevent a valid Keychain
+    // unlock, and never pass either value to a child process.
+    let mut candidates = Vec::new();
+    if let Ok(password) = std::env::var("VAULTLY_MASTER_PASSWORD") {
+        candidates.push(password);
+    }
+    if let Some(password) = keychain::get_from_keychain() {
+        candidates.push(password);
+    }
+
+    for password in candidates {
+        if engine.unlock(&password).is_ok() {
+            return engine;
+        }
+    }
+
+    if non_interactive() {
+        let detail = if std::env::var("VAULTLY_DIR").is_ok()
+            && std::env::var("VAULTLY_ALLOW_KEYCHAIN").as_deref() != Ok("1")
+        {
+            "VAULTLY_DIR is set; use the default store or set VAULTLY_ALLOW_KEYCHAIN=1 for an intentional custom-store Keychain setup."
+        } else if keychain::is_keychain_available() && !keychain::keychain_entry_exists() {
+            "No macOS Keychain entry exists yet; run `VAULTLY_HUMAN_MODE=1 vaultly keychain store` once as a human."
+        } else {
+            "Set VAULTLY_MASTER_PASSWORD or configure macOS Keychain with `VAULTLY_HUMAN_MODE=1 vaultly keychain store`."
+        };
+        eprintln!(
+            "{} Non-interactive unlock unavailable. {}",
+            "✗".red(),
+            detail
+        );
+        exit(1);
+    }
+
+    let password = prompt::prompt_password("🔑 Master password: ");
     if engine.unlock(&password).is_err() {
         eprintln!("{} Wrong master password.", "✗".red());
         exit(1);
@@ -2826,11 +2872,23 @@ fn cmd_export(vault_name: &str, file: &str) {
 
 // ─── encrypted export ─────────────────────────────────────
 
-/// Read the master password from env or interactive prompt (same source as
-/// `require_unlock`), without consuming the engine.
+/// Read the master password from env, Keychain, or an interactive prompt
+/// (same sources as `require_unlock`), without consuming the engine.
 fn master_password() -> String {
-    std::env::var("VAULTLY_MASTER_PASSWORD")
-        .unwrap_or_else(|_| prompt::prompt_password("🔑 Master password: "))
+    if let Ok(password) = std::env::var("VAULTLY_MASTER_PASSWORD") {
+        return password;
+    }
+    if let Some(password) = keychain::get_from_keychain() {
+        return password;
+    }
+    if non_interactive() {
+        eprintln!(
+            "{} Non-interactive encrypted export needs VAULTLY_MASTER_PASSWORD or a configured macOS Keychain.",
+            "✗".red()
+        );
+        exit(1);
+    }
+    prompt::prompt_password("🔑 Master password: ")
 }
 
 fn cmd_export_encrypted(vault_name: &str, file: &str) {

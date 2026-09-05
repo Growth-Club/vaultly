@@ -45,7 +45,8 @@ concrete mitigations implemented in the Rust codebase (`rust/crates/`).
 - **No value-returning tool.** `vault_list`, `vault_keys`, `vault_meta`,
   `vault_status`, `list`, `inspect`, and `stats` return names/metadata only
   (`engine.rs`, `vault.rs list_keys`).
-- **Agent mode** (`VAULTLY_AGENT_MODE=1`) hard-blocks every command that reads
+- **Agent mode** (the default; `VAULTLY_AGENT_MODE=1` is retained for
+  compatibility) hard-blocks every command that reads
   or writes raw values: `get`, `get --export`, `env`, `export`, `add`, `delete`,
   `import`, `copy`, `rename`, `mv`, `cp`, `backup`, `restore`, `template`,
   `keychain`, `init`, `tui`, `kill`, `status`, and `cf add/use/remove`

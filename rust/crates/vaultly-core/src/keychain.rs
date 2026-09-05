@@ -2,17 +2,21 @@
 //!
 //! Stores the master password in the macOS Keychain so agents/MCP can
 //! auto-unlock without a password prompt. Falls back gracefully on
-//! non-macOS platforms and whenever VAULTLY_DIR is set (test isolation —
-//! NEVER touch the real user keychain from tests).
+//! non-macOS platforms and, by default, whenever VAULTLY_DIR is set (test
+//! isolation — NEVER touch the real user keychain from tests). Custom stores
+//! can explicitly opt in with VAULTLY_ALLOW_KEYCHAIN=1.
 
 use std::process::Command;
 
 const SERVICE_NAME: &str = "vaultly-master-key";
 const ACCOUNT_NAME: &str = "vaultly";
 
-/// Test/CI isolation: when VAULTLY_DIR is set, never touch the real keychain.
+/// Keep isolated test stores away from the real Keychain unless a custom-store
+/// user explicitly opts in. This preserves test isolation while allowing
+/// agent deployments to use a non-default VAULTLY_DIR.
 pub fn keychain_inert() -> bool {
     std::env::var("VAULTLY_DIR").is_ok()
+        && std::env::var("VAULTLY_ALLOW_KEYCHAIN").as_deref() != Ok("1")
 }
 
 pub fn is_keychain_available() -> bool {

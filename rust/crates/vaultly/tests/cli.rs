@@ -43,6 +43,7 @@ impl VaultlyEnv {
         // Force deterministic plain-text output: no ANSI, no TUI, no agent mode.
         std::env::set_var("NO_COLOR", "1");
         std::env::remove_var("VAULTLY_AGENT_MODE");
+        std::env::set_var("VAULTLY_HUMAN_MODE", "1");
         VaultlyEnv { _guard, dir }
     }
 
@@ -59,6 +60,7 @@ impl Drop for VaultlyEnv {
     fn drop(&mut self) {
         std::env::remove_var("VAULTLY_DIR");
         std::env::remove_var("VAULTLY_MASTER_PASSWORD");
+        std::env::remove_var("VAULTLY_HUMAN_MODE");
     }
 }
 

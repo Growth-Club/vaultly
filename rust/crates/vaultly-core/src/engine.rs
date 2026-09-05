@@ -751,6 +751,12 @@ impl VaultEngine {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // Keep command discovery working after env_clear(). Secrets remain
+        // isolated because only PATH is restored from the parent process;
+        // all other inherited environment variables stay excluded.
+        if let Some(path) = std::env::var_os("PATH") {
+            child.env("PATH", path);
+        }
         if let Some(dir) = cwd {
             child.current_dir(dir);
         }
@@ -2743,5 +2749,22 @@ mod tests {
             .unwrap();
         assert!(res.secrets_injected.contains(&"A".to_string()));
         assert!(!res.secrets_injected.contains(&"B".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_preserves_path_for_child_commands() {
+        let (mut engine, _dir) = setup();
+        engine
+            .add_secret("path", "K", "v", Some(&agent_ctx()))
+            .unwrap();
+        let opts = RunOptions::default();
+        let expected_path = std::env::var("PATH").unwrap();
+        let res = engine
+            .run_command("path", "sh -c 'printf %s \"$PATH\"'", &opts, Some(&agent_ctx()))
+            .await
+            .unwrap();
+        assert_eq!(res.code, 0);
+        assert_eq!(res.stdout, expected_path);
     }
 }

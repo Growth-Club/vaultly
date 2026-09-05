@@ -72,9 +72,11 @@ the inner plaintext is JSON of secret key/value pairs.
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `VAULTLY_DIR` | `~/.vaultly` | Overrides the vault data directory (`VaultStore::default_dir`). Also used by the TUI to locate `theme.toml`. |
+| `VAULTLY_ALLOW_KEYCHAIN` | unset | Set to `1` when intentionally using macOS Keychain with a custom `VAULTLY_DIR`; otherwise custom stores remain isolated from the real Keychain. |
 | `VAULTLY_MAX_OPS_PER_MINUTE` | `60` | Positive integer overriding the agent rate limit (`PolicyEngine::default_max_ops`). Values ≤ 0 fall back to the default. Constant: `DEFAULT_MAX_OPS_PER_MINUTE = 60`. |
-| `VAULTLY_AGENT_MODE` | unset | `=1` enables agent mode: read/raw-secret commands (`get`, `env`) are blocked; see [`README.md`](../README.md). |
-| `VAULTLY_MASTER_PASSWORD` | unset | Supplies the master password where a terminal prompt would otherwise appear (e.g. headless/unattended use; used by the keychain flow). |
+| `VAULTLY_AGENT_MODE` | `1` | Compatibility switch: `=0` disables default agent mode; `=1` explicitly enables it. |
+| `VAULTLY_HUMAN_MODE` | unset | `=1` enables human-only commands for one invocation, overriding agent mode. |
+| `VAULTLY_MASTER_PASSWORD` | unset | Supplies the master password for non-interactive unlock. CLI/MCP/server flows also support the macOS Keychain; agent mode never falls back to a prompt. |
 | `VAULTLY_THEME` | unset | Path to a custom TUI theme file; overrides the default `<dir>/theme.toml`. |
 | `VAULTLY_QUIET` | unset | `=1` suppresses non-essential output (also honors `NO_COLOR`). |
 | `VAULTLY_AUTO_LOCK_MINUTES` | unset | Positive integer (minutes) idle auto-lock timeout. Read at `init` and persisted to `config.json` `autoLockMinutes`; the engine auto-locks after that much idle time since the last operation. |

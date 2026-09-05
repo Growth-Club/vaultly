@@ -26,7 +26,7 @@ Run `vaultly` with no arguments:
 
 ## Agent mode
 
-`VAULTLY_AGENT_MODE=1` puts the CLI in **agent mode**. Every command that reads
+Vaultly runs in **agent mode by default**. Every command that reads
 or writes raw secret values is blocked with a clear message and exit code 1:
 
 **Blocked:** `init`, `add`, `get`, `get --export`, `env`, `import`, `backup`,
@@ -39,6 +39,19 @@ or writes raw secret values is blocked with a clear message and exit code 1:
 
 The guiding rule: *agents can never read or write a raw secret value;* use
 `vaultly run <vault> -- <command>` for execution.
+
+Set `VAULTLY_HUMAN_MODE=1` for a human-only command such as initialization,
+adding a secret, or Keychain bootstrap. `VAULTLY_AGENT_MODE=1` remains
+supported for compatibility; `VAULTLY_AGENT_MODE=0` disables the default.
+
+### Unlock behavior
+
+Commands that need the vault try `VAULTLY_MASTER_PASSWORD`, then the macOS
+Keychain entry created by `vaultly keychain store`. Human mode falls back to a
+secure terminal prompt. Agent and non-TTY mode are strictly non-interactive
+and exit with setup guidance if neither source is available. If `VAULTLY_DIR`
+is customized, set `VAULTLY_ALLOW_KEYCHAIN=1` to opt that store into Keychain
+auto-unlock.
 
 ## Commands
 
@@ -201,7 +214,8 @@ cf subcommands:
 |---|---|
 | `VAULTLY_DIR` | Store directory (default `~/.vaultly`); also isolates the test keychain |
 | `VAULTLY_MASTER_PASSWORD` | Master password for non-interactive CLI and MCP unlock |
-| `VAULTLY_AGENT_MODE=1` | Agent mode: block value-reading/writing commands, `tui` |
+| `VAULTLY_AGENT_MODE=0` | Compatibility opt-out from the default agent mode |
+| `VAULTLY_HUMAN_MODE=1` | One-command human-mode override for value/keychain operations |
 | `VAULTLY_MAX_OPS_PER_MINUTE` | Per-agent rate-limit override (default `60`) |
 | `VAULTLY_AUTO_LOCK_MINUTES` | Idle auto-lock timeout (minutes): locks the session after inactivity since the last operation; recorded on `config.json` at `init` |
 | `VAULTLY_SERVER_TOKEN` | Bearer token for `vaultly serve` REST server (alternative to `--token`; preferred so it never shows in `ps`) |

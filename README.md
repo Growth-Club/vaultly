@@ -47,23 +47,49 @@ git clone https://github.com/Growth-Club/vaultly.git
 cd vaultly/rust && cargo build --release
 cp target/release/vaultly target/release/vaultly-mcp ~/.local/bin/   # or anywhere on PATH
 
-# 2. Initialize your master password
-vaultly init
+# 2. Initialize your master password (the rare human-only operation)
+VAULTLY_HUMAN_MODE=1 vaultly init
 
 # 3. Add a credential
-vaultly add github -k GITHUB_TOKEN -v "ghp_xxx"
+VAULTLY_HUMAN_MODE=1 vaultly add github -k GITHUB_TOKEN -v "ghp_xxx"
 
 # 4. Read it back (humans only — blocked in agent mode)
-vaultly get github GITHUB_TOKEN
+VAULTLY_HUMAN_MODE=1 vaultly get github GITHUB_TOKEN
 
 # 5. Let an agent use it
-vaultly run github -- git push       # injects env, scrubs output
+vaultly run github -- git push       # agent mode is automatic
 
 # 6. Set up the MCP server for your AI tool
 vaultly mcp                          # add to your tool's MCP config (see below)
 ```
 
 For a guided setup — Cloudflare accounts, templates, macOS Keychain — run `bash setup.sh`.
+
+### Human and agent unlock modes
+
+Vaultly runs in agent mode by default. Human-only commands can be enabled for
+one command with `VAULTLY_HUMAN_MODE=1`. Human commands use the stored macOS
+Keychain credential when available and otherwise prompt securely. For
+unattended agents or CI, provide the master password through
+`VAULTLY_MASTER_PASSWORD`:
+
+```bash
+VAULTLY_MASTER_PASSWORD="$VAULTLY_MASTER_PASSWORD" \
+  vaultly run cf-gateandtech -- npm run deploy
+```
+
+Agent mode never prints raw secret values, never forwards the master password
+to the child command, and never waits for an interactive password prompt.
+
+One-time human bootstrap for local agents:
+
+```bash
+VAULTLY_HUMAN_MODE=1 vaultly keychain store
+```
+
+After this, `vaultly mcp` and `vaultly run` can unlock through the
+Keychain without putting the master password in an agent configuration. If a
+custom `VAULTLY_DIR` is required, also set `VAULTLY_ALLOW_KEYCHAIN=1`.
 
 ## 📖 Command Cheat-Sheet
 
@@ -142,15 +168,15 @@ The 61 MCP tools cover vault operations (`vault_list`, `vault_keys`,
 | Zero-knowledge backup | Cloudflare stores ciphertext only |
 
 **The core invariant:** agents get *use*, never *read*. `get`, `env`, and raw
-value access are excluded from default agent policies and blocked in agent
-mode (`VAULTLY_AGENT_MODE=1`).
+value access are excluded from default agent policies and blocked in the
+default agent mode.
 
 Useful commands:
 
 ```bash
-vaultly keychain store     # auto-unlock via macOS Keychain
-vaultly kill               # 🚨 emergency lock
-vaultly status             # session info
+VAULTLY_HUMAN_MODE=1 vaultly keychain store  # auto-unlock via macOS Keychain
+VAULTLY_HUMAN_MODE=1 vaultly kill            # 🚨 emergency lock
+VAULTLY_HUMAN_MODE=1 vaultly status          # session info
 vaultly tui                # interactive menu (human only)
 ```
 
