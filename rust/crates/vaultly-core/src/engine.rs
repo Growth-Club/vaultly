@@ -912,7 +912,12 @@ impl VaultEngine {
 
         let manifest: Map<String, Value> = files
             .iter()
-            .map(|file| (file.relative.clone(), Value::String(file.hash.clone())))
+            .map(|file| {
+                (
+                    format!("/{}", file.relative),
+                    Value::String(file.hash.clone()),
+                )
+            })
             .collect();
         let hashes: Vec<&str> = files.iter().map(|f| f.hash.as_str()).collect();
         let missing_response = send_with_retry(
@@ -968,6 +973,23 @@ impl VaultEngine {
                     response.status().as_u16()
                 )));
             }
+        }
+
+        // Wrangler registers the uploaded hashes before creating the
+        // deployment. Without this step, the deployment record can be
+        // accepted while its assets remain unavailable at the Pages URL.
+        let upsert_response = send_with_retry(
+            client
+                .post(format!("{}/pages/assets/upsert-hashes", self.cf_base))
+                .bearer_auth(jwt)
+                .json(&serde_json::json!({"hashes": hashes})),
+        )
+        .await?;
+        if !upsert_response.status().is_success() {
+            return Err(VaultError::CloudflareResponse(format!(
+                "asset hash registration failed with HTTP {}",
+                upsert_response.status().as_u16()
+            )));
         }
 
         let mut form =
