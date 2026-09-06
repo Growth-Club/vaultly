@@ -87,6 +87,9 @@ pub struct AuditEntry {
 pub struct VaultEngine {
     key: Option<Zeroizing<Vec<u8>>>,
     store: VaultStore,
+    /// Only the default user vault may control the user's Keychain entry.
+    /// Explicit test/custom stores must never clear the real Keychain.
+    manages_keychain: bool,
     policy: PolicyEngine,
     unlocked_at: Option<Instant>,
     session_ttl: Duration,
@@ -112,6 +115,7 @@ impl VaultEngine {
         Self {
             key: None,
             store: VaultStore::new(),
+            manages_keychain: true,
             policy: PolicyEngine::new(),
             unlocked_at: None,
             session_ttl: Duration::from_secs(
@@ -127,6 +131,7 @@ impl VaultEngine {
     pub fn with_dir(session_ttl_minutes: Option<u64>, dir: PathBuf) -> Self {
         let mut engine = Self::new(session_ttl_minutes);
         engine.store = VaultStore::with_dir(dir);
+        engine.manages_keychain = false;
         engine
     }
 
@@ -199,7 +204,9 @@ impl VaultEngine {
     pub fn kill(&mut self, ctx: Option<&CallerContext>) {
         self.lock(ctx);
         let _ = self.store.set_killed();
-        crate::keychain::delete_from_keychain();
+        if self.manages_keychain {
+            crate::keychain::delete_from_keychain();
+        }
         self.audit(
             "KILL",
             "🚨 Killswitch activated — vault locked, keychain cleared",
@@ -1101,11 +1108,10 @@ impl VaultEngine {
         vault_name: &str,
         secrets: &Map<String, Value>,
     ) -> Result<reqwest::header::HeaderMap> {
+        // Keep authentication separate from the request body type. JSON
+        // requests set their own content type through `.json(...)`, while
+        // Pages deployments require reqwest's multipart boundary.
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            reqwest::header::CONTENT_TYPE,
-            reqwest::header::HeaderValue::from_static("application/json"),
-        );
         let token = secrets.get("CLOUDFLARE_API_TOKEN").and_then(|v| v.as_str());
         let email = secrets.get("CLOUDFLARE_EMAIL").and_then(|v| v.as_str());
         let api_key = secrets.get("CLOUDFLARE_API_KEY").and_then(|v| v.as_str());
