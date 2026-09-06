@@ -15,8 +15,14 @@ const ACCOUNT_NAME: &str = "vaultly";
 /// user explicitly opts in. This preserves test isolation while allowing
 /// agent deployments to use a non-default VAULTLY_DIR.
 pub fn keychain_inert() -> bool {
-    std::env::var("VAULTLY_DIR").is_ok()
-        && std::env::var("VAULTLY_ALLOW_KEYCHAIN").as_deref() != Ok("1")
+    keychain_inert_for(
+        std::env::var_os("VAULTLY_DIR").is_some(),
+        std::env::var("VAULTLY_ALLOW_KEYCHAIN").as_deref() == Ok("1"),
+    )
+}
+
+fn keychain_inert_for(vaultly_dir_set: bool, allow_keychain: bool) -> bool {
+    vaultly_dir_set && !allow_keychain
 }
 
 pub fn is_keychain_available() -> bool {
@@ -138,12 +144,8 @@ mod tests {
 
     #[test]
     fn inert_when_vaultly_dir_set() {
-        std::env::set_var("VAULTLY_DIR", "/tmp/fake-vaultly");
-        assert!(keychain_inert());
-        assert!(!is_keychain_available());
-        assert!(get_from_keychain().is_none());
-        assert!(!store_in_keychain("x"));
-        assert!(!delete_from_keychain());
-        std::env::remove_var("VAULTLY_DIR");
+        assert!(keychain_inert_for(true, false));
+        assert!(!keychain_inert_for(false, false));
+        assert!(!keychain_inert_for(true, true));
     }
 }

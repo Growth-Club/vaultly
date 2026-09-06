@@ -984,8 +984,9 @@ impl VaultEngine {
         let data: Value = response.json().await?;
         if !status.is_success() {
             return Err(VaultError::CloudflareResponse(format!(
-                "Pages deployment failed with HTTP {}",
-                status.as_u16()
+                "Pages deployment failed with HTTP {}: {}",
+                status.as_u16(),
+                cloudflare_response_detail(&data)
             )));
         }
         let result = data.get("result").cloned().unwrap_or_default();
@@ -1847,6 +1848,37 @@ async fn send_with_retry(request: reqwest::RequestBuilder) -> Result<reqwest::Re
 /// could create a duplicate remote resource.
 async fn send_once(request: reqwest::RequestBuilder) -> Result<reqwest::Response> {
     request.send().await.map_err(VaultError::CloudflareRequest)
+}
+
+/// Return a small, secret-free summary of a Cloudflare API error response.
+/// Cloudflare's response envelope is safe to inspect, but the full body should
+/// never be forwarded to an agent because providers can add arbitrary fields.
+fn cloudflare_response_detail(data: &Value) -> String {
+    for key in ["errors", "messages"] {
+        let Some(entries) = data.get(key).and_then(Value::as_array) else {
+            continue;
+        };
+
+        let details: Vec<String> = entries
+            .iter()
+            .take(3)
+            .filter_map(|entry| {
+                let message = entry.get("message").and_then(Value::as_str)?;
+                let code = entry.get("code").and_then(Value::as_u64);
+                let message: String = message.chars().take(240).collect();
+                Some(match code {
+                    Some(code) => format!("{} ({})", message, code),
+                    None => message,
+                })
+            })
+            .collect();
+
+        if !details.is_empty() {
+            return details.join("; ");
+        }
+    }
+
+    "Cloudflare returned no error details".into()
 }
 
 pub fn urlencode(s: &str) -> String {
