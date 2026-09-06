@@ -3,19 +3,15 @@
 //! for identical audit + policy + encryption behavior.
 
 use std::io::IsTerminal;
-use std::path::PathBuf;
 use std::process::exit;
 
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use serde_json::{Map, Value};
 use vaultly_core::keychain;
-use vaultly_core::{RunOptions, VaultEngine};
+use vaultly_core::{Caller, CallerContext, DeploymentProvider, DeploymentTarget, VaultEngine};
 
 mod prompt;
-pub use vaultly_core::templates;
-mod server;
-mod tui;
 
 fn agent_mode() -> bool {
     if std::env::var("VAULTLY_HUMAN_MODE").as_deref() == Ok("1") {
@@ -34,7 +30,7 @@ fn non_interactive() -> bool {
 fn block_in_agent_mode(command_name: &str) {
     if agent_mode() {
         eprintln!(
-            "{} '{}' is blocked in agent mode.\n  Agents cannot read raw secrets. Use instead:\n    vaultly run <vault> -- <command>   (execute with injected env)\n    vaultly mcp                        (MCP server for AI agents)",
+            "{} '{}' is blocked in agent mode.\n  Agents cannot read raw secrets. Use instead:\n    vaultly deploy <target>            (brokered, target-bound deployment)\n    vaultly mcp                        (MCP server for AI agents)",
             "✗".red(),
             command_name
         );
@@ -186,63 +182,23 @@ enum Command {
         )]
         encrypted: bool,
     },
-    /// Push encrypted vaults to Cloudflare Worker (remote backup)
-    Backup {
-        #[arg(short, long, help = "Your Vaultly Worker URL")]
-        url: String,
-        #[arg(short, long, help = "Backup API token (set in Worker)")]
-        token: String,
+    /// Deploy a human-registered target (agent-safe; no arbitrary account/project args)
+    Deploy {
+        target: String,
+        #[arg(long, help = "Output one JSON object for automation")]
+        json: bool,
     },
-    /// Pull encrypted vaults from Cloudflare Worker
-    Restore {
-        #[arg(short, long, help = "Your Vaultly Worker URL")]
-        url: String,
-        #[arg(short, long, help = "Backup API token")]
-        token: String,
-    },
-    /// Add AI-tool ignore rules to protect secrets
-    Protect { project_dir: Option<String> },
-    /// Run a command with vault secrets injected (agent-safe, output scrubbed)
-    Run {
-        vault_name: String,
-        #[arg(
-            trailing_var_arg = true,
-            required = true,
-            allow_hyphen_values = true,
-            help = "Command and arguments to run, e.g. -- 'npx wrangler deploy'"
-        )]
-        command: Vec<String>,
-        #[arg(
-            long,
-            help = "Timeout in milliseconds (default: 86400000 for CLI, 300000 for MCP)"
-        )]
-        timeout: Option<u64>,
-        #[arg(
-            short,
-            long,
-            help = "Run even if the vault has expired secrets (proceeds knowingly)"
-        )]
-        force: bool,
+    /// Manage deployment targets (metadata only; add/remove are human-only)
+    Target {
+        #[command(subcommand)]
+        sub: TargetCommand,
     },
     /// Start MCP server for AI agents
     Mcp,
-    /// Start a local HTTP/REST server (bearer-token auth, agent-first)
-    Serve {
-        #[arg(long, default_value = "127.0.0.1:8799", help = "Bind address")]
-        bind: String,
-        #[arg(long, help = "Bearer token (default: VAULTLY_SERVER_TOKEN env var)")]
-        token: Option<String>,
-    },
     /// Manage Cloudflare accounts
     Cf {
         #[command(subcommand)]
         sub: CfCommand,
-    },
-    /// Create a vault from a pre-built template
-    Template {
-        name: Option<String>,
-        #[arg(long, help = "List available templates")]
-        list: bool,
     },
     /// Manage macOS Keychain integration
     Keychain {
@@ -253,8 +209,6 @@ enum Command {
     Kill,
     /// Show vault status: vaults, keychain, platform
     Status,
-    /// Interactive menu (human-only, blocked in agent mode)
-    Tui,
     /// Print version and exit
     Version,
     /// Generate a random secret
@@ -290,37 +244,6 @@ enum Command {
             help = "Explicit RFC 3339 expiry timestamp for the rotated secret"
         )]
         expires: Option<String>,
-    },
-    /// Copy a secret value to the clipboard (macOS pbcopy)
-    Copy {
-        vault_name: String,
-        secret_key: String,
-    },
-    /// Rename a vault (moves all secrets and deletes the old vault)
-    Rename { old_name: String, new_name: String },
-    /// Move a secret to another vault
-    Mv {
-        vault_name: String,
-        secret_key: String,
-        to_vault: String,
-    },
-    /// Copy a secret to another vault (keeps the original)
-    Cp {
-        vault_name: String,
-        secret_key: String,
-        to_vault: String,
-    },
-    /// Generate shell completion scripts (bash, zsh, fish, ...)
-    Completions {
-        #[arg(value_enum)]
-        shell: clap_complete::Shell,
-        #[arg(long, help = "Write completions to a specific file instead of stdout")]
-        output: Option<PathBuf>,
-        #[arg(
-            long,
-            help = "Install to the standard completion dir for the shell (bash/zsh/fish)"
-        )]
-        install: bool,
     },
     /// Show metadata about a vault (never secret values)
     Inspect { vault_name: String },
@@ -363,15 +286,6 @@ enum CfCommand {
     },
     /// List all Cloudflare accounts
     List,
-    /// Output shell eval to activate a CF account (use with eval)
-    Use { name: String },
-    /// Deploy a Worker project using a CF account (agent-safe, output scrubbed)
-    Deploy {
-        name: String,
-        project_dir: String,
-        #[arg(long, help = "Wrangler environment (e.g. staging)")]
-        env: Option<String>,
-    },
     /// Remove a Cloudflare account
     Remove { name: String },
     /// List zones (domains) for a CF account
@@ -393,53 +307,39 @@ enum CfCommand {
         #[arg(short, long, help = "Delete a secret")]
         delete: Option<String>,
     },
-    /// Delete a DNS record from a zone (agent-safe — never returns values)
-    DnsDelete {
-        name: String,
-        zone_id: String,
-        record_id: String,
-    },
-    /// Purge a zone's cache (agent-safe)
-    CachePurge {
-        name: String,
-        zone_id: String,
-        #[arg(long, help = "Purge the entire zone cache")]
-        purge_everything: bool,
-    },
-    /// List R2 buckets, or objects in a bucket with --bucket
-    R2 {
-        name: String,
-        #[arg(long, help = "List objects in this bucket")]
-        bucket: Option<String>,
-    },
-    /// List KV namespaces, or keys in a namespace with --namespace
-    Kv {
-        name: String,
-        #[arg(long, help = "List keys in this namespace ID")]
-        namespace: Option<String>,
-    },
-    /// List D1 databases, or info for one with --database
-    D1 {
-        name: String,
-        #[arg(long, help = "Show info for this database ID")]
-        database: Option<String>,
-    },
     /// List Cloudflare Pages projects
     Pages { name: String },
-    /// List a Worker's bindings
-    Bindings { name: String, script_name: String },
-    /// List a Worker's triggers
-    Triggers { name: String, script_name: String },
-    /// Show a zone's SSL settings
-    Ssl { name: String, zone_id: String },
-    /// List a zone's custom certificates
-    Certificates { name: String, zone_id: String },
-    /// List a zone's firewall rules
-    Firewall { name: String, zone_id: String },
-    /// List load balancers and pools
-    Lb { name: String },
-    /// List a zone's email routing rules
-    Email { name: String, zone_id: String },
+}
+
+#[derive(Subcommand)]
+enum TargetCommand {
+    /// Register or replace a deployment target
+    Add {
+        id: String,
+        #[arg(long, value_parser = ["pages", "worker"])]
+        provider: String,
+        #[arg(long, help = "Vault containing Cloudflare credentials")]
+        vault: String,
+        #[arg(long, help = "Cloudflare account ID")]
+        account_id: String,
+        #[arg(long, help = "Pages project or Worker script name")]
+        project: String,
+        #[arg(long, help = "Repository/workspace directory")]
+        project_dir: String,
+        #[arg(long, default_value = "npm run build")]
+        build_command: String,
+        #[arg(long, default_value = "dist")]
+        output_dir: String,
+        #[arg(long)]
+        branch: Option<String>,
+    },
+    /// List registered deployment targets (never includes secret values)
+    List {
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
+    /// Remove a deployment target
+    Remove { id: String },
 }
 
 #[derive(Subcommand)]
@@ -487,12 +387,6 @@ fn print_cf_result(result: &vaultly_core::ApiResult, label: &str) {
 
 #[tokio::main]
 async fn main() {
-    // `vaultly` with no args + a real terminal → interactive TUI
-    if std::env::args().count() <= 1 && std::io::stdin().is_terminal() {
-        tui::start_tui().await;
-        return;
-    }
-
     let cli = Cli::parse();
 
     if cli.quiet {
@@ -609,29 +503,40 @@ async fn main() {
                 cmd_import(&file, &vault, delete_after, dry_run)
             }
         }
-        Some(Command::Backup { url, token }) => {
-            block_in_agent_mode("backup");
-            cmd_backup(&url, &token).await
-        }
-        Some(Command::Restore { url, token }) => {
-            block_in_agent_mode("restore");
-            cmd_restore(&url, &token).await
-        }
-        Some(Command::Protect { project_dir }) => {
-            block_in_agent_mode("protect");
-            cmd_protect(project_dir.as_deref().unwrap_or("."))
-        }
-        Some(Command::Run {
-            vault_name,
-            command,
-            timeout,
-            force,
-        }) => cmd_run(&vault_name, &command, timeout, force).await,
+        Some(Command::Deploy { target, json }) => cmd_deploy_target(&target, json).await,
+        Some(Command::Target { sub }) => match sub {
+            TargetCommand::Add {
+                id,
+                provider,
+                vault,
+                account_id,
+                project,
+                project_dir,
+                build_command,
+                output_dir,
+                branch,
+            } => {
+                block_in_agent_mode("target add");
+                cmd_target_add(
+                    &id,
+                    &provider,
+                    &vault,
+                    &account_id,
+                    &project,
+                    &project_dir,
+                    &build_command,
+                    &output_dir,
+                    branch.as_deref(),
+                )
+            }
+            TargetCommand::List { json } => cmd_target_list(json),
+            TargetCommand::Remove { id } => {
+                block_in_agent_mode("target remove");
+                cmd_target_remove(&id)
+            }
+        },
         Some(Command::Mcp) => {
             vaultly_mcp::start_mcp_server().await;
-        }
-        Some(Command::Serve { bind, token }) => {
-            cmd_serve(&bind, token.as_deref()).await;
         }
         Some(Command::Cf { sub }) => match sub {
             CfCommand::Add {
@@ -651,33 +556,6 @@ async fn main() {
                 )
             }
             CfCommand::List => cmd_cf_list(),
-            CfCommand::Use { name } => {
-                block_in_agent_mode("cf use");
-                let mut engine = require_unlock();
-                let vault_name = cf_vault(&name);
-                match engine.get_secrets(&vault_name, None) {
-                    Ok(secrets) => {
-                        if secrets.is_empty() {
-                            eprintln!("{} Account '{}' not found.", "✗".red(), vault_name);
-                            exit(1);
-                        }
-                        for (k, v) in secrets {
-                            if let Some(v) = v.as_str() {
-                                println!("export {}='{}'", k, shell_escape(v));
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("{} {}", "✗".red(), e);
-                        exit(1);
-                    }
-                }
-            }
-            CfCommand::Deploy {
-                name,
-                project_dir,
-                env,
-            } => cmd_cf_deploy(&name, &project_dir, env.as_deref()).await,
             CfCommand::Remove { name } => {
                 block_in_agent_mode("cf remove");
                 let vault_name = cf_vault(&name);
@@ -707,38 +585,8 @@ async fn main() {
                 value,
                 delete,
             } => cmd_cf_secrets(&name, &script_name, list, set, value, delete).await,
-            CfCommand::DnsDelete {
-                name,
-                zone_id,
-                record_id,
-            } => cmd_cf_dns_delete(&name, &zone_id, &record_id).await,
-            CfCommand::CachePurge {
-                name,
-                zone_id,
-                purge_everything,
-            } => cmd_cf_cache_purge(&name, &zone_id, purge_everything).await,
-            CfCommand::R2 { name, bucket } => cmd_cf_r2(&name, bucket.as_deref()).await,
-            CfCommand::Kv { name, namespace } => cmd_cf_kv(&name, namespace.as_deref()).await,
-            CfCommand::D1 { name, database } => cmd_cf_d1(&name, database.as_deref()).await,
             CfCommand::Pages { name } => cmd_cf_pages(&name).await,
-            CfCommand::Bindings { name, script_name } => {
-                cmd_cf_bindings(&name, &script_name).await
-            }
-            CfCommand::Triggers { name, script_name } => {
-                cmd_cf_triggers(&name, &script_name).await
-            }
-            CfCommand::Ssl { name, zone_id } => cmd_cf_ssl(&name, &zone_id).await,
-            CfCommand::Certificates { name, zone_id } => {
-                cmd_cf_certificates(&name, &zone_id).await
-            }
-            CfCommand::Firewall { name, zone_id } => cmd_cf_firewall(&name, &zone_id).await,
-            CfCommand::Lb { name } => cmd_cf_lb(&name).await,
-            CfCommand::Email { name, zone_id } => cmd_cf_email(&name, &zone_id).await,
         },
-        Some(Command::Template { name, list }) => {
-            block_in_agent_mode("template");
-            cmd_template(name.as_deref(), list)
-        }
         Some(Command::Keychain { sub }) => match sub {
             KeychainCommand::Store => {
                 block_in_agent_mode("keychain store");
@@ -760,10 +608,6 @@ async fn main() {
         Some(Command::Status) => {
             block_in_agent_mode("status");
             cmd_status()
-        }
-        Some(Command::Tui) => {
-            block_in_agent_mode("tui");
-            tui::start_tui().await
         }
         Some(Command::Version) => {
             println!("{}", env!("CARGO_PKG_VERSION"));
@@ -791,64 +635,6 @@ async fn main() {
             ttl,
             expires,
         ),
-        Some(Command::Copy {
-            vault_name,
-            secret_key,
-        }) => {
-            block_in_agent_mode("copy");
-            cmd_copy(&vault_name, &secret_key)
-        }
-        Some(Command::Rename { old_name, new_name }) => {
-            block_in_agent_mode("rename");
-            cmd_rename(&old_name, &new_name)
-        }
-        Some(Command::Mv {
-            vault_name,
-            secret_key,
-            to_vault,
-        }) => {
-            block_in_agent_mode("mv");
-            cmd_mv(&vault_name, &secret_key, &to_vault)
-        }
-        Some(Command::Cp {
-            vault_name,
-            secret_key,
-            to_vault,
-        }) => {
-            block_in_agent_mode("cp");
-            cmd_cp(&vault_name, &secret_key, &to_vault)
-        }
-        Some(Command::Completions {
-            shell,
-            output,
-            install,
-        }) => {
-            use std::io::Write;
-            let script = completion_script(shell);
-            if let Some(path) = output {
-                if let Some(parent) = path.parent() {
-                    if !parent.as_os_str().is_empty() {
-                        if let Err(e) = std::fs::create_dir_all(parent) {
-                            eprintln!("{} Failed to create {}: {}", "✗".red(), parent.display(), e);
-                            exit(1);
-                        }
-                    }
-                }
-                if let Err(e) = std::fs::write(&path, &script) {
-                    eprintln!("{} Failed to write '{}': {}", "✗".red(), path.display(), e);
-                    exit(1);
-                }
-                println!("{} Wrote completions to '{}'", "✓".green(), path.display());
-            } else if install {
-                install_completions(shell, &script);
-            } else {
-                let mut out = std::io::stdout();
-                if let Err(e) = out.write_all(script.as_bytes()) {
-                    eprintln!("{} Failed to write stdout: {}", "✗".red(), e);
-                    exit(1);
-                }
-            }
-        }
         Some(Command::Inspect { vault_name }) => cmd_inspect(&vault_name),
         Some(Command::Export {
             vault_name,
@@ -876,60 +662,9 @@ async fn main() {
 
 // ─── completions ─────────────────────────────────────────────
 
-fn completion_script(shell: clap_complete::Shell) -> String {
-    use clap::CommandFactory;
-    let mut cmd = Cli::command();
-    let mut buf: Vec<u8> = Vec::new();
-    clap_complete::generate(shell, &mut cmd, "vaultly", &mut buf);
-    String::from_utf8_lossy(&buf).into_owned()
-}
-
 /// Install completions to the standard directory for the shell.
 /// Non-destructive: only ever creates directories and writes the
 /// completion file for vaultly; leaves other files untouched.
-fn install_completions(shell: clap_complete::Shell, script: &str) {
-    let Some(home) = dirs::home_dir() else {
-        eprintln!("{} Could not determine home directory.", "✗".red());
-        exit(1);
-    };
-    let (dir, file_name) = match shell {
-        clap_complete::Shell::Bash => (
-            home.join(".local/share/bash-completion/completions"),
-            "vaultly".to_string(),
-        ),
-        clap_complete::Shell::Zsh => (home.join(".zfunc"), "_vaultly".to_string()),
-        clap_complete::Shell::Fish => (
-            home.join(".config/fish/completions"),
-            "vaultly.fish".to_string(),
-        ),
-        other => (
-            home.join(".local/share/vaultly/completions"),
-            format!("{other}.vaultly"),
-        ),
-    };
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!("{} Failed to create {}: {}", "✗".red(), dir.display(), e);
-        exit(1);
-    }
-    let path = dir.join(file_name);
-    if let Err(e) = std::fs::write(&path, script) {
-        eprintln!("{} Failed to write '{}': {}", "✗".red(), path.display(), e);
-        exit(1);
-    }
-    println!(
-        "{} Installed {shell} completions to '{}'",
-        "✓".green(),
-        path.display()
-    );
-    match shell {
-        clap_complete::Shell::Zsh => println!("  Add to your ~/.zshrc: fpath+=({})", dir.display()),
-        clap_complete::Shell::Fish => {
-            println!("  Restart your shell or run: . ~/.config/fish/config.fish")
-        }
-        _ => println!("  Restart your shell to activate."),
-    }
-}
-
 // ─── init ───────────────────────────────────────────────────
 
 async fn cmd_init() {
@@ -1131,146 +866,6 @@ fn cmd_inspect(vault_name: &str) {
 }
 
 // ─── copy / rename / mv / cp ─────────────────────────────────
-
-fn cmd_copy(vault_name: &str, secret_key: &str) {
-    let mut engine = require_unlock();
-    let value = match engine.get_secret_value(vault_name, secret_key, None) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("{} {}", "✗".red(), e);
-            exit(1);
-        }
-    };
-    #[cfg(target_os = "macos")]
-    {
-        use std::io::Write;
-        use std::process::{Command, Stdio};
-        let mut child = match Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("{} Could not start clipboard: {}", "✗".red(), e);
-                eprintln!(
-                    "{} value available via: vaultly get {} {}",
-                    "→".dimmed(),
-                    vault_name,
-                    secret_key
-                );
-                exit(1);
-            }
-        };
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(value.as_bytes());
-        }
-        // stdout is captured here; wait for pbcopy to flush
-        match child.wait() {
-            Ok(_) => println!(
-                "{} {}/{} copied to clipboard",
-                "✓".green(),
-                vault_name,
-                secret_key
-            ),
-            Err(e) => {
-                eprintln!("{} Clipboard error: {}", "✗".red(), e);
-                exit(1);
-            }
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        eprintln!(
-            "{} Clipboard not supported on this platform; using: {}",
-            "✗".red(),
-            value
-        );
-    }
-}
-
-fn cmd_rename(old_name: &str, new_name: &str) {
-    let mut engine = require_unlock();
-    let secrets = match engine.get_secrets(old_name, None) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("{} {}", "✗".red(), e);
-            exit(1);
-        }
-    };
-    if secrets.is_empty() {
-        eprintln!("{} Vault '{}' not found or empty.", "✗".red(), old_name);
-        exit(1);
-    }
-    for (k, v) in &secrets {
-        if let Some(val) = v.as_str() {
-            if let Err(e) = engine.add_secret(new_name, k, val, None) {
-                eprintln!("{} Failed to copy key '{}': {}", "✗".red(), k, e);
-                exit(1);
-            }
-        }
-    }
-    match engine.delete_vault(old_name, None) {
-        Ok(true) => println!("{} Renamed '{}' → '{}'", "✓".green(), old_name, new_name),
-        Ok(false) => println!(
-            "{} Copied to '{}' but could not remove '{}'",
-            "⚠".yellow(),
-            new_name,
-            old_name
-        ),
-        Err(e) => eprintln!("{} Could not remove old vault: {}", "✗".red(), e),
-    }
-}
-
-fn cmd_mv(vault_name: &str, secret_key: &str, to_vault: &str) {
-    let mut engine = require_unlock();
-    let value = match engine.get_secret_value(vault_name, secret_key, None) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("{} {}", "✗".red(), e);
-            exit(1);
-        }
-    };
-    if let Err(e) = engine.add_secret(to_vault, secret_key, &value, None) {
-        eprintln!("{} {}", "✗".red(), e);
-        exit(1);
-    }
-    match engine.delete_secret(vault_name, secret_key, None) {
-        Ok(true) => println!(
-            "{} Moved {}/{} → {}",
-            "✓".green(),
-            vault_name,
-            secret_key,
-            to_vault
-        ),
-        _ => eprintln!(
-            "{} Copied to {} but could not delete from {}",
-            "⚠".yellow(),
-            to_vault,
-            vault_name
-        ),
-    }
-}
-
-fn cmd_cp(vault_name: &str, secret_key: &str, to_vault: &str) {
-    let mut engine = require_unlock();
-    let value = match engine.get_secret_value(vault_name, secret_key, None) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("{} {}", "✗".red(), e);
-            exit(1);
-        }
-    };
-    match engine.add_secret(to_vault, secret_key, &value, None) {
-        Ok(()) => println!(
-            "{} Copied {}/{} → {}",
-            "✓".green(),
-            vault_name,
-            secret_key,
-            to_vault
-        ),
-        Err(e) => {
-            eprintln!("{} {}", "✗".red(), e);
-            exit(1);
-        }
-    }
-}
 
 // ─── delete ─────────────────────────────────────────────────
 
@@ -1495,217 +1090,7 @@ fn cmd_import(file: &str, vault_name: &str, delete_after: bool, dry_run: bool) {
 
 // ─── backup / restore ───────────────────────────────────────
 
-async fn cmd_backup(url: &str, token: &str) {
-    let mut engine = engine();
-    if !engine.is_initialized() {
-        eprintln!("{} Not initialized. Run: vaultly init", "✗".red());
-        exit(1);
-    }
-    println!(
-        "{} Backing up encrypted vaults to Cloudflare...",
-        "📤".cyan()
-    );
-
-    let vaults = engine.get_encrypted_vaults();
-    if vaults.is_empty() {
-        println!("{} No vaults to backup.", "⚠".yellow());
-        return;
-    }
-    let names: Vec<String> = vaults.keys().cloned().collect();
-
-    let config = engine.store().get_config_for_backup().ok();
-    let checksum = match vaultly_core::vault::backup_checksum(&vaults) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("{} Failed to checksum backup: {}", "✗".red(), e);
-            exit(1);
-        }
-    };
-    let payload = serde_json::json!({
-        "version": 1,
-        "checksum": checksum,
-        "vaults": vaults,
-        "config": config
-    });
-
-    let client = reqwest::Client::new();
-    let res = client
-        .put(format!("{}/backup", url.trim_end_matches('/')))
-        .header("Content-Type", "application/json")
-        .bearer_auth(token)
-        .json(&payload)
-        .send()
-        .await;
-
-    match res {
-        Ok(r) if r.status().is_success() => {
-            if let Err(e) = engine.update_backup_meta(url) {
-                eprintln!("{} Failed to update backup metadata: {}", "⚠".yellow(), e);
-            }
-            println!(
-                "{} Backed up {} vault(s): {}",
-                "✓".green(),
-                names.len(),
-                names.join(", ")
-            );
-            println!(
-                "{}",
-                "  Data is encrypted — Cloudflare only stores ciphertext.".dimmed()
-            );
-        }
-        Ok(r) => {
-            let status = r.status().as_u16();
-            let text = r.text().await.unwrap_or_default();
-            eprintln!("{} Backup failed: HTTP {}: {}", "✗".red(), status, text);
-            exit(1);
-        }
-        Err(e) => {
-            eprintln!("{} Backup failed: {}", "✗".red(), e);
-            exit(1);
-        }
-    }
-}
-
-async fn cmd_restore(url: &str, token: &str) {
-    println!(
-        "{} Restoring encrypted vaults from Cloudflare...",
-        "📥".cyan()
-    );
-    if !prompt::prompt_confirm(
-        "Restore overwrites existing vaults. Continue?"
-            .red()
-            .to_string()
-            .as_str(),
-    ) {
-        return;
-    }
-
-    let client = reqwest::Client::new();
-    let res = client
-        .get(format!("{}/backup", url.trim_end_matches('/')))
-        .bearer_auth(token)
-        .send()
-        .await;
-
-    match res {
-        Ok(r) if r.status().is_success() => {
-            let data: Value = match r.json().await {
-                Ok(v) => v,
-                Err(_) => {
-                    eprintln!("{} Restore failed: response was not valid JSON.", "✗".red());
-                    exit(1);
-                }
-            };
-            let vaults = data
-                .get("vaults")
-                .and_then(|v| v.as_object())
-                .cloned()
-                .unwrap_or_default();
-
-            // Reject unsupported backup versions before touching any files.
-            let version = data.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
-            if version != 1 {
-                eprintln!(
-                    "{} Restore failed: unsupported backup version {}.",
-                    "✗".red(),
-                    version
-                );
-                exit(1);
-            }
-
-            // Verify the integrity checksum so corruption/tampering can never
-            // silently overwrite a local store with bad data.
-            let expected = data.get("checksum").and_then(|c| c.as_str());
-            match expected {
-                Some(c) => {
-                    let computed =
-                        vaultly_core::vault::backup_checksum(&vaults).unwrap_or_default();
-                    if computed != *c {
-                        eprintln!(
-                            "{} Restore failed: backup checksum mismatch (data corrupt or tampered).",
-                            "✗".red()
-                        );
-                        exit(1);
-                    }
-                }
-                None => {
-                    eprintln!(
-                        "{} Restore failed: backup has no integrity checksum. Re-run `vaultly backup` to regenerate.",
-                        "✗".red()
-                    );
-                    exit(1);
-                }
-            }
-
-            let mut engine = engine();
-            match engine.restore_encrypted_vaults(&vaults) {
-                Ok(count) => {
-                    println!("{} Restored {} vault(s).", "✓".green(), count);
-                    println!("{}", "  Use your master password to decrypt them.".dimmed());
-                }
-                Err(e) => {
-                    eprintln!("{} Restore failed: {}", "✗".red(), e);
-                    exit(1);
-                }
-            }
-        }
-        Ok(r) => {
-            let status = r.status().as_u16();
-            let text = r.text().await.unwrap_or_default();
-            eprintln!("{} Restore failed: HTTP {}: {}", "✗".red(), status, text);
-            exit(1);
-        }
-        Err(e) => {
-            eprintln!("{} Restore failed: {}", "✗".red(), e);
-            exit(1);
-        }
-    }
-}
-
 // ─── protect ────────────────────────────────────────────────
-
-fn cmd_protect(dir: &str) {
-    let patterns = [
-        "# Vaultly secrets protection",
-        ".env",
-        ".env.*",
-        "*.vault",
-        ".production-keys",
-        "credentials*",
-        "*-keys*",
-        "*.pem",
-    ];
-    let targets = [".gitignore", ".windsurfrules"];
-    let mut updated = 0;
-
-    for file in targets {
-        let path = PathBuf::from(dir).join(file);
-        let mut content = std::fs::read_to_string(&path).unwrap_or_default();
-        if content.contains("Vaultly secrets protection") {
-            println!("{} {} (already protected)", "⏭".dimmed(), file);
-            continue;
-        }
-        content.push('\n');
-        content.push_str(&patterns.join("\n"));
-        content.push('\n');
-        std::fs::create_dir_all(path.parent().unwrap_or(&PathBuf::from("."))).ok();
-        if std::fs::write(&path, content).is_ok() {
-            println!("{} {} updated", "✓".green(), file);
-            updated += 1;
-        }
-    }
-
-    println!(
-        "{} Protected {} config file(s) in {}",
-        "✓".green(),
-        updated,
-        dir
-    );
-    println!(
-        "{}",
-        "  AI tools that respect these files won't read your secrets.".dimmed()
-    );
-}
 
 // ─── run (agent-safe command execution) ─────────────────────
 
@@ -1808,111 +1193,6 @@ fn cmd_rotate(
     }
 }
 
-async fn cmd_serve(bind: &str, token: Option<&str>) {
-    let token = match token {
-        Some(t) if !t.is_empty() => t.to_string(),
-        _ => match std::env::var("VAULTLY_SERVER_TOKEN") {
-            Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
-            _ => {
-                eprintln!(
-                    "{} Missing server token. Pass --token or set VAULTLY_SERVER_TOKEN.",
-                    "✗".red()
-                );
-                exit(1);
-            }
-        },
-    };
-    if let Err(e) = server::serve(bind, &token).await {
-        eprintln!("{} {}", "✗".red(), e);
-        exit(1);
-    }
-}
-
-async fn cmd_run(vault_name: &str, command: &[String], timeout_ms: Option<u64>, force: bool) {
-    let args: Vec<String> = command.to_vec();
-    if args.is_empty() {
-        eprintln!(
-            "{} No command given. Usage: vaultly run <vault> -- <command>",
-            "✗".red()
-        );
-        exit(1);
-    }
-
-    let mut engine = require_unlock();
-
-    if !force {
-        match engine.expired_keys(vault_name, None) {
-            Ok(expired) if !expired.is_empty() => {
-                eprintln!(
-                    "{} {} expired secret(s) in '{}' ({}). Rotate them first (`vaultly rotate {} --expired`), or pass --force to override.",
-                    "⛔".red(),
-                    expired.len(),
-                    vault_name,
-                    expired.join(", "),
-                    vault_name
-                );
-                exit(1);
-            }
-            Ok(_) => {}
-            Err(e) => {
-                // Unknown/empty vault is reported by list_keys below.
-                eprintln!("{} {}", "✗".red(), e);
-                exit(1);
-            }
-        }
-    }
-
-    let (program, program_args) = args.split_first().expect("args non-empty guaranteed");
-    let cmd_display = args.join(" ");
-
-    let keys = engine.list_keys(vault_name, None).unwrap_or_default();
-    if keys.is_empty() {
-        eprintln!(
-            "{} Vault '{}' is empty or doesn't exist.",
-            "✗".red(),
-            vault_name
-        );
-        exit(1);
-    }
-    eprintln!(
-        "{} Injecting {} secret(s) from '{}': {}",
-        "🔐".dimmed(),
-        keys.len(),
-        vault_name,
-        keys.join(", ")
-    );
-    eprintln!("{} Running: {}\n", "▶".dimmed(), cmd_display);
-
-    let timeout = timeout_ms.unwrap_or(86_400_000);
-    let opts = RunOptions {
-        cwd: None,
-        timeout_ms: Some(timeout),
-        allowed_keys: None,
-    };
-    let result = engine
-        .run(vault_name, program, program_args, &opts, None)
-        .await;
-
-    match result {
-        Ok(res) => {
-            if !res.stdout.is_empty() {
-                println!("{}", res.stdout);
-            }
-            if !res.stderr.is_empty() {
-                eprintln!("{}", res.stderr);
-            }
-            if res.scrubbed {
-                eprintln!("{} Secret values were scrubbed from output.", "⚠".yellow());
-            }
-            exit(res.code);
-        }
-        Err(e) => {
-            eprintln!("{} {}", "✗".red(), e);
-            exit(1);
-        }
-    }
-}
-
 // ─── cf add ─────────────────────────────────────────────────
 
 fn cmd_cf_add(
@@ -2004,11 +1284,14 @@ fn cmd_cf_add(
     if !failures.is_empty() {
         eprintln!("{} Failed to store: {}", "✗".red(), failures.join(", "));
     }
-    println!("{} Use it:  vaultly cf use {}", "".dimmed(), name);
     println!(
-        "{} Deploy:  vaultly cf deploy {} /path/to/project",
+        "{} Use it for discovery: vaultly cf zones {}",
         "".dimmed(),
         name
+    );
+    println!(
+        "{} Register deployments with: vaultly target add ...",
+        "".dimmed()
     );
 }
 
@@ -2042,68 +1325,199 @@ fn cmd_cf_list() {
     println!();
 }
 
-// ─── cf deploy ──────────────────────────────────────────────
+fn target_context() -> Option<CallerContext> {
+    if agent_mode() {
+        Some(CallerContext {
+            caller: Caller::Agent,
+            agent_name: Some("cli-agent".into()),
+            session_id: None,
+        })
+    } else {
+        None
+    }
+}
 
-async fn cmd_cf_deploy(name: &str, project_dir: &str, env: Option<&str>) {
-    let vault_name = cf_vault(name);
-    let mut engine = require_unlock();
-
-    let secrets = match engine.get_secrets(&vault_name, None) {
-        Ok(s) => s,
+fn cmd_target_list(json_output: bool) {
+    let engine = VaultEngine::new(None);
+    let store = engine.store();
+    let targets = match store.load_deployment_targets() {
+        Ok(targets) => targets,
         Err(e) => {
             eprintln!("{} {}", "✗".red(), e);
             exit(1);
         }
     };
-    if secrets
-        .get("CLOUDFLARE_API_TOKEN")
-        .and_then(|v| v.as_str())
-        .is_none()
-    {
-        eprintln!("{} No CLOUDFLARE_API_TOKEN in '{}'", "✗".red(), vault_name);
+    if json_output || agent_mode() {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&targets).unwrap_or_else(|_| "[]".into())
+        );
+        return;
+    }
+    println!("\n🚀 Deployment targets ({}):\n", targets.len());
+    for target in targets {
+        println!(
+            "  {}  {} → {} ({})",
+            target.id.cyan(),
+            target.vault,
+            target.project,
+            match target.provider {
+                DeploymentProvider::Pages => "Pages",
+                DeploymentProvider::Worker => "Worker",
+            }
+        );
+    }
+}
+
+fn cmd_target_add(
+    id: &str,
+    provider: &str,
+    vault: &str,
+    account_id: &str,
+    project: &str,
+    project_dir: &str,
+    build_command: &str,
+    output_dir: &str,
+    branch: Option<&str>,
+) {
+    let provider = match provider {
+        "pages" => DeploymentProvider::Pages,
+        "worker" => DeploymentProvider::Worker,
+        _ => {
+            eprintln!("{} Provider must be pages or worker", "✗".red());
+            exit(1);
+        }
+    };
+    let dir = match std::fs::canonicalize(project_dir) {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("{} Invalid project directory: {}", "✗".red(), e);
+            exit(1);
+        }
+    };
+    let target = DeploymentTarget {
+        id: id.to_string(),
+        provider,
+        vault: vault.to_string(),
+        account_id: account_id.to_string(),
+        project: project.to_string(),
+        project_dir: dir.to_string_lossy().to_string(),
+        build_command: build_command.to_string(),
+        output_dir: output_dir.to_string(),
+        branch: branch.map(str::to_string),
+        created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    };
+    if let Err(e) = target.validate() {
+        eprintln!("{} {}", "✗".red(), e);
         exit(1);
     }
 
-    let mut args = vec!["deploy".to_string()];
-    if let Some(e) = env {
-        args.push("--env".to_string());
-        args.push(e.to_string());
-    }
-
-    eprintln!(
-        "{} Deploying with account '{}' → {}",
-        "☁️".dimmed(),
-        name,
-        project_dir
-    );
-    eprintln!("{} npx wrangler {}\n", "▶".dimmed(), args.join(" "));
-
-    let opts = RunOptions {
-        cwd: Some(project_dir),
-        timeout_ms: Some(86_400_000),
-        allowed_keys: None,
-    };
-    let result = engine.run(&vault_name, "npx", &args, &opts, None).await;
-
-    match result {
-        Ok(res) => {
-            if !res.stdout.is_empty() {
-                println!("{}", res.stdout);
-            }
-            if !res.stderr.is_empty() {
-                eprintln!("{}", res.stderr);
-            }
-            if res.scrubbed {
-                eprintln!("{} Secret values were scrubbed from output.", "⚠".yellow());
-            }
-            exit(res.code);
+    let mut engine = require_unlock();
+    match engine.cf_account_id(vault) {
+        Ok(actual) if actual == account_id => {}
+        Ok(_) => {
+            eprintln!(
+                "{} Vault account ID does not match target account ID",
+                "✗".red()
+            );
+            exit(1);
         }
         Err(e) => {
-            eprintln!("{} Failed to start deploy: {}", "✗".red(), e);
+            eprintln!("{} {}", "✗".red(), e);
+            exit(1);
+        }
+    }
+    let store = engine.store();
+    let mut targets = store.load_deployment_targets().unwrap_or_default();
+    targets.retain(|existing| existing.id != target.id);
+    targets.push(target.clone());
+    if let Err(e) = store.save_deployment_targets(&targets) {
+        eprintln!("{} {}", "✗".red(), e);
+        exit(1);
+    }
+    println!(
+        "{} Registered deployment target '{}'",
+        "✓".green(),
+        target.id
+    );
+}
+
+fn cmd_target_remove(id: &str) {
+    let engine = VaultEngine::new(None);
+    let store = engine.store();
+    let mut targets = match store.load_deployment_targets() {
+        Ok(targets) => targets,
+        Err(e) => {
+            eprintln!("{} {}", "✗".red(), e);
+            exit(1);
+        }
+    };
+    let before = targets.len();
+    targets.retain(|target| target.id != id);
+    if before == targets.len() {
+        eprintln!("{} Target '{}' not found", "✗".red(), id);
+        exit(1);
+    }
+    if let Err(e) = store.save_deployment_targets(&targets) {
+        eprintln!("{} {}", "✗".red(), e);
+        exit(1);
+    }
+    println!("{} Removed deployment target '{}'", "✓".green(), id);
+}
+
+async fn cmd_deploy_target(id: &str, json_output: bool) {
+    let mut engine = require_unlock();
+    let store = engine.store();
+    let targets = match store.load_deployment_targets() {
+        Ok(targets) => targets,
+        Err(e) => {
+            eprintln!("{} {}", "✗".red(), e);
+            exit(1);
+        }
+    };
+    let target = match targets.into_iter().find(|target| target.id == id) {
+        Some(target) => target,
+        None => {
+            eprintln!(
+                "{} Deployment target '{}' not found. Run: vaultly target list",
+                "✗".red(),
+                id
+            );
+            exit(1);
+        }
+    };
+    let context = target_context();
+    let result = engine.deploy_target(&target, context.as_ref()).await;
+    match result {
+        Ok(result) => {
+            if json_output || agent_mode() {
+                println!(
+                    "{}",
+                    serde_json::to_string(&result).unwrap_or_else(|_| "{}".into())
+                );
+            } else {
+                println!("{} Deployed '{}'", "✓".green(), result.target);
+                if let Some(url) = result.url {
+                    println!("  URL: {}", url);
+                }
+                println!("  Files: {}", result.files);
+            }
+        }
+        Err(e) => {
+            if json_output || agent_mode() {
+                println!(
+                    "{}",
+                    serde_json::json!({"target": id, "status": "failed", "error": e.to_string()})
+                );
+            } else {
+                eprintln!("{} {}", "✗".red(), e);
+            }
             exit(1);
         }
     }
 }
+
+// ─── cf deploy ──────────────────────────────────────────────
 
 // ─── cf zones ───────────────────────────────────────────────
 
@@ -2149,37 +1563,7 @@ async fn cmd_cf_zones(name: &str) {
 
 // ─── cf dns-delete ──────────────────────────────────────────
 
-async fn cmd_cf_dns_delete(name: &str, zone_id: &str, record_id: &str) {
-    // Deleting a DNS record is safe for agents (no values are involved), so
-    // this command is NOT agent-blocked — mirror the agent-safe cf_zones.
-    let vault_name = cf_vault(name);
-    let mut engine = require_unlock();
-    match engine
-        .dns_delete(&vault_name, zone_id, record_id, None)
-        .await
-    {
-        Ok(r) => print_cf_result(
-            &r,
-            &format!(
-                "Deleted DNS record '{}' in zone '{}' (account '{}')",
-                record_id, zone_id, name
-            ),
-        ),
-        Err(e) => {
-            eprintln!("{} Failed to delete DNS record: {}", "✗".red(), e);
-            exit(1);
-        }
-    }
-}
-
 // ─── cf helpers ─────────────────────────────────────────────
-
-fn print_cf_json(result: &vaultly_core::ApiResult) {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&result.data).unwrap_or_else(|_| result.data.to_string())
-    );
-}
 
 fn cf_list_names(r: &vaultly_core::ApiResult, field: &str) -> Vec<String> {
     r.data
@@ -2195,142 +1579,11 @@ fn cf_list_names(r: &vaultly_core::ApiResult, field: &str) -> Vec<String> {
 
 // ─── cf cache-purge ─────────────────────────────────────────
 
-async fn cmd_cf_cache_purge(name: &str, zone_id: &str, purge_everything: bool) {
-    let vault_name = cf_vault(name);
-    let mut engine = require_unlock();
-    if !purge_everything {
-        eprintln!(
-            "{} Pass --purge-everything to purge the whole zone cache (targeted purge is not exposed in the CLI).",
-            "✗".red()
-        );
-        exit(1);
-    }
-    let body = serde_json::json!({ "purge_everything": true });
-    match engine
-        .cloudflare_api(
-            &vault_name,
-            "POST",
-            &format!("/zones/{}/purge_cache", zone_id),
-            Some(body),
-            None,
-        )
-        .await
-    {
-        Ok(r) => print_cf_result(
-            &r,
-            &format!("Cache purge requested for zone '{}'", zone_id),
-        ),
-        Err(e) => {
-            eprintln!("{} Failed: {}", "✗".red(), e);
-            exit(1);
-        }
-    }
-}
-
 // ─── cf r2 ──────────────────────────────────────────────────
-
-async fn cmd_cf_r2(name: &str, bucket: Option<&str>) {
-    let vault_name = cf_vault(name);
-    let mut engine = require_unlock();
-    match bucket {
-        Some(b) => {
-            let path = format!("/r2/buckets/{}/objects", vaultly_core::urlencode(b));
-            match engine.cloudflare_account_api(&vault_name, "GET", &path, None, None).await {
-                Ok(r) => print_cf_json(&r),
-                Err(e) => {
-                    eprintln!("{} Failed: {}", "✗".red(), e);
-                    exit(1);
-                }
-            }
-        }
-        None => match engine
-            .cloudflare_account_api(&vault_name, "GET", "/r2/buckets", None, None)
-            .await
-        {
-            Ok(r) => {
-                let names = cf_list_names(&r, "name");
-                println!("☁️  R2 buckets for '{}' ({}):", name, names.len());
-                for n in &names {
-                    println!("  - {}", n.green());
-                }
-            }
-            Err(e) => {
-                eprintln!("{} Failed: {}", "✗".red(), e);
-                exit(1);
-            }
-        },
-    }
-}
 
 // ─── cf kv ──────────────────────────────────────────────────
 
-async fn cmd_cf_kv(name: &str, namespace: Option<&str>) {
-    let vault_name = cf_vault(name);
-    let mut engine = require_unlock();
-    match namespace {
-        Some(ns) => {
-            let path = format!("/storage/kv/namespaces/{}/keys", ns);
-            match engine.cloudflare_account_api(&vault_name, "GET", &path, None, None).await {
-                Ok(r) => print_cf_json(&r),
-                Err(e) => {
-                    eprintln!("{} Failed: {}", "✗".red(), e);
-                    exit(1);
-                }
-            }
-        }
-        None => match engine
-            .cloudflare_account_api(&vault_name, "GET", "/storage/kv/namespaces", None, None)
-            .await
-        {
-            Ok(r) => {
-                let names = cf_list_names(&r, "title");
-                println!("☁️  KV namespaces for '{}' ({}):", name, names.len());
-                for n in &names {
-                    println!("  - {}", n.green());
-                }
-            }
-            Err(e) => {
-                eprintln!("{} Failed: {}", "✗".red(), e);
-                exit(1);
-            }
-        },
-    }
-}
-
 // ─── cf d1 ──────────────────────────────────────────────────
-
-async fn cmd_cf_d1(name: &str, database: Option<&str>) {
-    let vault_name = cf_vault(name);
-    let mut engine = require_unlock();
-    match database {
-        Some(id) => {
-            let path = format!("/d1/database/{}", id);
-            match engine.cloudflare_account_api(&vault_name, "GET", &path, None, None).await {
-                Ok(r) => print_cf_json(&r),
-                Err(e) => {
-                    eprintln!("{} Failed: {}", "✗".red(), e);
-                    exit(1);
-                }
-            }
-        }
-        None => match engine
-            .cloudflare_account_api(&vault_name, "GET", "/d1/database", None, None)
-            .await
-        {
-            Ok(r) => {
-                let names = cf_list_names(&r, "name");
-                println!("☁️  D1 databases for '{}' ({}):", name, names.len());
-                for n in &names {
-                    println!("  - {}", n.green());
-                }
-            }
-            Err(e) => {
-                eprintln!("{} Failed: {}", "✗".red(), e);
-                exit(1);
-            }
-        },
-    }
-}
 
 // ─── cf pages ───────────────────────────────────────────────
 
@@ -2357,156 +1610,13 @@ async fn cmd_cf_pages(name: &str) {
 
 // ─── cf bindings / triggers ─────────────────────────────────
 
-async fn cmd_cf_bindings(name: &str, script_name: &str) {
-    let vault_name = cf_vault(name);
-    let mut engine = require_unlock();
-    let path = format!(
-        "/workers/scripts/{}/bindings",
-        vaultly_core::urlencode(script_name)
-    );
-    match engine.cloudflare_account_api(&vault_name, "GET", &path, None, None).await {
-        Ok(r) => print_cf_json(&r),
-        Err(e) => {
-            eprintln!("{} Failed: {}", "✗".red(), e);
-            exit(1);
-        }
-    }
-}
-
-async fn cmd_cf_triggers(name: &str, script_name: &str) {
-    let vault_name = cf_vault(name);
-    let mut engine = require_unlock();
-    let path = format!(
-        "/workers/scripts/{}/triggers",
-        vaultly_core::urlencode(script_name)
-    );
-    match engine.cloudflare_account_api(&vault_name, "GET", &path, None, None).await {
-        Ok(r) => print_cf_json(&r),
-        Err(e) => {
-            eprintln!("{} Failed: {}", "✗".red(), e);
-            exit(1);
-        }
-    }
-}
-
 // ─── cf ssl / certificates ──────────────────────────────────
-
-async fn cmd_cf_ssl(name: &str, zone_id: &str) {
-    let vault_name = cf_vault(name);
-    let mut engine = require_unlock();
-    match engine
-        .cloudflare_api(
-            &vault_name,
-            "GET",
-            &format!("/zones/{}/settings/ssl", zone_id),
-            None,
-            None,
-        )
-        .await
-    {
-        Ok(r) => print_cf_json(&r),
-        Err(e) => {
-            eprintln!("{} Failed: {}", "✗".red(), e);
-            exit(1);
-        }
-    }
-}
-
-async fn cmd_cf_certificates(name: &str, zone_id: &str) {
-    let vault_name = cf_vault(name);
-    let mut engine = require_unlock();
-    match engine
-        .cloudflare_api(
-            &vault_name,
-            "GET",
-            &format!("/zones/{}/custom_certificates", zone_id),
-            None,
-            None,
-        )
-        .await
-    {
-        Ok(r) => print_cf_json(&r),
-        Err(e) => {
-            eprintln!("{} Failed: {}", "✗".red(), e);
-            exit(1);
-        }
-    }
-}
 
 // ─── cf firewall ────────────────────────────────────────────
 
-async fn cmd_cf_firewall(name: &str, zone_id: &str) {
-    let vault_name = cf_vault(name);
-    let mut engine = require_unlock();
-    match engine
-        .cloudflare_api(
-            &vault_name,
-            "GET",
-            &format!("/zones/{}/firewall/rules", zone_id),
-            None,
-            None,
-        )
-        .await
-    {
-        Ok(r) => print_cf_json(&r),
-        Err(e) => {
-            eprintln!("{} Failed: {}", "✗".red(), e);
-            exit(1);
-        }
-    }
-}
-
 // ─── cf lb ──────────────────────────────────────────────────
 
-async fn cmd_cf_lb(name: &str) {
-    let vault_name = cf_vault(name);
-    let mut engine = require_unlock();
-    println!("{}", "☁️  Load balancer pools:".bold());
-    match engine
-        .cloudflare_account_api(&vault_name, "GET", "/load_balancers/pools", None, None)
-        .await
-    {
-        Ok(r) => print_cf_json(&r),
-        Err(e) => {
-            eprintln!("{} Failed: {}", "✗".red(), e);
-            exit(1);
-        }
-    }
-    println!("{}", "☁️  Load balancers:".bold());
-    match engine
-        .cloudflare_account_api(&vault_name, "GET", "/load_balancers/load_balancers", None, None)
-        .await
-    {
-        Ok(r) => print_cf_json(&r),
-        Err(e) => {
-            eprintln!("{} Failed: {}", "✗".red(), e);
-            exit(1);
-        }
-    }
-}
-
 // ─── cf email ───────────────────────────────────────────────
-
-async fn cmd_cf_email(name: &str, zone_id: &str) {
-    let vault_name = cf_vault(name);
-    let mut engine = require_unlock();
-    match engine
-        .cloudflare_api(
-            &vault_name,
-            "GET",
-            &format!("/zones/{}/email/routing/rules", zone_id),
-            None,
-            None,
-        )
-        .await
-    {
-        Ok(r) => print_cf_json(&r),
-        Err(e) => {
-            eprintln!("{} Failed: {}", "✗".red(), e);
-            exit(1);
-        }
-    }
-}
 
 // ─── cf secrets ─────────────────────────────────────────────
 
@@ -2605,93 +1715,6 @@ async fn cmd_cf_secrets(
 }
 
 // ─── template ───────────────────────────────────────────────
-
-fn cmd_template(name: Option<&str>, list: bool) {
-    if list || name.is_none() {
-        println!("{}", "\n📋 Available templates:\n".bold());
-        for (key, tpl) in templates::TEMPLATES {
-            println!("  {} {}", key.cyan(), tpl.description.dimmed());
-            if !tpl.keys.is_empty() {
-                println!(
-                    "  {} {}",
-                    "".dimmed(),
-                    format!("Keys: {}", tpl.keys.join(", ")).dimmed()
-                );
-            }
-        }
-        println!("{}", "\nUsage: vaultly template github my-github".dimmed());
-        return;
-    }
-
-    let name = name.unwrap();
-    let tpl = match templates::get_template(name) {
-        Some(t) => t,
-        None => {
-            eprintln!("{} Unknown template '{}'.", "✗".red(), name);
-            eprintln!(
-                "{} Available: {}",
-                "".dimmed(),
-                templates::template_names().join(", ")
-            );
-            exit(1);
-        }
-    };
-
-    let mut engine = require_unlock();
-
-    let vault_name = prompt::prompt_line(&format!("Vault name [{}]: ", name));
-    let vault_name = if vault_name.is_empty() {
-        name.to_string()
-    } else {
-        vault_name
-    };
-
-    let keys: Vec<String> = if tpl.keys.is_empty() {
-        println!("{}", "Enter keys (comma-separated, e.g. A,B,C):".dimmed());
-        prompt::prompt_line("  Keys: ")
-            .split(',')
-            .map(|k| {
-                k.trim()
-                    .to_uppercase()
-                    .replace(|c: char| !c.is_ascii_alphanumeric() && c != '_', "_")
-            })
-            .filter(|k| !k.is_empty())
-            .collect()
-    } else {
-        println!("{}", format!("\nTemplate: {}", tpl.description).dimmed());
-        println!("{}", "(press Enter to skip any key)\n".dimmed());
-        tpl.keys.iter().map(|k| k.to_string()).collect()
-    };
-
-    let mut added = 0;
-    for k in &keys {
-        let v = prompt::prompt_password(&format!("  {}: ", k));
-        if !v.is_empty() && engine.add_secret(&vault_name, k, &v, None).is_ok() {
-            added += 1;
-        }
-    }
-
-    if added == 0 {
-        eprintln!(
-            "{} No values entered — vault '{}' not created.",
-            "✗".red(),
-            vault_name
-        );
-        exit(1);
-    }
-
-    println!(
-        "{} Vault '{}' created with {} key(s)",
-        "✓".green(),
-        vault_name,
-        added
-    );
-    println!(
-        "{} Use: vaultly run {} -- <command>",
-        "".dimmed(),
-        vault_name
-    );
-}
 
 // ─── keychain ───────────────────────────────────────────────
 

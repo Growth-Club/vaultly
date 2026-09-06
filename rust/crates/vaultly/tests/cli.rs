@@ -112,22 +112,6 @@ fn init(_env: &VaultlyEnv) {
     assert_ok(&run(&["init"]));
 }
 
-/// Recursively copy a directory tree (used to snapshot/restore the encrypted
-/// store for the backup/restore roundtrip).
-fn copy_recursively(src: &Path, dst: &Path) {
-    std::fs::create_dir_all(dst).expect("create destination dir");
-    for entry in std::fs::read_dir(src).expect("read source dir") {
-        let entry = entry.expect("read directory entry");
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        if entry.file_type().expect("file type").is_dir() {
-            copy_recursively(&from, &to);
-        } else {
-            std::fs::copy(&from, &to).expect("copy file");
-        }
-    }
-}
-
 // ─── 1. init → add → get roundtrip ─────────────────────────
 
 #[test]
@@ -238,62 +222,6 @@ fn import_formats_env_json_yaml_csv() {
     }
 }
 
-// ─── 4. backup/restore roundtrip ───────────────────────────
-
-// The `backup`/`restore` subcommands push/pull encrypted vaults to a remote
-// Cloudflare Worker (url + token), which can't be exercised offline. This test
-// verifies the same encrypted-store roundtrip at the file layer: snapshot the
-// store (config + encrypted vault files), wipe it, restore it, and confirm the
-// secrets decrypt back to their original values under the same master password.
-#[test]
-fn backup_restore_roundtrip() {
-    let env = VaultlyEnv::new();
-    init(&env);
-
-    const VAULT: &str = "backupvault";
-    const K1: (&str, &str) = ("MY_KEY", "my-secret-value-1");
-    const K2: (&str, &str) = ("DB_PASS", "my-secret-value-2");
-    assert_ok(&run(&["add", VAULT, "-k", K1.0, "-v", K1.1]));
-    assert_ok(&run(&["add", VAULT, "-k", K2.0, "-v", K2.1]));
-
-    // Sanity-check the values are present before the roundtrip.
-    let pre = run(&["get", VAULT, K1.0]);
-    assert_ok(&pre);
-    assert_eq!(stdout(&pre).trim(), K1.1);
-
-    // "backup": snapshot the encrypted store to a separate temp dir.
-    let backup_dir = tempfile::tempdir().expect("backup tempdir");
-    let store = env.dir();
-    copy_recursively(&store.join("vaults"), &backup_dir.path().join("vaults"));
-    std::fs::copy(
-        store.join("config.json"),
-        backup_dir.path().join("config.json"),
-    )
-    .expect("backup config");
-
-    // Wipe the local store entirely.
-    std::fs::remove_dir_all(store).expect("wipe store");
-    assert_fails(&run(&["get", VAULT, K1.0]));
-
-    // "restore": copy the snapshot back.
-    copy_recursively(&backup_dir.path().join("vaults"), &store.join("vaults"));
-    std::fs::copy(
-        backup_dir.path().join("config.json"),
-        store.join("config.json"),
-    )
-    .expect("restore config");
-
-    // Original values come back (same master password decrypts the restored
-    // encrypted vault files).
-    let k1 = run(&["get", VAULT, K1.0]);
-    assert_ok(&k1);
-    assert_eq!(stdout(&k1).trim(), K1.1);
-
-    let k2 = run(&["get", VAULT, K2.0]);
-    assert_ok(&k2);
-    assert_eq!(stdout(&k2).trim(), K2.1);
-}
-
 // ─── 5. error paths exit non-zero (without panicking) ──────
 
 #[test]
@@ -315,72 +243,6 @@ fn error_paths_return_nonzero_exit() {
 
     // an invalid vault name (control character is rejected outright) must fail.
     assert_fails(&run(&["add", "bad\nvault", "-k", "K", "-v", "v"]));
-}
-
-// ─── 6. `run` injects secrets without leaking them ─────────
-
-#[test]
-fn run_does_not_leak_secret_to_child_and_scrubs() {
-    let env = VaultlyEnv::new();
-    init(&env);
-
-    const VAULT: &str = "runvault";
-    // The key name becomes the child's env var; the value must never appear in
-    // any listing/metadata/audit output.
-    assert_ok(&run(&["add", VAULT, "-k", "MYKEY", "-v", SECRET]));
-
-    // 1. The secret reaches the child as an env var. `/bin/sh` is used by
-    //    absolute path because `run` clears the child env. We assert the var is
-    //    present (non-empty) without embedding the literal value in the command
-    //    string — otherwise the secret would be recorded verbatim in the audit
-    //    log's RUN entry.
-    let reached = run(&[
-        "run",
-        VAULT,
-        "/bin/sh",
-        "-c",
-        r#"test -n "$MYKEY" && echo REACHED"#,
-    ]);
-    assert_ok(&reached);
-    assert!(
-        stdout(&reached).contains("REACHED"),
-        "stdout: {}",
-        stdout(&reached)
-    );
-
-    // 2. The secret reaches the child with the exact value: the child echoes
-    //    `$MYKEY`, and if it were anything other than SECRET the CLI's scrubber
-    //    would not redact it to [REDACTED]. This is also the scrub proof.
-    let echoed = run(&["run", VAULT, "/bin/sh", "-c", r#"printf %s "$MYKEY""#]);
-    assert_ok(&echoed);
-    assert!(
-        stdout(&echoed).contains("[REDACTED]"),
-        "expected scrubbed output, got: {}",
-        stdout(&echoed)
-    );
-    assert!(!stdout(&echoed).contains(SECRET), "run leaked secret");
-
-    // 3. Agent-safe invariant: no listing/metadata command leaks the value.
-    let commands: &[&[&str]] = &[
-        &["list"][..],
-        &["list", VAULT][..],
-        &["inspect", VAULT][..],
-        &["status"][..],
-    ];
-    for cmd in commands {
-        let out = run(cmd);
-        assert_ok(&out);
-        assert!(
-            !stdout(&out).contains(SECRET),
-            "command {cmd:?} leaked secret"
-        );
-    }
-
-    // 4. The audit log never stores the secret value (it records names only),
-    //    and the audit chain stays intact.
-    let audit_path = env.dir().join("audit.log");
-    let audit = std::fs::read_to_string(&audit_path).expect("read audit log");
-    assert!(!audit.contains(SECRET), "audit log leaked secret");
 }
 
 // ─── 7. rotate --expired (Phase B) ──────────────────────────
@@ -431,41 +293,7 @@ fn rotate_expired_rotates_and_clears_expiry() {
     );
 }
 
-// ─── 8. run --force expired-refusal (Phase B) ───────────────
-
-#[test]
-fn run_refuses_expired_without_force() {
-    let env = VaultlyEnv::new();
-    init(&env);
-
-    const VAULT: &str = "ci";
-    assert_ok(&run(&[
-        "add",
-        VAULT,
-        "-k",
-        "OLD",
-        "-v",
-        SECRET,
-        "--expires",
-        "2000-01-01T00:00:00Z",
-    ]));
-
-    // Without --force, an expired secret blocks the run.
-    let refused = run(&["run", VAULT, "--", "/usr/bin/true"]);
-    assert_fails(&refused);
-    assert!(
-        stderr(&refused).contains("expired"),
-        "stderr: {}",
-        stderr(&refused)
-    );
-
-    // With --force, the command proceeds and succeeds.
-    let forced = run(&["run", VAULT, "--force", "--", "/usr/bin/true"]);
-    assert_ok(&forced);
-}
-
 // ─── doctor ─────────────────────────────────────────────────
-
 #[test]
 fn doctor_reports_healthy_state() {
     let env = VaultlyEnv::new();
@@ -700,20 +528,4 @@ fn inspect_shows_metadata_not_values() {
     let stdout = stdout(&out);
     assert!(!stdout.contains(SECRET), "inspect must not leak values");
     assert!(stdout.contains("TOKEN"), "inspect should list key names");
-}
-
-// ─── completions ────────────────────────────────────────────
-
-#[test]
-fn completions_generates_nonempty_script() {
-    let env = VaultlyEnv::new();
-    init(&env);
-
-    let out = run(&["completions", "bash"]);
-    assert_ok(&out);
-    let stdout = stdout(&out);
-    assert!(
-        stdout.contains("vaultly") && stdout.len() > 100,
-        "completions should produce a non-trivial bash script"
-    );
 }

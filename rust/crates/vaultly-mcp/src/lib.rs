@@ -12,9 +12,7 @@ use std::process::exit;
 use std::sync::OnceLock;
 
 use serde_json::{json, Map, Value};
-use vaultly_core::{
-    generate, keychain, templates, CallerContext, RunOptions, VaultEngine, VaultError,
-};
+use vaultly_core::{generate, keychain, CallerContext, VaultEngine, VaultError};
 
 pub const SERVER_NAME: &str = "vaultly";
 pub const SERVER_VERSION: &str = "1.0.0";
@@ -32,8 +30,6 @@ fn master_password() -> Option<String> {
     std::env::var("VAULTLY_MASTER_PASSWORD").ok()
 }
 pub const SESSION_TTL_MINUTES: u64 = 120;
-pub const RUN_TIMEOUT_MS: u64 = 300_000;
-const OUTPUT_MAX: usize = 10_000;
 
 fn agent_ctx() -> CallerContext {
     CallerContext {
@@ -83,7 +79,6 @@ fn error_code(e: &VaultError) -> &'static str {
         UnknownSecretAction(_) => "unknown_secret_action",
         RequiredField(_, _) => "required_field",
         Audit(_) => "audit",
-        BackupMetaUpdate(_) => "backup_meta",
     }
 }
 
@@ -109,28 +104,6 @@ fn write_export_file(path: &str, contents: &str) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn write_export_file(path: &str, contents: &str) -> std::io::Result<()> {
     std::fs::write(path, contents)
-}
-
-fn truncate(s: &str) -> String {
-    if s.len() > OUTPUT_MAX {
-        let idx = s.floor_char_boundary(OUTPUT_MAX);
-        format!("{}\n...(truncated)", &s[..idx])
-    } else {
-        s.to_string()
-    }
-}
-
-fn urlencode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for &b in s.as_bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{:02X}", b)),
-        }
-    }
-    out
 }
 
 /// Bind required string args as `&str` (ident `name` for JSON key `"KEY"`)
@@ -163,935 +136,50 @@ fn str_prop(desc: &str) -> Value {
 
 fn tools_list() -> Vec<Tool> {
     vec![
-        Tool {
-            name: "vault_list",
-            description: "List all vault names. Safe — no secrets exposed.",
-            schema: json!({ "type": "object", "properties": {} }),
-        },
-        Tool {
-            name: "vault_keys",
-            description: "List secret KEY NAMES in a vault, plus per-key metadata (created/updated timestamps and expiry). Names/meta only — never values.",
-            schema: json!({ "type": "object", "properties": { "vaultName": str_prop("Vault name") }, "required": ["vaultName"] }),
-        },
-        Tool {
-            name: "vault_add",
-            description: "Store a secret (WRITE-ONLY). You can NEVER read it back. Optionally set an expiry via ttlSeconds or expiresAt.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "vaultName": str_prop("Vault name"),
-                    "key": str_prop("Secret name (e.g. CLOUDFLARE_API_TOKEN)"),
-                    "value": str_prop("Secret value to encrypt and store"),
-                    "ttlSeconds": json!({ "type": "number", "description": "Expire the secret this many seconds from now (mutually exclusive with expiresAt)" }),
-                    "expiresAt": str_prop("Explicit RFC 3339 expiry timestamp (mutually exclusive with ttlSeconds)"),
-                },
-                "required": ["vaultName", "key", "value"]
-            }),
-        },
-        Tool {
-            name: "vault_delete",
-            description: "Delete a secret from a vault.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "vaultName": str_prop("Vault name"),
-                    "key": str_prop("Secret key to delete"),
-                },
-                "required": ["vaultName", "key"]
-            }),
-        },
-        Tool {
-            name: "vault_run",
-            description: "Run a command with vault secrets injected as env vars. Secrets are NEVER printed — output is scrubbed. Refuses to run while the vault has expired secrets unless force=true.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "vaultName": str_prop("Vault to inject"),
-                    "command": str_prop("Command (e.g. 'npx wrangler deploy')"),
-                    "cwd": str_prop("Working directory"),
-                    "force": json!({ "type": "boolean", "description": "Run even if the vault has expired secrets (default false)" }),
-                    "allowlist": json!({ "type": "array", "items": { "type": "string" }, "description": "Only inject these secret names into the child (omit to inject all)" }),
-                },
-                "required": ["vaultName", "command"]
-            }),
-        },
-        Tool {
-            name: "vault_status",
-            description: "Show vault status: session TTL, vault count, keychain status.",
-            schema: json!({ "type": "object", "properties": {} }),
-        },
-        Tool {
-            name: "vault_lock",
-            description: "Lock the vault session immediately — wipes the decryption key from memory. Use vault_unlock to re-open.",
-            schema: json!({ "type": "object", "properties": {} }),
-        },
-        Tool {
-            name: "vault_unlock",
-            description: "Re-open a locked session. Uses the macOS Keychain — the agent never handles the password.",
-            schema: json!({ "type": "object", "properties": {} }),
-        },
-        Tool {
-            name: "vault_audit",
-            description: "View recent audit log, optionally filtered by vault, caller, or timestamp.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "lines": json!({ "type": "number", "description": "Entries to show (default 20)" }),
-                    "vault": str_prop("Only entries mentioning this vault name"),
-                    "caller": json!({ "type": "string", "enum": ["agent", "human"], "description": "Only entries from this caller" }),
-                    "after": str_prop("Only entries with timestamp >= this RFC3339 time (e.g. 2026-08-20T00:00:00Z)")
-                }
-            }),
-        },
-        Tool {
-            name: "cf_accounts",
-            description: "List which vaults hold Cloudflare credentials (account name, auth method, label, scope). Set health=true to also verify each credential is valid. Never exposes values.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "health": json!({ "type": "boolean", "description": "Verify each account's credential against Cloudflare (default false)" }),
-                }
-            }),
-        },
-        Tool {
-            name: "cf_account_label",
-            description: "Set, clear, or read a Cloudflare account's human-readable alias (label). Non-secret.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "vaultName": str_prop("Vault name"),
-                    "label": str_prop("Alias to set; omit to read, empty string to clear"),
-                },
-                "required": ["vaultName"]
-            }),
-        },
-        Tool {
-            name: "cf_api",
-            description: "Make an authenticated Cloudflare API call. Token injected from vault — you see the response, NEVER the token.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "vaultName": str_prop("Vault with CLOUDFLARE_API_TOKEN"),
-                    "method": json!({ "type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"] }),
-                    "path": str_prop("API path (e.g. /zones)"),
-                    "body": str_prop("JSON body string"),
-                },
-                "required": ["vaultName", "method", "path"]
-            }),
-        },
-        Tool {
-            name: "cf_zones",
-            description: "List all zones (domains) in a Cloudflare account.",
-            schema: json!({ "type": "object", "properties": { "vaultName": str_prop("Vault name") }, "required": ["vaultName"] }),
-        },
-        Tool {
-            name: "cf_dns_list",
-            description: "List DNS records for a zone.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "vaultName": str_prop("Vault name"),
-                    "zoneId": str_prop("Zone ID"),
-                    "type": str_prop("Filter: A, CNAME, MX, TXT..."),
-                },
-                "required": ["vaultName", "zoneId"]
-            }),
-        },
-        Tool {
-            name: "cf_dns_upsert",
-            description: "Create or update a DNS record.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "vaultName": str_prop("Vault name"),
-                    "zoneId": str_prop("Zone ID"),
-                    "type": str_prop("A, AAAA, CNAME, MX, TXT..."),
-                    "name": str_prop("Record name (e.g. app.example.com)"),
-                    "content": str_prop("Record value (IP, hostname...)"),
-                    "ttl": json!({ "type": "number" }),
-                    "proxied": json!({ "type": "boolean" }),
-                },
-                "required": ["vaultName", "zoneId", "type", "name", "content"]
-            }),
-        },
-        Tool {
-            name: "cf_workers_list",
-            description: "List deployed Workers in a Cloudflare account.",
-            schema: json!({ "type": "object", "properties": { "vaultName": str_prop("Vault with CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID") }, "required": ["vaultName"] }),
-        },
-        Tool {
-            name: "cf_secrets",
-            description: "Manage secrets for a deployed Worker (list, set, delete). Values are write-only, never echoed back.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "vaultName": str_prop("Vault with CLOUDFLARE_ACCOUNT_ID + auth"),
-                    "scriptName": str_prop("Worker script name"),
-                    "action": json!({ "type": "string", "enum": ["list", "set", "delete"] }),
-                    "name": str_prop("Secret name (required for set/delete)"),
-                    "value": str_prop("Secret value (set only; write-only)"),
-                },
-                "required": ["vaultName", "scriptName", "action"]
-            }),
-        },
-        Tool {
-            name: "cf_deploy",
-            description: "Deploy a Cloudflare Worker project via wrangler. Credentials injected from vault.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "vaultName": str_prop("Vault name"),
-                    "projectDir": str_prop("Path to Worker project"),
-                    "extraArgs": str_prop("Extra wrangler args"),
-                },
-                "required": ["vaultName", "projectDir"]
-            }),
-        },
-        Tool {
-            name: "cf_health",
-            description: "Verify a Cloudflare API token is still valid.",
-            schema: json!({ "type": "object", "properties": { "vaultName": str_prop("Vault name") }, "required": ["vaultName"] }),
-        },
-        Tool {
-            name: "vault_meta",
-            description: "Inspect a vault: file path, size, secret count, key names. Meta only — never values.",
-            schema: json!({ "type": "object", "properties": { "vaultName": str_prop("Vault name") }, "required": ["vaultName"] }),
-        },
-        Tool {
-            name: "template_list",
-            description: "List available vault templates (name + description).",
-            schema: json!({ "type": "object", "properties": {} }),
-        },
-        Tool {
-            name: "template_apply",
-            description: "Create/populate a vault from a template. Optionally pass values to store (write-only).",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "vaultName": str_prop("Vault to populate"),
-                    "templateName": str_prop("Template name (see template_list)"),
-                    "values": json!({ "type": "object", "description": "Optional map of key -> value to store immediately" }),
-                },
-                "required": ["vaultName", "templateName"]
-            }),
-        },
-        Tool {
-            name: "cf_dns_delete",
-            description: "Delete a DNS record from a zone. Agent-safe — no values returned.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "vaultName": str_prop("Vault with CLOUDFLARE_ACCOUNT_ID + auth"),
-                    "zoneId": str_prop("Zone ID"),
-                    "recordId": str_prop("DNS record ID"),
-                },
-                "required": ["vaultName", "zoneId", "recordId"]
-            }),
-        },
-        Tool {
-            name: "cf_workers_versions",
-            description: "List deployment versions of a Worker script. Agent-safe.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "vaultName": str_prop("Vault with CLOUDFLARE_ACCOUNT_ID + auth"),
-                    "scriptName": str_prop("Worker script name"),
-                },
-                "required": ["vaultName", "scriptName"]
-            }),
-        },
-        Tool {
-            name: "vault_generate",
-            description: "Generate a cryptographically strong random secret and STORE it under a key (write-only — the value is never shown). Optionally set an expiry via ttlSeconds or expiresAt.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "vaultName": str_prop("Vault name"),
-                    "key": str_prop("Key to store the generated secret under"),
-                    "length": json!({ "type": "number", "description": "Length (default 32, max 4096)" }),
-                    "symbols": json!({ "type": "boolean", "description": "Include punctuation (default false)" }),
-                    "ttlSeconds": json!({ "type": "number", "description": "Expire the secret this many seconds from now (mutually exclusive with expiresAt)" }),
-                    "expiresAt": str_prop("Explicit RFC 3339 expiry timestamp (mutually exclusive with ttlSeconds)"),
-                },
-                "required": ["vaultName", "key"]
-            }),
-        },
-        Tool {
-            name: "vault_rotate",
-            description: "Rotate an existing secret: generate a new random value and overwrite it in place (write-only).",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "vaultName": str_prop("Vault name"),
-                    "key": str_prop("Key to rotate"),
-                    "length": json!({ "type": "number", "description": "Length (default 32, max 4096)" }),
-                    "symbols": json!({ "type": "boolean", "description": "Include punctuation (default false)" }),
-                },
-                "required": ["vaultName", "key"]
-            }),
-        },
-        Tool {
-            name: "vault_import",
-            description: "Import multiple secrets from a JSON object (write-only — values are never read back).",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "vaultName": str_prop("Vault name"),
-                    "entriesJson": str_prop("JSON object of key -> value to store"),
-                },
-                "required": ["vaultName", "entriesJson"]
-            }),
-        },
-        Tool {
-            name: "vault_export",
-            description: "Export secrets to a plaintext file. BLOCKED for agents — exporting would expose values. Run 'vaultly export' as a human instead.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "vaultName": str_prop("Vault name"),
-                    "file": str_prop("Output file path"),
-                },
-                "required": ["vaultName", "file"]
-            }),
-        },
-        Tool {
-            name: "vault_export_encrypted",
-            description: "Export a vault as an encrypted, portable blob (AES-256-GCM with embedded salt). Safe for agents — no plaintext values are exposed. The blob can be imported by any vaultly instance with the same master password.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "vaultName": str_prop("Vault name"),
-                    "file": str_prop("Output file path for the encrypted blob"),
-                },
-                "required": ["vaultName", "file"]
-            }),
-        },
-        Tool {
-            name: "vault_import_encrypted",
-            description: "Import an encrypted export blob (from vault_export_encrypted) into a target vault. The blob is decrypted with the master password + embedded salt, then re-encrypted under the local store.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "file": str_prop("Path to the encrypted export blob"),
-                    "vaultName": str_prop("Target vault name (defaults to 'imported')"),
-                },
-                "required": ["file"]
-            }),
-        },
-        Tool {
-            name: "policy_info",
-            description: "Show Vaultly's agent security policy and session limits.",
-            schema: json!({ "type": "object", "properties": {} }),
-        },
-        Tool {
-            name: "vault_policy",
-            description: "Show the loaded per-agent security policy (vault allowlists, per-vault roles, rate limits) for every configured agent.",
-            schema: json!({ "type": "object", "properties": {} }),
-        },
-        Tool {
-            name: "cf_cache_purge",
-            description: "Purge a zone's cache. Either purgeEverything=true, or target specific URLs/files/tags.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "vaultName": str_prop("Vault with CF credentials"),
-                    "zoneId": str_prop("Zone ID"),
-                    "purgeEverything": json!({ "type": "boolean", "description": "Purge the entire cache (default false)" }),
-                    "urls": json!({ "type": "array", "items": { "type": "string" }, "description": "URLs to purge" }),
-                    "files": json!({ "type": "array", "items": { "type": "string" }, "description": "Asset paths to purge" }),
-                    "tags": json!({ "type": "array", "items": { "type": "string" }, "description": "Cache tags to purge" }),
-                },
-                "required": ["vaultName", "zoneId"]
-            }),
-        },
-        Tool {
-            name: "cf_r2_buckets",
-            description: "List R2 buckets in the account.",
-            schema: json!({ "type": "object", "properties": { "vaultName": str_prop("Vault with CLOUDFLARE_ACCOUNT_ID + auth") }, "required": ["vaultName"] }),
-        },
-        Tool {
-            name: "cf_r2_objects",
-            description: "List objects in an R2 bucket.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "vaultName": str_prop("Vault with CLOUDFLARE_ACCOUNT_ID + auth"),
-                    "bucket": str_prop("R2 bucket name"),
-                },
-                "required": ["vaultName", "bucket"]
-            }),
-        },
-        Tool {
-            name: "cf_r2_object_put",
-            description: "Write an object to an R2 bucket (the given value becomes the object body).",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "vaultName": str_prop("Vault with CLOUDFLARE_ACCOUNT_ID + auth"),
-                    "bucket": str_prop("R2 bucket name"),
-                    "key": str_prop("Object key"),
-                    "value": str_prop("Object content"),
-                },
-                "required": ["vaultName", "bucket", "key", "value"]
-            }),
-        },
-        Tool {
-            name: "cf_r2_object_get",
-            description: "Read an object from an R2 bucket.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "vaultName": str_prop("Vault with CLOUDFLARE_ACCOUNT_ID + auth"),
-                    "bucket": str_prop("R2 bucket name"),
-                    "key": str_prop("Object key"),
-                },
-                "required": ["vaultName", "bucket", "key"]
-            }),
-        },
-        Tool {
-            name: "cf_r2_object_delete",
-            description: "Delete an object from an R2 bucket.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "vaultName": str_prop("Vault with CLOUDFLARE_ACCOUNT_ID + auth"),
-                    "bucket": str_prop("R2 bucket name"),
-                    "key": str_prop("Object key"),
-                },
-                "required": ["vaultName", "bucket", "key"]
-            }),
-        },
-        Tool {
-            name: "cf_kv_namespaces",
-            description: "List KV namespaces in the account.",
-            schema: json!({ "type": "object", "properties": { "vaultName": str_prop("Vault with CLOUDFLARE_ACCOUNT_ID + auth") }, "required": ["vaultName"] }),
-        },
-        Tool {
-            name: "cf_kv_keys",
-            description: "List keys in a KV namespace.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "vaultName": str_prop("Vault with CLOUDFLARE_ACCOUNT_ID + auth"),
-                    "namespaceId": str_prop("KV namespace ID"),
-                },
-                "required": ["vaultName", "namespaceId"]
-            }),
-        },
-        Tool {
-            name: "cf_kv_put",
-            description: "Write a value to a KV key.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "vaultName": str_prop("Vault with CLOUDFLARE_ACCOUNT_ID + auth"),
-                    "namespaceId": str_prop("KV namespace ID"),
-                    "key": str_prop("KV key"),
-                    "value": str_prop("Value to store"),
-                },
-                "required": ["vaultName", "namespaceId", "key", "value"]
-            }),
-        },
-        Tool {
-            name: "cf_kv_get",
-            description: "Read the value of a KV key.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "vaultName": str_prop("Vault with CLOUDFLARE_ACCOUNT_ID + auth"),
-                    "namespaceId": str_prop("KV namespace ID"),
-                    "key": str_prop("KV key"),
-                },
-                "required": ["vaultName", "namespaceId", "key"]
-            }),
-        },
-        Tool {
-            name: "cf_kv_delete",
-            description: "Delete a KV key.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "vaultName": str_prop("Vault with CLOUDFLARE_ACCOUNT_ID + auth"),
-                    "namespaceId": str_prop("KV namespace ID"),
-                    "key": str_prop("KV key"),
-                },
-                "required": ["vaultName", "namespaceId", "key"]
-            }),
-        },
-        Tool {
-            name: "cf_d1_databases",
-            description: "List D1 databases in the account.",
-            schema: json!({ "type": "object", "properties": { "vaultName": str_prop("Vault with CLOUDFLARE_ACCOUNT_ID + auth") }, "required": ["vaultName"] }),
-        },
-        Tool {
-            name: "cf_d1_info",
-            description: "Get info about a D1 database.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "vaultName": str_prop("Vault with CLOUDFLARE_ACCOUNT_ID + auth"),
-                    "databaseId": str_prop("D1 database ID"),
-                },
-                "required": ["vaultName", "databaseId"]
-            }),
-        },
-        Tool {
-            name: "cf_d1_query",
-            description: "Run a SQL query against a D1 database.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "vaultName": str_prop("Vault with CLOUDFLARE_ACCOUNT_ID + auth"),
-                    "databaseId": str_prop("D1 database ID"),
-                    "sql": str_prop("SQL statement"),
-                },
-                "required": ["vaultName", "databaseId", "sql"]
-            }),
-        },
-        Tool {
-            name: "cf_pages_projects",
-            description: "List Cloudflare Pages projects in the account.",
-            schema: json!({ "type": "object", "properties": { "vaultName": str_prop("Vault with CLOUDFLARE_ACCOUNT_ID + auth") }, "required": ["vaultName"] }),
-        },
-        Tool {
-            name: "cf_pages_deploy",
-            description: "Deploy a static site to a Cloudflare Pages project via wrangler.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "vaultName": str_prop("Vault with CLOUDFLARE_ACCOUNT_ID + auth"),
-                    "project": str_prop("Pages project name"),
-                    "projectDir": str_prop("Directory containing the built site"),
-                    "extraArgs": str_prop("Extra wrangler arguments"),
-                },
-                "required": ["vaultName", "project", "projectDir"]
-            }),
-        },
-        Tool {
-            name: "cf_worker_bindings",
-            description: "List bindings (KV, D1, R2, secrets, etc.) of a Worker script.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "vaultName": str_prop("Vault with CLOUDFLARE_ACCOUNT_ID + auth"),
-                    "scriptName": str_prop("Worker script name"),
-                },
-                "required": ["vaultName", "scriptName"]
-            }),
-        },
-        Tool {
-            name: "cf_worker_triggers",
-            description: "List triggers (including scheduled/cron) of a Worker script.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "vaultName": str_prop("Vault with CLOUDFLARE_ACCOUNT_ID + auth"),
-                    "scriptName": str_prop("Worker script name"),
-                },
-                "required": ["vaultName", "scriptName"]
-            }),
-        },
-        Tool {
-            name: "cf_ssl_settings",
-            description: "Get a zone's SSL settings.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "vaultName": str_prop("Vault with CF credentials"),
-                    "zoneId": str_prop("Zone ID"),
-                },
-                "required": ["vaultName", "zoneId"]
-            }),
-        },
-        Tool {
-            name: "cf_certificates",
-            description: "List custom SSL certificates for a zone.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "vaultName": str_prop("Vault with CF credentials"),
-                    "zoneId": str_prop("Zone ID"),
-                },
-                "required": ["vaultName", "zoneId"]
-            }),
-        },
-        Tool {
-            name: "cf_certificate_order",
-            description: "Order an advanced SSL certificate pack for a zone.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "vaultName": str_prop("Vault with CF credentials"),
-                    "zoneId": str_prop("Zone ID"),
-                    "hosts": json!({ "type": "array", "items": { "type": "string" }, "description": "Hostnames to cover" }),
-                    "validationMethod": str_prop("Validation method (txt, http, email)"),
-                    "certificateAuthority": str_prop("CA (lets_encrypt, google, ...)"),
-                },
-                "required": ["vaultName", "zoneId"]
-            }),
-        },
-        Tool {
-            name: "cf_firewall_rules",
-            description: "List firewall rules for a zone.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "vaultName": str_prop("Vault with CF credentials"),
-                    "zoneId": str_prop("Zone ID"),
-                },
-                "required": ["vaultName", "zoneId"]
-            }),
-        },
-        Tool {
-            name: "cf_firewall_rule_create",
-            description: "Create a firewall rule for a zone (expression + action).",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "vaultName": str_prop("Vault with CF credentials"),
-                    "zoneId": str_prop("Zone ID"),
-                    "expression": str_prop("WAF expression, e.g. (ip.src eq 1.2.3.4)"),
-                    "action": str_prop("Action: block, challenge, js_challenge, allow, log"),
-                    "description": str_prop("Optional description"),
-                },
-                "required": ["vaultName", "zoneId", "expression", "action"]
-            }),
-        },
-        Tool {
-            name: "cf_firewall_rule_delete",
-            description: "Delete a firewall rule from a zone.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "vaultName": str_prop("Vault with CF credentials"),
-                    "zoneId": str_prop("Zone ID"),
-                    "ruleId": str_prop("Firewall rule ID"),
-                },
-                "required": ["vaultName", "zoneId", "ruleId"]
-            }),
-        },
-        Tool {
-            name: "cf_lb_pools",
-            description: "List load balancer pools in the account.",
-            schema: json!({ "type": "object", "properties": { "vaultName": str_prop("Vault with CLOUDFLARE_ACCOUNT_ID + auth") }, "required": ["vaultName"] }),
-        },
-        Tool {
-            name: "cf_lb_list",
-            description: "List load balancers in the account.",
-            schema: json!({ "type": "object", "properties": { "vaultName": str_prop("Vault with CLOUDFLARE_ACCOUNT_ID + auth") }, "required": ["vaultName"] }),
-        },
-        Tool {
-            name: "cf_email_settings",
-            description: "Get a zone's email routing settings.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "vaultName": str_prop("Vault with CF credentials"),
-                    "zoneId": str_prop("Zone ID"),
-                },
-                "required": ["vaultName", "zoneId"]
-            }),
-        },
-        Tool {
-            name: "cf_email_rules",
-            description: "List email routing rules for a zone.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "vaultName": str_prop("Vault with CF credentials"),
-                    "zoneId": str_prop("Zone ID"),
-                },
-                "required": ["vaultName", "zoneId"]
-            }),
-        },
-        Tool {
-            name: "cf_email_rule_create",
-            description: "Create an email routing rule for a zone.",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "vaultName": str_prop("Vault with CF credentials"),
-                    "zoneId": str_prop("Zone ID"),
-                    "action": str_prop("Action: forward, drop, send"),
-                    "value": str_prop("Destination address for forward/send"),
-                    "enabled": json!({ "type": "boolean", "description": "Rule enabled (default true)" }),
-                },
-                "required": ["vaultName", "zoneId", "action"]
-            }),
-        },
+        Tool { name: "vault_list", description: "List vault names. No values.", schema: json!({"type":"object","properties":{}}) },
+        Tool { name: "vault_keys", description: "List credential key names and expiry metadata. No values.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Vault name")},"required":["vaultName"]}) },
+        Tool { name: "vault_add", description: "Write a credential into an encrypted vault. The value is never returned.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Vault name"),"key":str_prop("Credential name"),"value":str_prop("Credential value"),"ttlSeconds":json!({"type":"number"}),"expiresAt":str_prop("RFC3339 expiry")},"required":["vaultName","key","value"]}) },
+        Tool { name: "vault_delete", description: "Delete one credential from a vault.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Vault name"),"key":str_prop("Credential name")},"required":["vaultName","key"]}) },
+        Tool { name: "vault_import", description: "Import credentials as a write-only JSON object.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Vault name"),"entriesJson":str_prop("JSON object of credentials")},"required":["vaultName","entriesJson"]}) },
+        Tool { name: "vault_export_encrypted", description: "Export an encrypted vault blob without plaintext.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Vault name"),"file":str_prop("Output file")},"required":["vaultName","file"]}) },
+        Tool { name: "vault_import_encrypted", description: "Import an encrypted vault blob without exposing values.", schema: json!({"type":"object","properties":{"file":str_prop("Encrypted export file"),"vaultName":str_prop("Destination vault")},"required":["file"]}) },
+        Tool { name: "vault_generate", description: "Generate and store a credential without returning its value.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Vault name"),"key":str_prop("Credential name"),"length":json!({"type":"number"}),"symbols":json!({"type":"boolean"})},"required":["vaultName","key"]}) },
+        Tool { name: "vault_rotate", description: "Rotate one credential or all expired credentials without returning values.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Vault name"),"key":str_prop("Credential name"),"expired":json!({"type":"boolean"}),"length":json!({"type":"number"}),"symbols":json!({"type":"boolean"})},"required":["vaultName"]}) },
+        Tool { name: "vault_status", description: "Show lock/session status and vault names.", schema: json!({"type":"object","properties":{}}) },
+        Tool { name: "vault_lock", description: "Lock Vaultly and wipe the in-memory key.", schema: json!({"type":"object","properties":{}}) },
+        Tool { name: "vault_unlock", description: "Unlock through macOS Keychain; the agent never handles the password.", schema: json!({"type":"object","properties":{}}) },
+        Tool { name: "vault_audit", description: "Read the tamper-evident audit trail without values.", schema: json!({"type":"object","properties":{"lines":json!({"type":"number"}),"vault":str_prop("Filter"),"caller":str_prop("human or agent"),"after":str_prop("RFC3339 timestamp")}}) },
+        Tool { name: "vault_meta", description: "Inspect vault metadata and credential names without values.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Vault name")},"required":["vaultName"]}) },
+        Tool { name: "cf_accounts", description: "List configured Cloudflare accounts and health, never credentials.", schema: json!({"type":"object","properties":{"health":json!({"type":"boolean"})}}) },
+        Tool { name: "cf_account_label", description: "Read or set a non-secret Cloudflare account label.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault"),"label":str_prop("Label; omit to read, empty to clear")},"required":["vaultName"]}) },
+        Tool { name: "cf_health", description: "Verify one Cloudflare credential set.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault")},"required":["vaultName"]}) },
+        Tool { name: "cf_zones", description: "List domains in a Cloudflare account.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault")},"required":["vaultName"]}) },
+        Tool { name: "cf_pages_projects", description: "List Pages projects for discovery; deployment requires a registered target.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault")},"required":["vaultName"]}) },
+        Tool { name: "cf_workers_list", description: "List Workers for discovery; deployment requires a registered target.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault")},"required":["vaultName"]}) },
+        Tool { name: "cf_secrets", description: "List/set/delete Worker secrets. Values are write-only.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault"),"scriptName":str_prop("Worker name"),"action":json!({"type":"string","enum":["list","set","delete"]}),"name":str_prop("Secret name"),"value":str_prop("Secret value; write-only")},"required":["vaultName","scriptName","action"]}) },
+        Tool { name: "deploy_targets", description: "List human-approved deployment targets. Metadata only.", schema: json!({"type":"object","properties":{}}) },
+        Tool { name: "deploy_target", description: "Deploy one approved target by ID. The agent cannot choose account, project, branch, directory, or command.", schema: json!({"type":"object","properties":{"targetId":str_prop("Registered deployment target ID")},"required":["targetId"]}) },
+        Tool { name: "policy_info", description: "Show effective agent operation policy without secrets.", schema: json!({"type":"object","properties":{}}) },
     ]
 }
-
-fn pretty(v: &Value) -> String {
-    serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
-}
-
-fn account_id(engine: &mut VaultEngine, vault: &str) -> Result<String, VaultError> {
-    engine.cf_account_id(vault)
-}
-
-// ─── Cache Purge ─────────────────────────────────────────
-
-async fn tool_cf_cache_purge(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
-    require!(args, vault => "vaultName", zone => "zoneId");
-    let purge_everything = args
-        .get("purgeEverything")
-        .and_then(|b| b.as_bool())
-        .unwrap_or(false);
-    let urls = args.get("urls").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-    let files = args.get("files").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-    let tags = args.get("tags").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-    let body = if purge_everything {
-        json!({ "purge_everything": true })
-    } else {
-        let mut m = Map::new();
-        if !urls.is_empty() {
-            m.insert("urls".into(), Value::Array(urls));
-        }
-        if !files.is_empty() {
-            m.insert("files".into(), Value::Array(files));
-        }
-        if !tags.is_empty() {
-            m.insert("tags".into(), Value::Array(tags));
-        }
-        Value::Object(m)
-    };
-    match engine
-        .cloudflare_api(vault, "POST", &format!("/zones/{}/purge_cache", zone), Some(body), Some(ctx))
-        .await
-    {
-        Ok(r) => ok(format!("Cache purge submitted (HTTP {}).", r.status)),
-        Err(e) => fail_err(&e),
-    }
-}
-
 // ─── R2 Object Storage ───────────────────────────────────
-
-async fn tool_cf_r2_buckets(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
-    require!(args, vault => "vaultName");
-    match engine.cloudflare_account_api(vault, "GET", "/r2/buckets", None, Some(ctx)).await {
-        Ok(r) => {
-            let names: Vec<String> = r
-                .data
-                .get("result")
-                .and_then(|x| x.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|b| b.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
-                        .collect()
-                })
-                .unwrap_or_default();
-            ok(format!(
-                "R2 buckets ({}):\n{}",
-                names.len(),
-                names.iter().map(|n| format!("  - {}", n)).collect::<Vec<_>>().join("\n")
-            ))
-        }
-        Err(e) => fail_err(&e),
-    }
-}
-
-async fn tool_cf_r2_objects(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
-    require!(args, vault => "vaultName", bucket => "bucket");
-    let path = format!("/r2/buckets/{}/objects", urlencode(bucket));
-    match engine.cloudflare_account_api(vault, "GET", &path, None, Some(ctx)).await {
-        Ok(r) => ok(format!("Objects in '{}':\n{}", bucket, pretty(&r.data))),
-        Err(e) => fail_err(&e),
-    }
-}
-
-async fn tool_cf_r2_object_put(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
-    require!(args, vault => "vaultName", bucket => "bucket", key => "key", value => "value");
-    let account_id = match account_id(engine, vault) {
-        Ok(a) => a,
-        Err(e) => return fail_err(&e),
-    };
-    let path = format!(
-        "/accounts/{}/r2/buckets/{}/objects/{}",
-        urlencode(&account_id),
-        urlencode(bucket),
-        urlencode(key)
-    );
-    match engine.cloudflare_raw(vault, "PUT", &path, Some(value), Some(ctx)).await {
-        Ok(r) => ok(format!("Object '{}' written to '{}' (HTTP {}).", key, bucket, r.status)),
-        Err(e) => fail_err(&e),
-    }
-}
-
-async fn tool_cf_r2_object_get(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
-    require!(args, vault => "vaultName", bucket => "bucket", key => "key");
-    let account_id = match account_id(engine, vault) {
-        Ok(a) => a,
-        Err(e) => return fail_err(&e),
-    };
-    let path = format!(
-        "/accounts/{}/r2/buckets/{}/objects/{}",
-        urlencode(&account_id),
-        urlencode(bucket),
-        urlencode(key)
-    );
-    match engine.cloudflare_raw(vault, "GET", &path, None, Some(ctx)).await {
-        Ok(r) => {
-            if r.status >= 400 {
-                return fail(format!("HTTP {}: {}", r.status, pretty(&r.data)));
-            }
-            let text = r.data.get("raw").and_then(|x| x.as_str()).unwrap_or("");
-            ok(format!("Object '{}':\n{}", key, truncate(text)))
-        }
-        Err(e) => fail_err(&e),
-    }
-}
-
-async fn tool_cf_r2_object_delete(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
-    require!(args, vault => "vaultName", bucket => "bucket", key => "key");
-    let path = format!("/r2/buckets/{}/objects/{}", urlencode(bucket), urlencode(key));
-    match engine.cloudflare_account_api(vault, "DELETE", &path, None, Some(ctx)).await {
-        Ok(r) => ok(format!("Object '{}' deleted from '{}' (HTTP {}).", key, bucket, r.status)),
-        Err(e) => fail_err(&e),
-    }
-}
 
 // ─── KV Storage ──────────────────────────────────────────
 
-async fn tool_cf_kv_namespaces(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
-    require!(args, vault => "vaultName");
-    match engine.cloudflare_account_api(vault, "GET", "/storage/kv/namespaces", None, Some(ctx)).await {
-        Ok(r) => {
-            let names: Vec<String> = r
-                .data
-                .get("result")
-                .and_then(|x| x.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|n| n.get("title").and_then(|t| t.as_str()).map(|s| s.to_string()))
-                        .collect()
-                })
-                .unwrap_or_default();
-            ok(format!(
-                "KV namespaces ({}):\n{}",
-                names.len(),
-                names.iter().map(|n| format!("  - {}", n)).collect::<Vec<_>>().join("\n")
-            ))
-        }
-        Err(e) => fail_err(&e),
-    }
-}
-
-async fn tool_cf_kv_keys(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
-    require!(args, vault => "vaultName", namespace => "namespaceId");
-    let path = format!("/storage/kv/namespaces/{}/keys", namespace);
-    match engine.cloudflare_account_api(vault, "GET", &path, None, Some(ctx)).await {
-        Ok(r) => ok(format!("KV keys:\n{}", pretty(&r.data))),
-        Err(e) => fail_err(&e),
-    }
-}
-
-async fn tool_cf_kv_put(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
-    require!(args, vault => "vaultName", namespace => "namespaceId", key => "key", value => "value");
-    let account_id = match account_id(engine, vault) {
-        Ok(a) => a,
-        Err(e) => return fail_err(&e),
-    };
-    let path = format!(
-        "/accounts/{}/storage/kv/namespaces/{}/keys/{}",
-        urlencode(&account_id),
-        namespace,
-        urlencode(key)
-    );
-    match engine.cloudflare_raw(vault, "PUT", &path, Some(value), Some(ctx)).await {
-        Ok(r) => ok(format!("KV key '{}' written (HTTP {}).", key, r.status)),
-        Err(e) => fail_err(&e),
-    }
-}
-
-async fn tool_cf_kv_get(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
-    require!(args, vault => "vaultName", namespace => "namespaceId", key => "key");
-    let account_id = match account_id(engine, vault) {
-        Ok(a) => a,
-        Err(e) => return fail_err(&e),
-    };
-    let path = format!(
-        "/accounts/{}/storage/kv/namespaces/{}/keys/{}",
-        urlencode(&account_id),
-        namespace,
-        urlencode(key)
-    );
-    match engine.cloudflare_raw(vault, "GET", &path, None, Some(ctx)).await {
-        Ok(r) => {
-            if r.status >= 400 {
-                return fail(format!("HTTP {}: {}", r.status, pretty(&r.data)));
-            }
-            let text = r.data.get("raw").and_then(|x| x.as_str()).unwrap_or("");
-            ok(format!("KV '{}':\n{}", key, truncate(text)))
-        }
-        Err(e) => fail_err(&e),
-    }
-}
-
-async fn tool_cf_kv_delete(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
-    require!(args, vault => "vaultName", namespace => "namespaceId", key => "key");
-    let path = format!("/storage/kv/namespaces/{}/keys/{}", namespace, urlencode(key));
-    match engine.cloudflare_account_api(vault, "DELETE", &path, None, Some(ctx)).await {
-        Ok(r) => ok(format!("KV key '{}' deleted (HTTP {}).", key, r.status)),
-        Err(e) => fail_err(&e),
-    }
-}
-
 // ─── D1 Database ─────────────────────────────────────────
-
-async fn tool_cf_d1_databases(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
-    require!(args, vault => "vaultName");
-    match engine.cloudflare_account_api(vault, "GET", "/d1/database", None, Some(ctx)).await {
-        Ok(r) => {
-            let names: Vec<String> = r
-                .data
-                .get("result")
-                .and_then(|x| x.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|d| d.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
-                        .collect()
-                })
-                .unwrap_or_default();
-            ok(format!(
-                "D1 databases ({}):\n{}",
-                names.len(),
-                names.iter().map(|n| format!("  - {}", n)).collect::<Vec<_>>().join("\n")
-            ))
-        }
-        Err(e) => fail_err(&e),
-    }
-}
-
-async fn tool_cf_d1_info(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
-    require!(args, vault => "vaultName", database => "databaseId");
-    let path = format!("/d1/database/{}", database);
-    match engine.cloudflare_account_api(vault, "GET", &path, None, Some(ctx)).await {
-        Ok(r) => ok(pretty(&r.data)),
-        Err(e) => fail_err(&e),
-    }
-}
-
-async fn tool_cf_d1_query(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
-    require!(args, vault => "vaultName", database => "databaseId", sql => "sql");
-    let path = format!("/d1/database/{}/query", database);
-    let body = json!({ "sql": sql });
-    match engine.cloudflare_account_api(vault, "POST", &path, Some(body), Some(ctx)).await {
-        Ok(r) => {
-            if r.status >= 400 {
-                return fail(format!("Query failed (HTTP {}): {}", r.status, pretty(&r.data)));
-            }
-            ok(format!("Query result:\n{}", pretty(&r.data)))
-        }
-        Err(e) => fail_err(&e),
-    }
-}
 
 // ─── Cloudflare Pages ────────────────────────────────────
 
-async fn tool_cf_pages_projects(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
+async fn tool_cf_pages_projects(
+    engine: &mut VaultEngine,
+    args: &Value,
+    ctx: &CallerContext,
+) -> Value {
     require!(args, vault => "vaultName");
-    match engine.cloudflare_account_api(vault, "GET", "/pages/projects", None, Some(ctx)).await {
+    match engine
+        .cloudflare_account_api(vault, "GET", "/pages/projects", None, Some(ctx))
+        .await
+    {
         Ok(r) => {
             let names: Vec<String> = r
                 .data
@@ -1099,185 +187,66 @@ async fn tool_cf_pages_projects(engine: &mut VaultEngine, args: &Value, ctx: &Ca
                 .and_then(|x| x.as_array())
                 .map(|arr| {
                     arr.iter()
-                        .filter_map(|p| p.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+                        .filter_map(|p| {
+                            p.get("name")
+                                .and_then(|n| n.as_str())
+                                .map(|s| s.to_string())
+                        })
                         .collect()
                 })
                 .unwrap_or_default();
             ok(format!(
                 "Pages projects ({}):\n{}",
                 names.len(),
-                names.iter().map(|n| format!("  - {}", n)).collect::<Vec<_>>().join("\n")
+                names
+                    .iter()
+                    .map(|n| format!("  - {}", n))
+                    .collect::<Vec<_>>()
+                    .join("\n")
             ))
         }
         Err(e) => fail_err(&e),
     }
 }
 
-async fn tool_cf_pages_deploy(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
-    require!(args, vault => "vaultName", project => "project", dir => "projectDir");
-    let extra = args.get("extraArgs").and_then(|a| a.as_str()).unwrap_or("");
-    let mut cmd = format!("npx wrangler pages deploy {} --project-name={}", dir, project);
-    if !extra.is_empty() {
-        cmd = format!("{} {}", cmd, extra);
+async fn tool_deploy_targets(engine: &mut VaultEngine, _ctx: &CallerContext) -> Value {
+    match engine.store().load_deployment_targets() {
+        Ok(targets) => json!({
+            "content": [{ "type": "text", "text": serde_json::to_string_pretty(&targets).unwrap_or_else(|_| "[]".into()) }],
+            "targets": targets,
+        }),
+        Err(e) => fail_err(&e),
     }
-    let opts = RunOptions {
-        cwd: Some(dir),
-        timeout_ms: Some(RUN_TIMEOUT_MS),
-        allowed_keys: None,
+}
+
+async fn tool_deploy_target(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
+    require!(args, target_id => "targetId");
+    let targets = match engine.store().load_deployment_targets() {
+        Ok(targets) => targets,
+        Err(e) => return fail_err(&e),
     };
-    match engine.run_command(vault, &cmd, &opts, Some(ctx)).await {
-        Ok(result) => {
-            let text = format!(
-                "Pages deploy: {}\nDir: {}\nExit: {}\n{}\n{}\n{}",
-                cmd,
-                dir,
-                result.code,
-                if result.scrubbed { "⚠ Output scrubbed\n" } else { "" },
-                truncate(&result.stdout),
-                if result.stderr.is_empty() {
-                    String::new()
-                } else {
-                    format!("\nSTDERR:\n{}", truncate(&result.stderr))
-                }
-            );
-            json!({ "content": [{ "type": "text", "text": text }], "isError": result.code != 0 })
-        }
+    let target = match targets.into_iter().find(|target| target.id == target_id) {
+        Some(target) => target,
+        None => return fail(format!("Deployment target '{}' was not found", target_id)),
+    };
+    match engine.deploy_target(&target, Some(ctx)).await {
+        Ok(result) => json!({
+            "content": [{ "type": "text", "text": serde_json::to_string(&result).unwrap_or_else(|_| "{}".into()) }],
+            "deployment": result,
+        }),
         Err(e) => fail_err(&e),
     }
 }
 
 // ─── Workers bindings / triggers ─────────────────────────
 
-async fn tool_cf_worker_bindings(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
-    require!(args, vault => "vaultName", script => "scriptName");
-    let path = format!("/workers/scripts/{}/bindings", urlencode(script));
-    match engine.cloudflare_account_api(vault, "GET", &path, None, Some(ctx)).await {
-        Ok(r) => ok(format!("Bindings for '{}':\n{}", script, pretty(&r.data))),
-        Err(e) => fail_err(&e),
-    }
-}
-
-async fn tool_cf_worker_triggers(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
-    require!(args, vault => "vaultName", script => "scriptName");
-    let path = format!("/workers/scripts/{}/triggers", urlencode(script));
-    match engine.cloudflare_account_api(vault, "GET", &path, None, Some(ctx)).await {
-        Ok(r) => ok(format!("Triggers for '{}':\n{}", script, pretty(&r.data))),
-        Err(e) => fail_err(&e),
-    }
-}
-
 // ─── SSL / certificates ──────────────────────────────────
-
-async fn tool_cf_ssl_settings(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
-    require!(args, vault => "vaultName", zone => "zoneId");
-    match engine.cloudflare_api(vault, "GET", &format!("/zones/{}/settings/ssl", zone), None, Some(ctx)).await {
-        Ok(r) => ok(pretty(&r.data)),
-        Err(e) => fail_err(&e),
-    }
-}
-
-async fn tool_cf_certificates(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
-    require!(args, vault => "vaultName", zone => "zoneId");
-    match engine.cloudflare_api(vault, "GET", &format!("/zones/{}/custom_certificates", zone), None, Some(ctx)).await {
-        Ok(r) => ok(format!("Custom certificates:\n{}", pretty(&r.data))),
-        Err(e) => fail_err(&e),
-    }
-}
-
-async fn tool_cf_certificate_order(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
-    require!(args, vault => "vaultName", zone => "zoneId");
-    let body = json!({
-        "type": "advanced",
-        "hosts": args.get("hosts").and_then(|h| h.as_array()).cloned().unwrap_or_default(),
-        "validation_method": args.get("validationMethod").and_then(|s| s.as_str()).unwrap_or("txt"),
-        "certificate_authority": args.get("certificateAuthority").and_then(|s| s.as_str()).unwrap_or("lets_encrypt"),
-    });
-    match engine.cloudflare_api(vault, "POST", &format!("/zones/{}/ssl/certificate_packs", zone), Some(body), Some(ctx)).await {
-        Ok(r) => ok(format!("Certificate order submitted (HTTP {}).", r.status)),
-        Err(e) => fail_err(&e),
-    }
-}
 
 // ─── WAF / firewall rules ────────────────────────────────
 
-async fn tool_cf_firewall_rules(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
-    require!(args, vault => "vaultName", zone => "zoneId");
-    match engine.cloudflare_api(vault, "GET", &format!("/zones/{}/firewall/rules", zone), None, Some(ctx)).await {
-        Ok(r) => ok(format!("Firewall rules:\n{}", pretty(&r.data))),
-        Err(e) => fail_err(&e),
-    }
-}
-
-async fn tool_cf_firewall_rule_create(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
-    require!(args, vault => "vaultName", zone => "zoneId", expression => "expression", action => "action");
-    let body = json!({
-        "expression": expression,
-        "action": action,
-        "description": args.get("description").and_then(|s| s.as_str()).unwrap_or(""),
-    });
-    match engine.cloudflare_api(vault, "POST", &format!("/zones/{}/firewall/rules", zone), Some(body), Some(ctx)).await {
-        Ok(r) => ok(format!("Firewall rule created (HTTP {}).", r.status)),
-        Err(e) => fail_err(&e),
-    }
-}
-
-async fn tool_cf_firewall_rule_delete(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
-    require!(args, vault => "vaultName", zone => "zoneId", rule => "ruleId");
-    match engine.cloudflare_api(vault, "DELETE", &format!("/zones/{}/firewall/rules/{}", zone, rule), None, Some(ctx)).await {
-        Ok(r) => ok(format!("Firewall rule '{}' deleted (HTTP {}).", rule, r.status)),
-        Err(e) => fail_err(&e),
-    }
-}
-
 // ─── Load balancers ──────────────────────────────────────
 
-async fn tool_cf_lb_pools(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
-    require!(args, vault => "vaultName");
-    match engine.cloudflare_account_api(vault, "GET", "/load_balancers/pools", None, Some(ctx)).await {
-        Ok(r) => ok(format!("Load balancer pools:\n{}", pretty(&r.data))),
-        Err(e) => fail_err(&e),
-    }
-}
-
-async fn tool_cf_lb_list(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
-    require!(args, vault => "vaultName");
-    match engine.cloudflare_account_api(vault, "GET", "/load_balancers/load_balancers", None, Some(ctx)).await {
-        Ok(r) => ok(format!("Load balancers:\n{}", pretty(&r.data))),
-        Err(e) => fail_err(&e),
-    }
-}
-
 // ─── Email routing ───────────────────────────────────────
-
-async fn tool_cf_email_settings(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
-    require!(args, vault => "vaultName", zone => "zoneId");
-    match engine.cloudflare_api(vault, "GET", &format!("/zones/{}/email/routing", zone), None, Some(ctx)).await {
-        Ok(r) => ok(pretty(&r.data)),
-        Err(e) => fail_err(&e),
-    }
-}
-
-async fn tool_cf_email_rules(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
-    require!(args, vault => "vaultName", zone => "zoneId");
-    match engine.cloudflare_api(vault, "GET", &format!("/zones/{}/email/routing/rules", zone), None, Some(ctx)).await {
-        Ok(r) => ok(format!("Email routing rules:\n{}", pretty(&r.data))),
-        Err(e) => fail_err(&e),
-    }
-}
-
-async fn tool_cf_email_rule_create(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
-    require!(args, vault => "vaultName", zone => "zoneId", action => "action");
-    let value = args.get("value").and_then(|s| s.as_str()).unwrap_or("");
-    let body = json!({
-        "matchers": [{ "type": "all" }],
-        "actions": [{ "type": action, "value": [value] }],
-        "enabled": args.get("enabled").and_then(|b| b.as_bool()).unwrap_or(true),
-    });
-    match engine.cloudflare_api(vault, "POST", &format!("/zones/{}/email/routing/rules", zone), Some(body), Some(ctx)).await {
-        Ok(r) => ok(format!("Email routing rule created (HTTP {}).", r.status)),
-        Err(e) => fail_err(&e),
-    }
-}
 
 async fn call_tool(engine: &mut VaultEngine, name: &str, args: &Value) -> Value {
     let ctx = agent_ctx();
@@ -1286,68 +255,34 @@ async fn call_tool(engine: &mut VaultEngine, name: &str, args: &Value) -> Value 
         "vault_keys" => tool_vault_keys(engine, args, &ctx).await,
         "vault_add" => tool_vault_add(engine, args, &ctx).await,
         "vault_delete" => tool_vault_delete(engine, args, &ctx).await,
-        "vault_run" => tool_vault_run(engine, args, &ctx).await,
+        "vault_import" => tool_vault_import(engine, args, &ctx).await,
+        "vault_export_encrypted" => tool_vault_export_encrypted(engine, args, &ctx).await,
+        "vault_import_encrypted" => tool_vault_import_encrypted(engine, args, &ctx).await,
+        "vault_generate" => tool_vault_generate(engine, args, &ctx).await,
+        "vault_rotate" => tool_vault_rotate(engine, args, &ctx).await,
         "vault_status" => tool_vault_status(engine).await,
         "vault_lock" => tool_vault_lock(engine, &ctx).await,
         "vault_unlock" => tool_vault_unlock(engine).await,
         "vault_audit" => tool_vault_audit(engine, args, &ctx).await,
+        "vault_meta" => tool_vault_meta(engine, args, &ctx).await,
         "cf_accounts" => tool_cf_accounts(engine, args, &ctx).await,
         "cf_account_label" => tool_cf_account_label(engine, args, &ctx).await,
-        "cf_api" => tool_cf_api(engine, args, &ctx).await,
+        "cf_health" => tool_cf_health(engine, args, &ctx).await,
         "cf_zones" => tool_cf_zones(engine, args, &ctx).await,
-        "cf_dns_list" => tool_cf_dns_list(engine, args, &ctx).await,
-        "cf_dns_upsert" => tool_cf_dns_upsert(engine, args, &ctx).await,
+        "cf_pages_projects" => tool_cf_pages_projects(engine, args, &ctx).await,
         "cf_workers_list" => tool_cf_workers_list(engine, args, &ctx).await,
         "cf_secrets" => tool_cf_secrets(engine, args, &ctx).await,
-        "cf_deploy" => tool_cf_deploy(engine, args, &ctx).await,
-        "cf_health" => tool_cf_health(engine, args, &ctx).await,
-        "vault_meta" => tool_vault_meta(engine, args, &ctx).await,
-        "template_list" => tool_template_list(engine, &ctx).await,
-        "template_apply" => tool_template_apply(engine, args, &ctx).await,
-        "cf_dns_delete" => tool_cf_dns_delete(engine, args, &ctx).await,
-        "cf_workers_versions" => tool_cf_workers_versions(engine, args, &ctx).await,
-        "vault_generate" => tool_vault_generate(engine, args, &ctx).await,
-        "vault_rotate" => tool_vault_rotate(engine, args, &ctx).await,
-        "vault_import" => tool_vault_import(engine, args, &ctx).await,
-        "vault_export" => tool_vault_export(engine, args, &ctx).await,
-        "vault_export_encrypted" => tool_vault_export_encrypted(engine, args, &ctx).await,
-        "vault_import_encrypted" => tool_vault_import_encrypted(engine, args, &ctx).await,
+        "deploy_targets" => tool_deploy_targets(engine, &ctx).await,
+        "deploy_target" => tool_deploy_target(engine, args, &ctx).await,
         "policy_info" => tool_policy_info().await,
-        "vault_policy" => tool_vault_policy(engine).await,
-        "cf_cache_purge" => tool_cf_cache_purge(engine, args, &ctx).await,
-        "cf_r2_buckets" => tool_cf_r2_buckets(engine, args, &ctx).await,
-        "cf_r2_objects" => tool_cf_r2_objects(engine, args, &ctx).await,
-        "cf_r2_object_put" => tool_cf_r2_object_put(engine, args, &ctx).await,
-        "cf_r2_object_get" => tool_cf_r2_object_get(engine, args, &ctx).await,
-        "cf_r2_object_delete" => tool_cf_r2_object_delete(engine, args, &ctx).await,
-        "cf_kv_namespaces" => tool_cf_kv_namespaces(engine, args, &ctx).await,
-        "cf_kv_keys" => tool_cf_kv_keys(engine, args, &ctx).await,
-        "cf_kv_put" => tool_cf_kv_put(engine, args, &ctx).await,
-        "cf_kv_get" => tool_cf_kv_get(engine, args, &ctx).await,
-        "cf_kv_delete" => tool_cf_kv_delete(engine, args, &ctx).await,
-        "cf_d1_databases" => tool_cf_d1_databases(engine, args, &ctx).await,
-        "cf_d1_info" => tool_cf_d1_info(engine, args, &ctx).await,
-        "cf_d1_query" => tool_cf_d1_query(engine, args, &ctx).await,
-        "cf_pages_projects" => tool_cf_pages_projects(engine, args, &ctx).await,
-        "cf_pages_deploy" => tool_cf_pages_deploy(engine, args, &ctx).await,
-        "cf_worker_bindings" => tool_cf_worker_bindings(engine, args, &ctx).await,
-        "cf_worker_triggers" => tool_cf_worker_triggers(engine, args, &ctx).await,
-        "cf_ssl_settings" => tool_cf_ssl_settings(engine, args, &ctx).await,
-        "cf_certificates" => tool_cf_certificates(engine, args, &ctx).await,
-        "cf_certificate_order" => tool_cf_certificate_order(engine, args, &ctx).await,
-        "cf_firewall_rules" => tool_cf_firewall_rules(engine, args, &ctx).await,
-        "cf_firewall_rule_create" => tool_cf_firewall_rule_create(engine, args, &ctx).await,
-        "cf_firewall_rule_delete" => tool_cf_firewall_rule_delete(engine, args, &ctx).await,
-        "cf_lb_pools" => tool_cf_lb_pools(engine, args, &ctx).await,
-        "cf_lb_list" => tool_cf_lb_list(engine, args, &ctx).await,
-        "cf_email_settings" => tool_cf_email_settings(engine, args, &ctx).await,
-        "cf_email_rules" => tool_cf_email_rules(engine, args, &ctx).await,
-        "cf_email_rule_create" => tool_cf_email_rule_create(engine, args, &ctx).await,
-        _ => fail(format!("Unknown tool: {}", name)),
+        "vault_run" | "cf_deploy" | "cf_pages_deploy" => {
+            fail("This operation is disabled for agents. Use a human-approved deployment target.")
+        }
+        _ => fail(
+            "Unknown tool or disabled operation. Use tools/list for the supported core interface.",
+        ),
     }
 }
-
-// ─── Vault tools ─────────────────────────────────────────
 
 async fn tool_vault_list(engine: &mut VaultEngine, ctx: &CallerContext) -> Value {
     match engine.list_vaults(Some(ctx)) {
@@ -1359,79 +294,76 @@ async fn tool_vault_list(engine: &mut VaultEngine, ctx: &CallerContext) -> Value
                     "Vaults:\n{}",
                     vaults
                         .iter()
-                        .map(|v| format!("  - {}", v))
+                        .map(|vault| format!("  - {}", vault))
                         .collect::<Vec<_>>()
                         .join("\n")
                 ))
             }
         }
-        Err(e) => fail_err(&e),
+        Err(error) => fail_err(&error),
     }
 }
 
-/// Resolve the optional expiry (RFC 3339) from `ttlSeconds` and/or
-/// `expiresAt` tool arguments. Returns `Err` (rendered as a tool error) if
-/// both are supplied or a TTL value overflows. Values never leak secret data.
 fn expiry_from_args(args: &Value) -> Result<Option<String>, Value> {
-    let ttl = args.get("ttlSeconds").and_then(|v| v.as_u64());
-    let expires = args
+    let ttl = args.get("ttlSeconds").and_then(Value::as_u64);
+    let expires_at = args
         .get("expiresAt")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty());
-    if ttl.is_some() && expires.is_some() {
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    if ttl.is_some() && expires_at.is_some() {
         return Err(fail(
             "ttlSeconds and expiresAt are mutually exclusive — pass only one.",
         ));
     }
-    if let Some(secs) = ttl {
-        return match chrono::Utc::now().checked_add_signed(chrono::Duration::seconds(secs as i64)) {
-            Some(t) => Ok(Some(t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))),
-            None => Err(fail("ttlSeconds is out of range.")),
-        };
+    if let Some(seconds) = ttl {
+        return chrono::Utc::now()
+            .checked_add_signed(chrono::Duration::seconds(seconds as i64))
+            .map(|time| Some(time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)))
+            .ok_or_else(|| fail("ttlSeconds is out of range."));
     }
-    Ok(expires.map(str::to_string))
+    Ok(expires_at.map(str::to_string))
 }
 
 async fn tool_vault_keys(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
     require!(args, vault => "vaultName");
-    let meta = match engine.list_keys_meta(vault, Some(ctx)) {
-        Ok(m) => m,
-        Err(e) => return fail_err(&e),
+    let metadata = match engine.list_keys_meta(vault, Some(ctx)) {
+        Ok(metadata) => metadata,
+        Err(error) => return fail_err(&error),
     };
-    if meta.is_empty() {
+    if metadata.is_empty() {
         return ok(format!("Vault '{}' is empty or doesn't exist.", vault));
     }
-    let mut head = format!("Keys in '{}':\n", vault);
-    for m in &meta {
-        head.push_str(&format!("  - {}\n", m.key));
+    let mut output = format!("Keys in '{}':\n", vault);
+    for item in &metadata {
+        output.push_str(&format!("  - {}\n", item.key));
     }
-    head.push_str("Meta:\n");
-    for m in &meta {
-        let exp = m
+    output.push_str("Meta:\n");
+    for item in &metadata {
+        let expiry = item
             .expires_at
             .as_deref()
-            .map(|s| format!("expiresAt={} expired={}", s, m.expired))
+            .map(|value| format!("expiresAt={} expired={}", value, item.expired))
             .unwrap_or_else(|| "expiresAt=null expired=false".to_string());
-        head.push_str(&format!(
+        output.push_str(&format!(
             "  {}: createdAt={} updatedAt={} {}\n",
-            m.key, m.created_at, m.updated_at, exp
+            item.key, item.created_at, item.updated_at, expiry
         ));
     }
-    ok(head.trim_end())
+    ok(output.trim_end())
 }
 
 async fn tool_vault_add(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
     require!(args, vault => "vaultName", key => "key", value => "value");
     let expiry = match expiry_from_args(args) {
-        Ok(e) => e,
-        Err(v) => return v,
+        Ok(expiry) => expiry,
+        Err(error) => return error,
     };
     match engine.add_secret_with_expiry(vault, key, value, expiry.as_deref(), Some(ctx)) {
         Ok(()) => ok(format!(
             "✓ Stored '{}' in '{}'. Encrypted. Cannot be read back.",
             key, vault
         )),
-        Err(e) => fail_err(&e),
+        Err(error) => fail_err(&error),
     }
 }
 
@@ -1440,88 +372,16 @@ async fn tool_vault_delete(engine: &mut VaultEngine, args: &Value, ctx: &CallerC
     match engine.delete_secret(vault, key, Some(ctx)) {
         Ok(true) => ok(format!("✓ Deleted '{}' from '{}'.", key, vault)),
         Ok(false) => fail(format!("'{}' not found in '{}'.", key, vault)),
-        Err(e) => fail_err(&e),
-    }
-}
-
-async fn tool_vault_run(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
-    require!(args, vault => "vaultName", command => "command");
-    let cwd = args
-        .get("cwd")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty());
-    let force = args.get("force").and_then(|f| f.as_bool()).unwrap_or(false);
-    // Env allowlist: restrict which secrets are injected into the child.
-    let allowlist: Option<Vec<String>> =
-        args.get("allowlist").and_then(|a| a.as_array()).map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        });
-    // Mirror the CLI's expired-secret guard: refuse unless the agent passes
-    // force=true. Uses `None` ctx so the scan doesn't double-audit.
-    if !force {
-        match engine.expired_keys(vault, None) {
-            Ok(expired) if !expired.is_empty() => {
-                return fail(format!(
-                    "{} expired secret(s) in '{}' ({}). Rotate them first (vault_rotate) or set force=true to override.",
-                    expired.len(),
-                    vault,
-                    expired.join(", ")
-                ));
-            }
-            _ => {}
-        }
-    }
-    let opts = RunOptions {
-        cwd,
-        timeout_ms: Some(RUN_TIMEOUT_MS),
-        allowed_keys: allowlist.as_deref(),
-    };
-    match engine.run_command(vault, command, &opts, Some(ctx)).await {
-        Ok(result) => {
-            let injected = if let Some(allowed) = &allowlist {
-                // Report only the allowlisted names that actually exist.
-                let meta = result.secrets_injected.clone();
-                let found: Vec<String> = allowed
-                    .iter()
-                    .filter(|k| meta.iter().any(|m| m == *k))
-                    .cloned()
-                    .collect();
-                found.join(", ")
-            } else {
-                result.secrets_injected.join(", ")
-            };
-            let text = format!(
-                "Command: {}\nInjected: {}\nExit code: {}\n{}\n{}\n{}",
-                command,
-                injected,
-                result.code,
-                if result.scrubbed {
-                    "⚠ Output scrubbed (secret values removed)"
-                } else {
-                    ""
-                },
-                truncate(&result.stdout),
-                if result.stderr.is_empty() {
-                    String::new()
-                } else {
-                    format!("\nSTDERR:\n{}", truncate(&result.stderr))
-                }
-            );
-            json!({ "content": [{ "type": "text", "text": text }], "isError": result.code != 0 })
-        }
-        Err(e) => fail_err(&e),
+        Err(error) => fail_err(&error),
     }
 }
 
 async fn tool_vault_status(engine: &mut VaultEngine) -> Value {
     let vaults = engine.list_vaults(Some(&agent_ctx())).unwrap_or_default();
-    let ttl_min = engine.session_expires_in() / 60;
     ok(format!(
         "Vaultly Status:\n  Unlocked: {} (expires in {} min)\n  Vaults: {} ({})\n  Keychain: {}\n  Platform: {}",
         if engine.is_unlocked() { "yes" } else { "no" },
-        ttl_min,
+        engine.session_expires_in() / 60,
         vaults.len(),
         if vaults.is_empty() { "none".to_string() } else { vaults.join(", ") },
         if keychain::is_keychain_available() { "available" } else { "not available" },
@@ -1539,7 +399,7 @@ async fn tool_vault_unlock(engine: &mut VaultEngine) -> Value {
         return fail("Keychain unavailable. Restart the MCP server to unlock.");
     }
     match keychain::get_from_keychain() {
-        Some(pw) => match engine.unlock(&pw) {
+        Some(password) => match engine.unlock(&password) {
             Ok(()) => ok("✓ Vault unlocked."),
             Err(_) => fail("Keychain password invalid."),
         },
@@ -1696,7 +556,11 @@ async fn tool_cf_accounts(engine: &mut VaultEngine, args: &Value, ctx: &CallerCo
     }
 }
 
-async fn tool_cf_account_label(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
+async fn tool_cf_account_label(
+    engine: &mut VaultEngine,
+    args: &Value,
+    ctx: &CallerContext,
+) -> Value {
     require!(args, vault => "vaultName");
     let label = args.get("label").and_then(|l| l.as_str());
     match label {
@@ -1720,24 +584,6 @@ async fn tool_cf_account_label(engine: &mut VaultEngine, args: &Value, ctx: &Cal
                 Err(e) => fail_err(&e),
             }
         }
-    }
-}
-
-async fn tool_cf_api(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
-    require!(args, vault => "vaultName", method => "method", path => "path");
-    let body = args
-        .get("body")
-        .and_then(|b| b.as_str())
-        .and_then(|s| serde_json::from_str::<Value>(s).ok());
-    match engine
-        .cloudflare_api(vault, method, path, body, Some(ctx))
-        .await
-    {
-        Ok(result) => json!({
-            "content": [{ "type": "text", "text": format!("{} {} → {}\n\n{}", method, path, result.status, serde_json::to_string_pretty(&result.data).unwrap_or_default()) }],
-            "isError": result.status >= 400
-        }),
-        Err(e) => fail_err(&e),
     }
 }
 
@@ -1768,125 +614,6 @@ async fn tool_cf_zones(engine: &mut VaultEngine, args: &Value, ctx: &CallerConte
                     .collect::<Vec<_>>()
                     .join("\n")
             ))
-        }
-        Err(e) => fail_err(&e),
-    }
-}
-
-async fn tool_cf_dns_list(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
-    require!(args, vault => "vaultName", zone_id => "zoneId");
-    let type_filter = args.get("type").and_then(|t| t.as_str());
-    let path = match type_filter {
-        Some(t) => format!(
-            "/zones/{}/dns_records?per_page=100&type={}",
-            urlencode(zone_id),
-            urlencode(t)
-        ),
-        None => format!("/zones/{}/dns_records?per_page=100", urlencode(zone_id)),
-    };
-    match engine
-        .cloudflare_api(vault, "GET", &path, None, Some(ctx))
-        .await
-    {
-        Ok(r) => {
-            let records = r
-                .data
-                .get("result")
-                .and_then(|z| z.as_array())
-                .cloned()
-                .unwrap_or_default();
-            ok(format!(
-                "DNS records ({}):\n{}",
-                records.len(),
-                records
-                    .iter()
-                    .map(|d| format!(
-                        "  - {} {} → {} (id: {})",
-                        d.get("type").and_then(|t| t.as_str()).unwrap_or("?"),
-                        d.get("name").and_then(|n| n.as_str()).unwrap_or("?"),
-                        d.get("content").and_then(|c| c.as_str()).unwrap_or("?"),
-                        d.get("id").and_then(|i| i.as_str()).unwrap_or("?")
-                    ))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            ))
-        }
-        Err(e) => fail_err(&e),
-    }
-}
-
-async fn tool_cf_dns_upsert(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
-    require!(args, vault => "vaultName", zone_id => "zoneId", rtype => "type", rname => "name", content => "content");
-    let ttl = args.get("ttl").and_then(|t| t.as_u64()).unwrap_or(1);
-    let proxied = args
-        .get("proxied")
-        .and_then(|p| p.as_bool())
-        .unwrap_or(false);
-
-    let list_path = format!(
-        "/zones/{}/dns_records?type={}&name={}",
-        urlencode(zone_id),
-        urlencode(rtype),
-        urlencode(rname)
-    );
-    match engine
-        .cloudflare_api(vault, "GET", &list_path, None, Some(ctx))
-        .await
-    {
-        Ok(list) => {
-            let existing = list
-                .data
-                .get("result")
-                .and_then(|z| z.as_array())
-                .cloned()
-                .unwrap_or_default();
-            let body = json!({ "type": rtype, "name": rname, "content": content, "ttl": ttl, "proxied": proxied });
-            if !existing.is_empty() {
-                let rec_id = existing[0]
-                    .get("id")
-                    .and_then(|i| i.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                match engine
-                    .cloudflare_api(
-                        vault,
-                        "PUT",
-                        &format!("/zones/{}/dns_records/{}", zone_id, rec_id),
-                        Some(body),
-                        Some(ctx),
-                    )
-                    .await
-                {
-                    Ok(r) => ok(format!(
-                        "✓ Updated {} {} → {}\n{}",
-                        rtype,
-                        rname,
-                        content,
-                        serde_json::to_string_pretty(&r.data).unwrap_or_default()
-                    )),
-                    Err(e) => fail_err(&e),
-                }
-            } else {
-                match engine
-                    .cloudflare_api(
-                        vault,
-                        "POST",
-                        &format!("/zones/{}/dns_records", zone_id),
-                        Some(body),
-                        Some(ctx),
-                    )
-                    .await
-                {
-                    Ok(r) => ok(format!(
-                        "✓ Created {} {} → {}\n{}",
-                        rtype,
-                        rname,
-                        content,
-                        serde_json::to_string_pretty(&r.data).unwrap_or_default()
-                    )),
-                    Err(e) => fail_err(&e),
-                }
-            }
         }
         Err(e) => fail_err(&e),
     }
@@ -1979,44 +706,6 @@ async fn tool_cf_secrets(engine: &mut VaultEngine, args: &Value, ctx: &CallerCon
     }
 }
 
-async fn tool_cf_deploy(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
-    require!(args, vault => "vaultName", dir => "projectDir");
-    let extra = args.get("extraArgs").and_then(|a| a.as_str()).unwrap_or("");
-    let cmd = if extra.is_empty() {
-        "npx wrangler deploy".to_string()
-    } else {
-        format!("npx wrangler deploy {}", extra)
-    };
-    let opts = RunOptions {
-        cwd: Some(dir),
-        timeout_ms: Some(RUN_TIMEOUT_MS),
-        allowed_keys: None,
-    };
-    match engine.run_command(vault, &cmd, &opts, Some(ctx)).await {
-        Ok(result) => {
-            let text = format!(
-                "Deploy: {}\nDir: {}\nExit: {}\n{}\n{}\n{}",
-                cmd,
-                dir,
-                result.code,
-                if result.scrubbed {
-                    "⚠ Output scrubbed\n"
-                } else {
-                    ""
-                },
-                truncate(&result.stdout),
-                if result.stderr.is_empty() {
-                    String::new()
-                } else {
-                    format!("\nSTDERR:\n{}", truncate(&result.stderr))
-                }
-            );
-            json!({ "content": [{ "type": "text", "text": text }], "isError": result.code != 0 })
-        }
-        Err(e) => fail_err(&e),
-    }
-}
-
 async fn tool_cf_health(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
     require!(args, vault => "vaultName");
     match engine.health_check(vault, Some(ctx)).await {
@@ -2061,109 +750,6 @@ async fn tool_vault_meta(engine: &mut VaultEngine, args: &Value, ctx: &CallerCon
                 .join("\n")
         }
     ))
-}
-
-async fn tool_template_list(_engine: &mut VaultEngine, _ctx: &CallerContext) -> Value {
-    let names = templates::template_names();
-    ok(format!(
-        "Templates ({}):\n{}",
-        names.len(),
-        templates::TEMPLATES
-            .iter()
-            .map(|(n, t)| format!("  - {}: {}", n, t.description))
-            .collect::<Vec<_>>()
-            .join("\n")
-    ))
-}
-
-async fn tool_template_apply(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
-    require!(args, vault => "vaultName", template => "templateName");
-    let tpl = match templates::get_template(template) {
-        Some(t) => t,
-        None => {
-            return fail(format!(
-                "Unknown template '{}'. Available: {}",
-                template,
-                templates::template_names().join(", ")
-            ))
-        }
-    };
-    if tpl.keys.is_empty() {
-        return ok(format!(
-            "Template '{}' has no predefined keys. Add secrets with vault_add.",
-            template
-        ));
-    }
-    let values = args.get("values").and_then(|v| v.as_object());
-    let mut stored = 0;
-    let mut needed: Vec<&str> = Vec::new();
-    for key in tpl.keys {
-        let val = values.and_then(|m| m.get(*key)).and_then(|v| v.as_str());
-        match val {
-            Some(v) => {
-                if let Err(e) = engine.add_secret(vault, key, v, Some(ctx)) {
-                    return fail_err(&e);
-                }
-                stored += 1;
-            }
-            None => needed.push(key),
-        }
-    }
-    ok(format!(
-        "✓ Applied '{}' template to '{}': {} keys stored.\n  {}",
-        template,
-        vault,
-        stored,
-        if needed.is_empty() {
-            "Complete — all keys set.".to_string()
-        } else {
-            format!("Values still needed for: {}", needed.join(", "))
-        }
-    ))
-}
-
-async fn tool_cf_dns_delete(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
-    require!(args, vault => "vaultName", zone_id => "zoneId", record_id => "recordId");
-    match engine
-        .dns_delete(vault, zone_id, record_id, Some(ctx))
-        .await
-    {
-        Ok(r) => ok(format!(
-            "✓ Deleted DNS record {} from zone {}: HTTP {}",
-            record_id, zone_id, r.status
-        )),
-        Err(e) => fail_err(&e),
-    }
-}
-
-async fn tool_cf_workers_versions(
-    engine: &mut VaultEngine,
-    args: &Value,
-    ctx: &CallerContext,
-) -> Value {
-    require!(args, vault => "vaultName", script => "scriptName");
-    match engine.list_worker_versions(vault, script, Some(ctx)).await {
-        Ok(versions) => {
-            if versions.is_empty() {
-                return ok(format!("No versions found for '{}'.", script));
-            }
-            ok(format!(
-                "Versions of '{}' ({}):\n{}",
-                script,
-                versions.len(),
-                versions
-                    .iter()
-                    .map(|v| format!(
-                        "  - id={} created={}",
-                        v.get("id").and_then(|x| x.as_str()).unwrap_or("?"),
-                        v.get("created_on").and_then(|x| x.as_str()).unwrap_or("?")
-                    ))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            ))
-        }
-        Err(e) => fail_err(&e),
-    }
 }
 
 async fn tool_vault_generate(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
@@ -2223,37 +809,6 @@ async fn tool_vault_import(engine: &mut VaultEngine, args: &Value, ctx: &CallerC
             n, vault
         )),
         Err(e) => fail_err(&e),
-    }
-}
-
-async fn tool_vault_export(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
-    require!(args, vault => "vaultName", file => "file");
-    // Agents are denied by policy (ReadValue): exporting plaintext would expose
-    // secret values, which the agent-first model forbids. Run the human CLI
-    // (`vaultly export`) instead.
-    match engine.get_secrets(vault, Some(ctx)) {
-        Err(e) => fail(format!(
-            "Export blocked in MCP/agent context: {}. Run 'vaultly export {} {}' as a human instead.",
-            e, vault, file
-        )),
-        Ok(secrets) => {
-            let mut keys: Vec<&String> = secrets.keys().collect();
-            keys.sort();
-            let mut buf = String::new();
-            for k in keys {
-                let v = secrets.get(k).and_then(|x| x.as_str()).unwrap_or("");
-                buf.push_str(&format!("{}='{}'\n", k, v.replace('\'', "'\\''")));
-            }
-            if let Err(e) = write_export_file(file, &buf) {
-                return fail(format!("Write failed: {}", e));
-            }
-            ok(format!(
-                "✓ Exported {} secrets from '{}' to {} (mode 0600). Values written to file only.",
-                secrets.len(),
-                vault,
-                file
-            ))
-        }
     }
 }
 
@@ -2324,19 +879,13 @@ async fn tool_vault_import_encrypted(
 
 async fn tool_policy_info() -> Value {
     ok(format!(
-        "Vaultly agent security policy:\n  Session TTL: {} min\n  Command timeout: {} ms\n  Max response output: {} bytes\n\n  READ operations (get/env/export) are BANNED for agents.\n  Permitted: list names, add, delete, run commands, cf_* (no values),\n  template_apply, vault_generate/rotate, import.\n  Every tool returns names/meta/confirmations only — never raw secret values.",
-        SESSION_TTL_MINUTES, RUN_TIMEOUT_MS, OUTPUT_MAX
+        "Vaultly agent security policy:\n  Session TTL: {} min\n\n  Raw reads and arbitrary credential-injected commands are disabled.\n  Permitted: encrypted credential operations, safe Cloudflare discovery,\n  write-only Worker secrets, and human-approved target deployment.\n  Every tool returns names, metadata, or safe operation status — never raw secret values.",
+        SESSION_TTL_MINUTES
     ))
 }
 
 /// Return the ACTUAL loaded per-agent policy (vault allowlists, roles, rate
 /// limits) as JSON — agent-safe, no values.
-async fn tool_vault_policy(engine: &mut VaultEngine) -> Value {
-    let info = engine.policy_info();
-    let text = serde_json::to_string_pretty(&info).unwrap_or_else(|_| info.to_string());
-    ok(text)
-}
-
 fn get_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(|v| v.as_str())
 }
@@ -2568,37 +1117,4 @@ fn read_tty_password() -> Option<String> {
     tty.read_to_string(&mut buf).ok()?;
     eprintln!();
     Some(buf.trim_end().to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn truncate_short_content_is_unchanged() {
-        let s = "short";
-        assert_eq!(truncate(s), s);
-    }
-
-    #[test]
-    fn truncate_multibyte_never_panics_and_stays_within_bound() {
-        // "字" is 3 UTF-8 bytes. A 10KB cut lands mid-character for many fills.
-        let mut s = String::new();
-        while s.len() < OUTPUT_MAX + 100 {
-            s.push('字');
-        }
-        let out = truncate(&s);
-        // Truncation must not panic and must include the suffix marker.
-        assert!(out.contains("...(truncated)"));
-        // The retained prefix must be valid UTF-8 (it is, by construction) and
-        // the truncated byte-count must not exceed the cap accounting for the marker.
-        assert!(s.len() > OUTPUT_MAX);
-    }
-
-    #[test]
-    fn truncate_exactly_at_boundary_needs_no_marker() {
-        let s = "a".repeat(OUTPUT_MAX);
-        let out = truncate(&s);
-        assert_eq!(out, s);
-    }
 }

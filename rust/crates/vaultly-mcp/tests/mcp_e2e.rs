@@ -11,26 +11,20 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 const PASSWORD: &str = "mcp-test-password";
 const SECRET_VALUE: &str = "sk-e2e-super-secret-token-1234567890";
 const SECRET_KEY: &str = "E2E_SECRET_KEY";
-const EXPECTED_TOOLS: [&str; 61] = [
-    "cf_api",
-    "cf_accounts",
+const EXPECTED_TOOLS: [&str; 24] = [
     "cf_account_label",
-    "cf_deploy",
-    "cf_dns_delete",
-    "cf_dns_list",
-    "cf_dns_upsert",
+    "cf_accounts",
     "cf_health",
+    "cf_pages_projects",
     "cf_secrets",
     "cf_workers_list",
-    "cf_workers_versions",
     "cf_zones",
+    "deploy_target",
+    "deploy_targets",
     "policy_info",
-    "template_apply",
-    "template_list",
     "vault_add",
     "vault_audit",
     "vault_delete",
-    "vault_export",
     "vault_export_encrypted",
     "vault_generate",
     "vault_import",
@@ -39,40 +33,9 @@ const EXPECTED_TOOLS: [&str; 61] = [
     "vault_list",
     "vault_lock",
     "vault_meta",
-    "vault_policy",
     "vault_rotate",
-    "vault_run",
     "vault_status",
     "vault_unlock",
-    "cf_cache_purge",
-    "cf_r2_buckets",
-    "cf_r2_objects",
-    "cf_r2_object_put",
-    "cf_r2_object_get",
-    "cf_r2_object_delete",
-    "cf_kv_namespaces",
-    "cf_kv_keys",
-    "cf_kv_put",
-    "cf_kv_get",
-    "cf_kv_delete",
-    "cf_d1_databases",
-    "cf_d1_info",
-    "cf_d1_query",
-    "cf_pages_projects",
-    "cf_pages_deploy",
-    "cf_worker_bindings",
-    "cf_worker_triggers",
-    "cf_ssl_settings",
-    "cf_certificates",
-    "cf_certificate_order",
-    "cf_firewall_rules",
-    "cf_firewall_rule_create",
-    "cf_firewall_rule_delete",
-    "cf_lb_pools",
-    "cf_lb_list",
-    "cf_email_settings",
-    "cf_email_rules",
-    "cf_email_rule_create",
 ];
 
 struct McpClient {
@@ -192,7 +155,9 @@ async fn mcp_e2e_security_surface() {
         assert!(text.contains(SECRET_KEY), "{}", text);
         assert!(!text.contains(SECRET_VALUE), "{}", text);
 
-        // 5. Scrubs secret values from command output
+        // 5. Arbitrary command execution is disabled for agents. Scrubbing
+        // alone is not a sufficient boundary because a child process could
+        // inspect the injected environment before output reaches Vaultly.
         let res = mcp
             .call_tool(
                 6,
@@ -202,7 +167,7 @@ async fn mcp_e2e_security_surface() {
             .await;
         let text = serde_json::to_string(&res).unwrap();
         assert!(!text.contains(SECRET_VALUE), "{}", text);
-        assert!(text.contains("[REDACTED]"), "{}", text);
+        assert!(text.contains("disabled for agents"), "{}", text);
 
         // 6. Lets agents lock and reports locked status
         let res = mcp.call_tool(7, "vault_lock", json!({})).await;
@@ -423,10 +388,13 @@ async fn mcp_policy_limits_info() {
             res
         );
         let text = mcp.result_text(&res);
-        // Exact output shape from lib.rs: session TTL, command timeout, max output.
+        // Policy summary exposes the session boundary and safe operation model.
         assert!(text.contains("Session TTL"), "{}", text);
-        assert!(text.contains("Command timeout"), "{}", text);
-        assert!(text.contains("Max response output"), "{}", text);
+        assert!(
+            text.contains("arbitrary credential-injected commands"),
+            "{}",
+            text
+        );
         // No secret value can appear in a policy summary.
         assert!(!text.contains(SECRET_VALUE), "{}", text);
         assert!(!text.contains(MARKER_VALUE), "{}", text);

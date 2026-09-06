@@ -33,6 +33,7 @@ pub enum Operation {
     Write,
     Delete,
     DeleteVault,
+    Deploy,
     Run,
     CfApi,
     Admin,
@@ -47,6 +48,7 @@ impl Operation {
             Operation::Write => "write",
             Operation::Delete => "delete",
             Operation::DeleteVault => "delete_vault",
+            Operation::Deploy => "deploy",
             Operation::Run => "run",
             Operation::CfApi => "cf_api",
             Operation::Admin => "admin",
@@ -59,7 +61,7 @@ const DEFAULT_AGENT_OPS: &[Operation] = &[
     Operation::ReadKeys,
     Operation::Write,
     Operation::Delete,
-    Operation::Run,
+    Operation::Deploy,
     Operation::CfApi,
 ];
 // NOTE: read_value, delete_vault, admin are NOT in default agent ops
@@ -403,7 +405,8 @@ mod tests {
         assert!(p.check(Some(&agent("a")), Operation::Admin, "v").is_err());
         assert!(p.check(Some(&agent("a")), Operation::List, "v").is_ok());
         assert!(p.check(Some(&agent("a")), Operation::Write, "v").is_ok());
-        assert!(p.check(Some(&agent("a")), Operation::Run, "v").is_ok());
+        assert!(p.check(Some(&agent("a")), Operation::Run, "v").is_err());
+        assert!(p.check(Some(&agent("a")), Operation::Deploy, "v").is_ok());
         assert!(p.check(Some(&agent("a")), Operation::CfApi, "v").is_ok());
     }
 

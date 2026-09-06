@@ -8,7 +8,7 @@
 
 [![Rust](https://img.shields.io/badge/Rust-1.96-000000?logo=rust&logoColor=white)](https://rust-lang.org)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![MCP](https://img.shields.io/badge/MCP-61_tools-8A2BE2)](#ai-agent-integration-mcp)
+[![MCP](https://img.shields.io/badge/MCP-24_tools-8A2BE2)](#ai-agent-integration-mcp)
 [![Cloudflare](https://img.shields.io/badge/Cloudflare-Workers-F38020?logo=cloudflare&logoColor=white)](https://workers.cloudflare.com)
 [![Security](https://img.shields.io/badge/encryption-AES--256--GCM-red)](#security)
 
@@ -30,14 +30,14 @@ Agent: "Deploy my Worker to Cloudflare"
     │  Agent   │────▶│   Vaultly    │────▶│  Cloudflare │
     │          │◀────│  (scrubbed)  │◀────│   API       │
     └─────────┘     └──────────────┘     └────────────┘
-     sees: "✅ Deployed"    injects token      real API call
-     never sees: token ●    scrubs output      response
+     sees: "✅ Deployed"    holds credential   real API call
+     never sees: token ●    returns status     response
 ```
 
-Agents run real commands with your secrets injected into the environment —
-and every trace of those secrets is scrubbed from the output they see. The
-policy engine lets you grant agents fine-grained access without ever exposing
-a raw value.
+Agents request approved operations through Vaultly. For deployment, the build
+receives no Cloudflare credentials; Vaultly holds the credential only inside
+the authenticated API call and returns structured status. The policy engine
+lets you grant agents fine-grained access without exposing a raw value.
 
 ## 🚀 Quickstart
 
@@ -56,14 +56,21 @@ VAULTLY_HUMAN_MODE=1 vaultly add github -k GITHUB_TOKEN -v "ghp_xxx"
 # 4. Read it back (humans only — blocked in agent mode)
 VAULTLY_HUMAN_MODE=1 vaultly get github GITHUB_TOKEN
 
-# 5. Let an agent use it
-vaultly run github -- git push       # agent mode is automatic
+# 5. Register a deployment target as a human
+VAULTLY_HUMAN_MODE=1 vaultly target add gateandtech-web \
+  --provider pages --vault cf-gateandtech \
+  --account-id <ACCOUNT_ID> --project gateandtech-all-in-one-web \
+  --project-dir /path/to/GATEAndTech-All-In-One-Web \
+  --build-command "npm run build" --output-dir apps/web/dist --branch main
 
-# 6. Set up the MCP server for your AI tool
+# 6. Let an agent deploy by target ID only
+vaultly deploy gateandtech-web --json
+
+# 7. Set up the MCP server for your AI tool
 vaultly mcp                          # add to your tool's MCP config (see below)
 ```
 
-For a guided setup — Cloudflare accounts, templates, macOS Keychain — run `bash setup.sh`.
+For setup, use the CLI help and the one-time human bootstrap above.
 
 ### Human and agent unlock modes
 
@@ -75,7 +82,7 @@ unattended agents or CI, provide the master password through
 
 ```bash
 VAULTLY_MASTER_PASSWORD="$VAULTLY_MASTER_PASSWORD" \
-  vaultly run cf-gateandtech -- npm run deploy
+  vaultly deploy gateandtech-web --json
 ```
 
 Agent mode never prints raw secret values, never forwards the master password
@@ -87,7 +94,7 @@ One-time human bootstrap for local agents:
 VAULTLY_HUMAN_MODE=1 vaultly keychain store
 ```
 
-After this, `vaultly mcp` and `vaultly run` can unlock through the
+After this, `vaultly mcp` and `vaultly deploy` can unlock through the
 Keychain without putting the master password in an agent configuration. If a
 custom `VAULTLY_DIR` is required, also set `VAULTLY_ALLOW_KEYCHAIN=1`.
 
@@ -104,29 +111,18 @@ vaultly delete <vault> [key]              Delete a secret or vault
 vaultly env <vault>                       Output shell export statements (human only)
 vaultly export <vault> <file>             Export plaintext (--encrypted for portable blob)
 vaultly import <file> [--vault name]      Import .env/.json/.yaml/.csv (--encrypted for blob)
-vaultly run <vault> -- <cmd>              Run with injected env (scrubbed, --force to override expiry)
+vaultly target add|list|remove ...       Manage human-approved deployment targets
+vaultly deploy <target> [--json]         Deploy a fixed target without exposing credentials
 vaultly gen [-l LENGTH] [-s]              Generate a random secret
 vaultly rotate <vault> <key> [--expired]  Rotate a secret (or all expired) to a new random value
-vaultly copy <vault> <key>                Copy secret to macOS clipboard
-vaultly rename <old> <new>                Rename a vault
-vaultly mv <vault> <key> <to_vault>       Move a secret to another vault
-vaultly cp <vault> <key> <to_vault>       Copy a secret to another vault
-vaultly serve [--bind ADDR] [--token T]   Start local HTTP/REST server (agent-first)
 vaultly doctor [--json]                   Environment diagnostics + health checks
-vaultly template [name] [--list]          Create vault from a template (14 built-in)
-vaultly completions <SHELL> [--install]   Generate shell completions (bash/zsh/fish)
-vaultly cf add|list|use|deploy|secrets|remove|zones|dns-delete  Cloudflare management
-vaultly keychain store|remove|status      macOS Keychain lock/unlock
-vaultly backup -u URL -t TOKEN            Push encrypted backup (ciphertext only)
-vaultly restore -u URL -t TOKEN           Pull encrypted backup
-vaultly protect [dir]                     Add AI-tool ignore rules
-vaultly mcp                               Start the MCP server (61 agent tools)
-vaultly lock                              Wipe key from memory
-vaultly unlock                            Re-open via Keychain
+vaultly cf add|list|remove|zones|pages|secrets  Cloudflare credentials/discovery
+vaultly keychain store|remove             macOS Keychain lock/unlock
+vaultly mcp                               Start the MCP server (24 agent tools)
+vaultly keychain store|remove             Manage Keychain auto-unlock
 vaultly kill                              Emergency lock + clear Keychain
 vaultly status                            Session and vault info
 vaultly version                           Print version
-vaultly tui                               Interactive menu (human only)
 ```
 
 ## 🤖 AI Agent Integration (MCP)
@@ -146,15 +142,19 @@ Add to your AI tool's MCP config:
 
 > 💡 With macOS Keychain (`vaultly keychain store`), no password is needed in config.
 
-The 61 MCP tools cover vault operations (`vault_list`, `vault_keys`,
-`vault_add`, `vault_delete`, `vault_run`, `vault_status`, `vault_lock`,
-`vault_unlock`, `vault_audit`) and Cloudflare management (`cf_accounts`,
-`cf_account_label`, `cf_api`, `cf_zones`, `cf_dns_list`, `cf_dns_upsert`,
-`cf_workers_list`, `cf_secrets`, `cf_deploy`, `cf_health`).
+The MCP interface is intentionally small: encrypted credential operations,
+Cloudflare discovery/write-only Worker secret management, and approved
+deployment targets. Agents never choose an arbitrary account, project,
+directory, branch, or command.
+
+Deployment is target-bound: agents use `deploy_targets` to discover approved
+targets and `deploy_target` with only a `targetId`. The old arbitrary
+`vault_run` and `cf_pages_deploy` paths are disabled for agents.
 
 > 🚫 **Write-only for agents.** No MCP tool ever returns a raw secret value;
 > agent-facing `vault_add`/`cf_secrets` store what you give them, and
-> `vault_run` surfaces only scrubbed output.
+> Deployment builds run without vault credentials; Vaultly performs the
+> Cloudflare upload internally and returns only structured deployment status.
 
 ## 🛡️ Security Model
 
@@ -165,11 +165,11 @@ The 61 MCP tools cover vault operations (`vault_list`, `vault_keys`,
 | Session TTL | Auto-lock after 120 minutes |
 | Policy engine | Per-agent allowed ops + rate limiting (60 ops/min default) |
 | Audit trail | Hash-chained, structured JSON log of every operation |
-| Zero-knowledge backup | Cloudflare stores ciphertext only |
+| Target-bound deployment | Agents cannot select an arbitrary account, project, branch, or command |
 
-**The core invariant:** agents get *use*, never *read*. `get`, `env`, and raw
-value access are excluded from default agent policies and blocked in the
-default agent mode.
+**The core invariant:** agents get approved *operations*, never raw secrets.
+Arbitrary credential-injecting commands are disabled for agents; deployments
+must use a human-registered target.
 
 Useful commands:
 
@@ -177,7 +177,6 @@ Useful commands:
 VAULTLY_HUMAN_MODE=1 vaultly keychain store  # auto-unlock via macOS Keychain
 VAULTLY_HUMAN_MODE=1 vaultly kill            # 🚨 emergency lock
 VAULTLY_HUMAN_MODE=1 vaultly status          # session info
-vaultly tui                # interactive menu (human only)
 ```
 
 ## 📁 Storage

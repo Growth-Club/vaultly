@@ -29,13 +29,6 @@
   // ISO-8601 timestamp when the vault was initialized (UTC, millisecond precision).
   "createdAt": "2026-01-01T00:00:00.000Z",
 
-  // Written by `vaultly backup -u <url>`; absent until the first backup (omitted,
-  // not null). workerUrl points at the Cloudflare Worker that stores ciphertext-only.
-  "backup": {
-    "workerUrl": "https://vaultly-backup.example.workers.dev",
-    "lastBackupAt": "2026-01-02T03:04:05.000Z"
-  }
-
   // NOTE: There is no per-vault "updatedAt" here — each secret lives in its OWN
   // *.vault file (VaultFile) which carries its own "updatedAt". The policy engine
   // (allowed operations / max ops per minute) is NOT stored in this file; it is

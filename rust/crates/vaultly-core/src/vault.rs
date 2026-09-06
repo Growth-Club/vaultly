@@ -11,6 +11,7 @@ use crate::crypto::{
     create_verifier, decrypt_vault, derive_key, encrypt_vault, generate_salt, now_iso,
     verify_password, BackupMeta, SecretEntry, SecretMeta, VaultConfig, VaultFile,
 };
+use crate::deploy::DeploymentTarget;
 use crate::error::{Result, VaultError};
 use zeroize::Zeroizing;
 
@@ -113,6 +114,47 @@ impl VaultStore {
 
     fn audit_path(&self) -> PathBuf {
         self.dir.join("audit.log")
+    }
+
+    fn deployment_targets_path(&self) -> PathBuf {
+        self.dir.join("deployment-targets.json")
+    }
+
+    /// Load non-secret deployment routing metadata.
+    pub fn load_deployment_targets(&self) -> Result<Vec<DeploymentTarget>> {
+        let path = self.deployment_targets_path();
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let raw = fs::read_to_string(path)?;
+        let targets: Vec<DeploymentTarget> = serde_json::from_str(&raw)
+            .map_err(|e| VaultError::ConfigCorrupt(format!("deployment targets: {e}")))?;
+        for target in &targets {
+            target
+                .validate()
+                .map_err(|e| VaultError::ConfigCorrupt(e))?;
+        }
+        Ok(targets)
+    }
+
+    /// Atomically save non-secret deployment routing metadata with 0600 mode.
+    pub fn save_deployment_targets(&self, targets: &[DeploymentTarget]) -> Result<()> {
+        let mut ids = std::collections::HashSet::new();
+        for target in targets {
+            target.validate().map_err(VaultError::Policy)?;
+            if !ids.insert(target.id.clone()) {
+                return Err(VaultError::Policy(format!(
+                    "duplicate deployment target id '{}'",
+                    target.id
+                )));
+            }
+        }
+        let json = serde_json::to_string_pretty(targets)?;
+        self.ensure_dirs()?;
+        self.with_write_lock(|| {
+            Self::write_secure(&self.deployment_targets_path(), &json)?;
+            Ok(())
+        })
     }
 
     /// Public path accessor for CLI/TUI display and MCP audit tool

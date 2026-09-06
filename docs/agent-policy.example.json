@@ -1,10 +1,10 @@
 {
   "deploy-bot": {
     "allowed_vaults": ["cf-personal", "ci"],
-    "allowed_operations": ["list", "read_keys", "run", "write", "cf_api"],
+    "allowed_operations": ["list", "read_keys", "write", "delete", "deploy", "cf_api"],
     "roles": {
       "readonly": ["list", "read_keys"],
-      "deploy": ["list", "read_keys", "run", "cf_api"]
+      "deploy": ["list", "read_keys", "deploy", "cf_api"]
     },
     "vault_roles": {
       "ci": "readonly",

@@ -91,9 +91,6 @@ pub enum VaultError {
 
     #[error("Audit log unavailable: {0}")]
     Audit(String),
-
-    #[error("Backup metadata update failed: {0}")]
-    BackupMetaUpdate(String),
 }
 
 impl From<reqwest::Error> for VaultError {

@@ -2,15 +2,18 @@
 //! Both CLI and MCP server use this — same permissions, same audit, same security.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command as TokioCommand;
 
 use crate::crypto::SecretMeta;
+use crate::deploy::{DeploymentProvider, DeploymentResult, DeploymentTarget};
 use crate::error::{Result, VaultError};
 use crate::policy::{CallerContext, Operation, PolicyEngine};
 use crate::scrubber::scrub_output;
@@ -332,10 +335,7 @@ impl VaultEngine {
     }
     /// Agent-safe: which vaults hold Cloudflare credentials, and how they
     /// authenticate. Inspects key NAMES only — never secret values.
-    pub fn list_cf_accounts(
-        &mut self,
-        ctx: Option<&CallerContext>,
-    ) -> Result<Vec<CfAccountInfo>> {
+    pub fn list_cf_accounts(&mut self, ctx: Option<&CallerContext>) -> Result<Vec<CfAccountInfo>> {
         let mut accounts = Vec::new();
         for vault in self.list_vaults(ctx)? {
             // Skip vaults this agent isn't allowed to read keys from, so a
@@ -363,7 +363,7 @@ impl VaultEngine {
             };
             let label = self.store.get_vault_label(&vault).unwrap_or(None);
             let cf_api = self.policy.check(ctx, Operation::CfApi, &vault).is_ok();
-            let deploy = self.policy.check(ctx, Operation::Run, &vault).is_ok();
+            let deploy = self.policy.check(ctx, Operation::Deploy, &vault).is_ok();
             accounts.push(CfAccountInfo {
                 vault,
                 auth,
@@ -732,6 +732,288 @@ impl VaultEngine {
         self.run(vault_name, &cmd, &args, opts, ctx).await
     }
 
+    /// Run a fixed build command with a deliberately empty environment.
+    /// Deployment targets use this so project build scripts never receive
+    /// Cloudflare credentials.
+    async fn run_without_secrets(
+        &mut self,
+        command_str: &str,
+        opts: &RunOptions<'_>,
+        ctx: Option<&CallerContext>,
+    ) -> Result<RunResult> {
+        let parts = shell_words::split(command_str)?;
+        let (cmd, args) = parts
+            .split_first()
+            .ok_or_else(|| VaultError::CommandSpawn(String::new(), "Empty build command".into()))?;
+        self.audit("BUILD", &format!("command=\"{}\"", command_str), ctx);
+        self.spawn(
+            cmd,
+            args,
+            &[],
+            opts.cwd,
+            opts.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS),
+        )
+        .await
+    }
+
+    /// Deploy a registered target. The caller supplies only the target
+    /// metadata selected by a human; account/project values are never accepted
+    /// as per-request agent arguments.
+    pub async fn deploy_target(
+        &mut self,
+        target: &DeploymentTarget,
+        ctx: Option<&CallerContext>,
+    ) -> Result<DeploymentResult> {
+        target.validate().map_err(VaultError::Policy)?;
+        self.op(ctx, Operation::Deploy, &target.vault)?;
+
+        let account_id = self.cf_account_id(&target.vault)?;
+        if account_id != target.account_id {
+            return Err(VaultError::Policy(format!(
+                "Deployment target '{}' is bound to a different Cloudflare account",
+                target.id
+            )));
+        }
+
+        let project_dir = PathBuf::from(&target.project_dir);
+        let output_dir = project_dir.join(&target.output_dir);
+        let build = self
+            .run_without_secrets(
+                &target.build_command,
+                &RunOptions {
+                    cwd: Some(&target.project_dir),
+                    timeout_ms: Some(1_800_000),
+                    allowed_keys: None,
+                },
+                ctx,
+            )
+            .await?;
+        if build.code != 0 {
+            return Err(VaultError::Policy(format!(
+                "Build failed for target '{}' with exit code {}",
+                target.id, build.code
+            )));
+        }
+
+        match target.provider {
+            DeploymentProvider::Pages => self.deploy_pages_files(target, &output_dir, ctx).await,
+            DeploymentProvider::Worker => {
+                // Wrangler is invoked only from target metadata, never from
+                // agent-provided command/args. The child receives the token,
+                // but the agent receives only scrubbed output and cannot choose
+                // the account, script, or command.
+                let args = vec![
+                    "deploy".to_string(),
+                    "--name".to_string(),
+                    target.project.clone(),
+                    "--account-id".to_string(),
+                    target.account_id.clone(),
+                ];
+                let result = self
+                    .run(
+                        &target.vault,
+                        "npx",
+                        &args,
+                        &RunOptions {
+                            cwd: Some(&target.project_dir),
+                            timeout_ms: Some(1_800_000),
+                            allowed_keys: Some(&[
+                                "CLOUDFLARE_API_TOKEN".to_string(),
+                                "CLOUDFLARE_EMAIL".to_string(),
+                                "CLOUDFLARE_API_KEY".to_string(),
+                                "CLOUDFLARE_ACCOUNT_ID".to_string(),
+                            ]),
+                        },
+                        ctx,
+                    )
+                    .await?;
+                if result.code != 0 {
+                    return Err(VaultError::Policy(format!(
+                        "Worker deployment failed for target '{}' with exit code {}",
+                        target.id, result.code
+                    )));
+                }
+                Ok(DeploymentResult {
+                    target: target.id.clone(),
+                    provider: DeploymentProvider::Worker,
+                    status: "success".into(),
+                    deployment_id: None,
+                    url: None,
+                    files: 0,
+                })
+            }
+        }
+    }
+
+    async fn deploy_pages_files(
+        &mut self,
+        target: &DeploymentTarget,
+        output_dir: &Path,
+        ctx: Option<&CallerContext>,
+    ) -> Result<DeploymentResult> {
+        if !output_dir.is_dir() {
+            return Err(VaultError::Policy(format!(
+                "Pages output directory does not exist for target '{}'",
+                target.id
+            )));
+        }
+        let files = collect_deploy_files(output_dir)?;
+        if files.is_empty() {
+            return Err(VaultError::Policy(format!(
+                "Pages output directory is empty for target '{}'",
+                target.id
+            )));
+        }
+        if files.len() > 20_000 {
+            return Err(VaultError::Policy(
+                "Pages deployment exceeds 20,000 files".into(),
+            ));
+        }
+
+        let secrets = self.read_secrets(&target.vault)?;
+        let api_headers = Self::build_cf_headers(&target.vault, &secrets)?;
+        let client = reqwest::Client::new();
+        let base = format!(
+            "{}/accounts/{}/pages/projects/{}",
+            self.cf_base,
+            urlencode(&target.account_id),
+            urlencode(&target.project)
+        );
+
+        let token_response = send_with_retry(
+            client
+                .get(format!("{}/upload-token", base))
+                .headers(api_headers.clone()),
+        )
+        .await?;
+        let token_status = token_response.status();
+        let token_data: Value = token_response.json().await?;
+        if !token_status.is_success() {
+            return Err(VaultError::CloudflareResponse(format!(
+                "upload-token failed with HTTP {}",
+                token_status.as_u16()
+            )));
+        }
+        let jwt = token_data
+            .get("result")
+            .and_then(|r| r.get("jwt"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                VaultError::CloudflareResponse(
+                    "Cloudflare did not return a Pages upload token".into(),
+                )
+            })?;
+
+        let manifest: Map<String, Value> = files
+            .iter()
+            .map(|file| (file.relative.clone(), Value::String(file.hash.clone())))
+            .collect();
+        let hashes: Vec<&str> = files.iter().map(|f| f.hash.as_str()).collect();
+        let missing_response = send_with_retry(
+            client
+                .post(format!("{}/pages/assets/check-missing", self.cf_base))
+                .bearer_auth(jwt)
+                .json(&serde_json::json!({"hashes": hashes})),
+        )
+        .await?;
+        if !missing_response.status().is_success() {
+            return Err(VaultError::CloudflareResponse(format!(
+                "asset check failed with HTTP {}",
+                missing_response.status().as_u16()
+            )));
+        }
+        let missing_data: Value = missing_response.json().await?;
+        let missing: std::collections::HashSet<String> = missing_data
+            .get("result")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+
+        for chunk in files
+            .iter()
+            .filter(|f| missing.contains(&f.hash))
+            .collect::<Vec<_>>()
+            .chunks(25)
+        {
+            let body: Vec<Value> = chunk
+                .iter()
+                .map(|file| {
+                    serde_json::json!({
+                        "base64": true,
+                        "key": file.hash,
+                        "metadata": {"contentType": content_type(&file.relative)},
+                        "value": base64::engine::general_purpose::STANDARD.encode(&file.bytes),
+                    })
+                })
+                .collect();
+            let response = send_with_retry(
+                client
+                    .post(format!("{}/pages/assets/upload", self.cf_base))
+                    .bearer_auth(jwt)
+                    .json(&body),
+            )
+            .await?;
+            if !response.status().is_success() {
+                return Err(VaultError::CloudflareResponse(format!(
+                    "asset upload failed with HTTP {}",
+                    response.status().as_u16()
+                )));
+            }
+        }
+
+        let mut form =
+            reqwest::multipart::Form::new().text("manifest", serde_json::to_string(&manifest)?);
+        if let Some(branch) = &target.branch {
+            form = form.text("branch", branch.clone());
+        }
+        form = form.text("pages_build_output_dir", target.output_dir.clone());
+        let response = send_with_retry(
+            client
+                .post(format!("{}/deployments", base))
+                .headers(api_headers)
+                .multipart(form),
+        )
+        .await?;
+        let status = response.status();
+        let data: Value = response.json().await?;
+        if !status.is_success() {
+            return Err(VaultError::CloudflareResponse(format!(
+                "Pages deployment failed with HTTP {}",
+                status.as_u16()
+            )));
+        }
+        let result = data.get("result").cloned().unwrap_or_default();
+        let deployment_id = result.get("id").and_then(Value::as_str).map(str::to_string);
+        let url = result
+            .get("url")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                result
+                    .get("aliases")
+                    .and_then(Value::as_array)
+                    .and_then(|a| a.first())
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+        self.audit(
+            "DEPLOY",
+            &format!("target={} provider=pages files={}", target.id, files.len()),
+            ctx,
+        );
+        Ok(DeploymentResult {
+            target: target.id.clone(),
+            provider: DeploymentProvider::Pages,
+            status: "success".into(),
+            deployment_id,
+            url,
+            files: files.len(),
+        })
+    }
+
     // ─── Spawn (timeout + output cap) ─────────────────────
 
     async fn spawn(
@@ -952,7 +1234,8 @@ impl VaultEngine {
     ) -> Result<ApiResult> {
         let account_id = self.cf_account_id(vault_name)?;
         let full = format!("/accounts/{}{}", urlencode(&account_id), api_path);
-        self.cloudflare_api(vault_name, method, &full, body, ctx).await
+        self.cloudflare_api(vault_name, method, &full, body, ctx)
+            .await
     }
 
     /// Cloudflare API call with a raw text body and raw text response
@@ -990,8 +1273,8 @@ impl VaultEngine {
             .await
             .map_err(|e| VaultError::Policy(format!("Invalid response: {}", e)))?;
         let scrubbed = scrub_output(&text, &Self::cf_secret_values(&secrets));
-        let data: Value =
-            serde_json::from_str(&scrubbed).unwrap_or_else(|_| serde_json::json!({ "raw": scrubbed }));
+        let data: Value = serde_json::from_str(&scrubbed)
+            .unwrap_or_else(|_| serde_json::json!({ "raw": scrubbed }));
         Ok(ApiResult { status, data })
     }
 
@@ -1449,6 +1732,89 @@ fn is_transient_request_err(e: &reqwest::Error) -> bool {
     e.is_connect() || e.is_timeout() || e.is_body()
 }
 
+struct DeployFile {
+    relative: String,
+    hash: String,
+    bytes: Vec<u8>,
+}
+
+fn collect_deploy_files(root: &Path) -> Result<Vec<DeployFile>> {
+    let mut paths = Vec::new();
+    collect_deploy_paths(root, root, &mut paths)?;
+    let mut files = Vec::with_capacity(paths.len());
+    for (relative, path) in paths {
+        let bytes = fs::read(&path)?;
+        if bytes.len() > 25 * 1024 * 1024 {
+            return Err(VaultError::Policy(format!(
+                "Pages asset '{}' exceeds the 25 MiB file limit",
+                relative
+            )));
+        }
+        let hash = hex::encode(Sha256::digest(&bytes));
+        files.push(DeployFile {
+            relative,
+            hash,
+            bytes,
+        });
+    }
+    Ok(files)
+}
+
+fn collect_deploy_paths(
+    root: &Path,
+    current: &Path,
+    out: &mut Vec<(String, PathBuf)>,
+) -> Result<()> {
+    for entry in fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        let meta = fs::symlink_metadata(&path)?;
+        if meta.file_type().is_symlink() {
+            return Err(VaultError::Policy(format!(
+                "Pages output contains unsupported symlink '{}'",
+                path.display()
+            )));
+        }
+        if meta.is_dir() {
+            collect_deploy_paths(root, &path, out)?;
+        } else if meta.is_file() {
+            let rel = path
+                .strip_prefix(root)
+                .map_err(|e| VaultError::Policy(e.to_string()))?
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            out.push((rel, path));
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(())
+}
+
+fn content_type(path: &str) -> &'static str {
+    match Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+    {
+        "html" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "application/javascript; charset=utf-8",
+        "json" | "map" => "application/json; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "txt" => "text/plain; charset=utf-8",
+        "xml" => "application/xml",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "wasm" => "application/wasm",
+        _ => "application/octet-stream",
+    }
+}
+
 /// Send a request with bounded retry + exponential backoff on transient
 /// network errors and HTTP 5xx responses. Requests with buffered (JSON)
 /// bodies are cloneable, so each attempt re-sends an identical request.
@@ -1689,81 +2055,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_injects_secrets_and_scrubs_output() {
-        let (mut engine, _dir) = setup();
-        engine
-            .add_secret("runvault", "API_KEY", "inject-me-123", Some(&agent_ctx()))
-            .unwrap();
-        let res = engine
-            .run(
-                "runvault",
-                "sh",
-                &["-c".into(), "echo INJECTED:$API_KEY".into()],
-                &RunOptions::default(),
-                Some(&agent_ctx()),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.code, 0);
-        assert!(!res.stdout.contains("inject-me-123"));
-        assert!(res.stdout.contains("INJECTED:[REDACTED]"));
-        assert!(res.scrubbed);
-        assert!(res.secrets_injected.contains(&"API_KEY".to_string()));
-    }
-
-    #[tokio::test]
-    async fn timeout_kills_long_running_commands() {
-        let (mut engine, _dir) = setup();
-        engine
-            .add_secret("slow", "K", "v", Some(&agent_ctx()))
-            .unwrap();
-        let res = engine
-            .run(
-                "slow",
-                "sh",
-                &["-c".into(), "sleep 30".into()],
-                &RunOptions {
-                    cwd: None,
-                    timeout_ms: Some(200),
-                    allowed_keys: None,
-                },
-                Some(&agent_ctx()),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.code, 124);
-        assert!(res.stderr.contains("timed out"));
-    }
-
-    #[tokio::test]
-    async fn output_capped_at_5mb() {
-        let (mut engine, _dir) = setup();
-        engine
-            .add_secret("big", "K", "v", Some(&agent_ctx()))
-            .unwrap();
-        let res = engine
-            .run(
-                "big",
-                "sh",
-                &[
-                    "-c".into(),
-                    "head -c 6000000 /dev/zero | tr '\\0' 'a'".into(),
-                ],
-                &RunOptions {
-                    cwd: None,
-                    timeout_ms: Some(30_000),
-                    allowed_keys: None,
-                },
-                Some(&agent_ctx()),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.code, 0);
-        assert!(res.stdout.len() < 6 * 1024 * 1024);
-        assert!(res.stdout.contains("truncated at 5MB"));
-    }
-
-    #[tokio::test]
     async fn audit_logs_structured_entries() {
         let (mut engine, _dir) = setup();
         engine
@@ -1864,36 +2155,6 @@ mod tests {
         assert!(engine.is_unlocked());
         let keys = engine.list_keys("g", Some(&agent_ctx())).unwrap();
         assert!(keys.contains(&"K".to_string()));
-    }
-
-    #[tokio::test]
-    async fn child_process_does_not_inherit_parent_env() {
-        let (mut engine, _dir) = setup();
-        engine
-            .add_secret("e", "K", "v", Some(&agent_ctx()))
-            .unwrap();
-        // Set a parent env var that must NOT reach the child.
-        std::env::set_var("VAULTLY_MASTER_PASSWORD", "topsecret-inherited");
-        let res = engine
-            .run(
-                "e",
-                "sh",
-                &[
-                    "-c".into(),
-                    "printf '%s' \"[${VAULTLY_MASTER_PASSWORD:-unset}]\"".into(),
-                ],
-                &RunOptions::default(),
-                Some(&agent_ctx()),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.code, 0);
-        assert!(
-            res.stdout.contains("[unset]"),
-            "child must not inherit parent env; got: {}",
-            res.stdout
-        );
-        std::env::remove_var("VAULTLY_MASTER_PASSWORD");
     }
 
     #[tokio::test]
@@ -2056,14 +2317,9 @@ mod tests {
             .add_secret("github", "GITHUB_TOKEN", "ghp-3", Some(&agent_ctx()))
             .unwrap();
 
-        let accounts = engine
-            .list_cf_accounts(Some(&agent_ctx()))
-            .unwrap();
+        let accounts = engine.list_cf_accounts(Some(&agent_ctx())).unwrap();
         assert_eq!(accounts.len(), 2);
-        let personal = accounts
-            .iter()
-            .find(|a| a.vault == "cf-personal")
-            .unwrap();
+        let personal = accounts.iter().find(|a| a.vault == "cf-personal").unwrap();
         assert_eq!(personal.auth, "token");
         assert!(personal.has_account_id);
         let work = accounts.iter().find(|a| a.vault == "cf-work").unwrap();
@@ -2086,26 +2342,16 @@ mod tests {
         engine
             .add_secret("cf-personal", "EXTRA", "v", Some(&agent_ctx()))
             .unwrap();
-        let accounts = engine
-            .list_cf_accounts(Some(&agent_ctx()))
-            .unwrap();
-        let personal = accounts
-            .iter()
-            .find(|a| a.vault == "cf-personal")
-            .unwrap();
+        let accounts = engine.list_cf_accounts(Some(&agent_ctx())).unwrap();
+        let personal = accounts.iter().find(|a| a.vault == "cf-personal").unwrap();
         assert_eq!(personal.label.as_deref(), Some("Personal"));
 
         // Clearing the label removes it.
         engine
             .set_account_label("cf-personal", None, Some(&agent_ctx()))
             .unwrap();
-        let accounts = engine
-            .list_cf_accounts(Some(&agent_ctx()))
-            .unwrap();
-        let personal = accounts
-            .iter()
-            .find(|a| a.vault == "cf-personal")
-            .unwrap();
+        let accounts = engine.list_cf_accounts(Some(&agent_ctx())).unwrap();
+        let personal = accounts.iter().find(|a| a.vault == "cf-personal").unwrap();
         assert_eq!(personal.label, None);
     }
 
@@ -2113,7 +2359,12 @@ mod tests {
     async fn engine_cf_accounts_surfaces_scope_and_filters() {
         let (mut engine, _dir) = setup();
         engine
-            .add_secret("cf-personal", "CLOUDFLARE_API_TOKEN", "t1", Some(&agent_ctx()))
+            .add_secret(
+                "cf-personal",
+                "CLOUDFLARE_API_TOKEN",
+                "t1",
+                Some(&agent_ctx()),
+            )
             .unwrap();
         engine
             .add_secret("cf-work", "CLOUDFLARE_API_TOKEN", "t2", Some(&agent_ctx()))
@@ -2123,13 +2374,13 @@ mod tests {
         engine.set_agent_policies(vec![AgentPolicy {
             name: "test-agent".into(),
             allowed_vaults: AllowedVaults::List(vec!["cf-personal".into()]),
-            // Run (deploy) granted, CfApi deliberately NOT granted.
+            // Deploy granted, CfApi deliberately NOT granted.
             allowed_operations: AllowedOperations::List(vec![
                 Operation::List,
                 Operation::ReadKeys,
                 Operation::Write,
                 Operation::Delete,
-                Operation::Run,
+                Operation::Deploy,
             ]),
             roles: Default::default(),
             vault_roles: Default::default(),
@@ -2143,7 +2394,7 @@ mod tests {
         let a = &accounts[0];
         assert_eq!(a.vault, "cf-personal");
         assert!(!a.cf_api, "CfApi not granted → cf_api must be false");
-        assert!(a.deploy, "Run granted → deploy must be true");
+        assert!(a.deploy, "Deploy granted → deploy must be true");
     }
 
     #[tokio::test]
@@ -2661,110 +2912,5 @@ mod tests {
         assert!(reqs2.lock().unwrap()[1]
             .path
             .ends_with(&format!("/dns_records/{}", rec_id)));
-    }
-
-    #[tokio::test]
-    async fn secrets_injected_reported_on_timeout() {
-        let (mut engine, _dir) = setup();
-        engine
-            .add_secret("slow", "API_KEY", "secret-123", Some(&agent_ctx()))
-            .unwrap();
-        let opts = RunOptions {
-            cwd: None,
-            timeout_ms: Some(200),
-            allowed_keys: None,
-        };
-        let res = engine
-            .run("slow", "sleep", &["10".into()], &opts, Some(&agent_ctx()))
-            .await
-            .unwrap();
-        // Timeout yields a non-zero exit code and still reports injected keys.
-        assert_ne!(res.code, 0);
-        assert!(res.secrets_injected.contains(&"API_KEY".to_string()));
-    }
-
-    #[tokio::test]
-    async fn run_reports_vault_exists_but_empty() {
-        let (mut engine, _dir) = setup();
-        engine
-            .add_secret("empty", "K", "v", Some(&agent_ctx()))
-            .unwrap();
-        engine
-            .delete_secret("empty", "K", Some(&agent_ctx()))
-            .unwrap();
-        let opts = RunOptions::default();
-        let err = engine
-            .run("empty", "true", &[], &opts, Some(&agent_ctx()))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, VaultError::VaultEmpty(_)));
-    }
-
-    #[tokio::test]
-    async fn run_reports_vault_not_found() {
-        let (mut engine, _dir) = setup();
-        let opts = RunOptions::default();
-        let err = engine
-            .run("nonexistent", "true", &[], &opts, Some(&agent_ctx()))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, VaultError::VaultNotFound(_)));
-    }
-
-    #[tokio::test]
-    async fn run_command_with_custom_timeout() {
-        let (mut engine, _dir) = setup();
-        engine
-            .add_secret("t", "K", "v", Some(&agent_ctx()))
-            .unwrap();
-        let opts = RunOptions {
-            cwd: None,
-            timeout_ms: Some(300),
-            allowed_keys: None,
-        };
-        let res = engine
-            .run_command("t", "sleep 10", &opts, Some(&agent_ctx()))
-            .await
-            .unwrap();
-        assert_ne!(res.code, 0, "command should time out");
-    }
-
-    #[tokio::test]
-    async fn run_filters_allowed_keys() {
-        let (mut engine, _dir) = setup();
-        engine
-            .add_secret("multi", "A", "val-a", Some(&agent_ctx()))
-            .unwrap();
-        engine
-            .add_secret("multi", "B", "val-b", Some(&agent_ctx()))
-            .unwrap();
-        let opts = RunOptions {
-            cwd: None,
-            timeout_ms: None,
-            allowed_keys: Some(&["A".to_string()]),
-        };
-        let res = engine
-            .run_command("multi", "env", &opts, Some(&agent_ctx()))
-            .await
-            .unwrap();
-        assert!(res.secrets_injected.contains(&"A".to_string()));
-        assert!(!res.secrets_injected.contains(&"B".to_string()));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn run_preserves_path_for_child_commands() {
-        let (mut engine, _dir) = setup();
-        engine
-            .add_secret("path", "K", "v", Some(&agent_ctx()))
-            .unwrap();
-        let opts = RunOptions::default();
-        let expected_path = std::env::var("PATH").unwrap();
-        let res = engine
-            .run_command("path", "sh -c 'printf %s \"$PATH\"'", &opts, Some(&agent_ctx()))
-            .await
-            .unwrap();
-        assert_eq!(res.code, 0);
-        assert_eq!(res.stdout, expected_path);
     }
 }
