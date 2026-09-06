@@ -8,7 +8,6 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use serde_json::{Map, Value};
-use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command as TokioCommand;
 
@@ -1760,7 +1759,7 @@ fn collect_deploy_files(root: &Path) -> Result<Vec<DeployFile>> {
                 relative
             )));
         }
-        let hash = hex::encode(Sha256::digest(&bytes));
+        let hash = pages_asset_hash(&relative, &bytes);
         files.push(DeployFile {
             relative,
             hash,
@@ -1768,6 +1767,19 @@ fn collect_deploy_files(root: &Path) -> Result<Vec<DeployFile>> {
         });
     }
     Ok(files)
+}
+
+/// Match Wrangler's Pages Direct Upload asset key algorithm:
+/// BLAKE3(base64(file bytes) + file extension), truncated to 32 hex chars.
+fn pages_asset_hash(relative: &str, bytes: &[u8]) -> String {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    let extension = Path::new(relative)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    let mut input = encoded;
+    input.push_str(extension);
+    hex::encode(blake3::hash(input.as_bytes()).as_bytes())[..32].to_string()
 }
 
 fn collect_deploy_paths(
