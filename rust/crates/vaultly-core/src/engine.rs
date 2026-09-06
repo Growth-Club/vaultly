@@ -970,7 +970,10 @@ impl VaultEngine {
             form = form.text("branch", branch.clone());
         }
         form = form.text("pages_build_output_dir", target.output_dir.clone());
-        let response = send_with_retry(
+        // Deployment creation is a multipart POST and reqwest cannot clone
+        // multipart request bodies for retry. It also creates a new remote
+        // deployment, so retrying it automatically could create duplicates.
+        let response = send_once(
             client
                 .post(format!("{}/deployments", base))
                 .headers(api_headers)
@@ -1836,6 +1839,14 @@ async fn send_with_retry(request: reqwest::RequestBuilder) -> Result<reqwest::Re
             Err(e) => return Err(VaultError::CloudflareRequest(e)),
         }
     }
+}
+
+/// Send a non-retryable request exactly once.
+///
+/// Use this for mutating requests whose body is not cloneable or whose retry
+/// could create a duplicate remote resource.
+async fn send_once(request: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+    request.send().await.map_err(VaultError::CloudflareRequest)
 }
 
 pub fn urlencode(s: &str) -> String {
