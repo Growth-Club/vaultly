@@ -35,11 +35,14 @@ vaultly cf pages personal
 | `cf_pages_projects` | Discover Pages projects |
 | `cf_workers_list` | Discover Workers |
 | `cf_secrets` | List, set, or delete Worker secrets; values are write-only |
-| `deploy_targets` | List human-approved deployment metadata |
+| `deploy_targets` | List deployment metadata |
+| `deploy_target_adopt` | Derive and verify a target from a local Wrangler config |
 | `deploy_target` | Deploy one target by ID |
 
-Agents cannot issue arbitrary Cloudflare API paths, choose an account for a
-deployment, or pass an arbitrary project/build command.
+Agents cannot issue arbitrary Cloudflare API paths, choose an account ID for a
+deployment, or pass an arbitrary project/build command. Dynamic adoption
+resolves the account from a selected Vaultly Cloudflare vault, derives the
+resource from local Wrangler config, and verifies it exists in that account.
 
 ## Deployment safety
 

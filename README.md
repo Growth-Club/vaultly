@@ -8,7 +8,7 @@
 
 [![Rust](https://img.shields.io/badge/Rust-1.96-000000?logo=rust&logoColor=white)](https://rust-lang.org)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![MCP](https://img.shields.io/badge/MCP-24_tools-8A2BE2)](#ai-agent-integration-mcp)
+[![MCP](https://img.shields.io/badge/MCP-25_tools-8A2BE2)](#ai-agent-integration-mcp)
 [![Cloudflare](https://img.shields.io/badge/Cloudflare-Workers-F38020?logo=cloudflare&logoColor=white)](https://workers.cloudflare.com)
 [![Security](https://img.shields.io/badge/encryption-AES--256--GCM-red)](#security)
 
@@ -63,10 +63,13 @@ VAULTLY_HUMAN_MODE=1 vaultly target add gateandtech-web \
   --project-dir /path/to/GATEAndTech-All-In-One-Web \
   --build-command "npm run build" --output-dir apps/web/dist --branch main
 
-# 6. Let an agent deploy by target ID only
+# 6. Or let an agent adopt a target from a local Wrangler config
+vaultly target adopt --vault cf-gateandtech --config apps/api/wrangler.jsonc --json
+
+# 7. Let an agent deploy by target ID only
 vaultly deploy gateandtech-web --json
 
-# 7. Set up the MCP server for your AI tool
+# 8. Set up the MCP server for your AI tool
 vaultly mcp                          # add to your tool's MCP config (see below)
 ```
 
@@ -111,14 +114,14 @@ vaultly delete <vault> [key]              Delete a secret or vault
 vaultly env <vault>                       Output shell export statements (human only)
 vaultly export <vault> <file>             Export plaintext (--encrypted for portable blob)
 vaultly import <file> [--vault name]      Import .env/.json/.yaml/.csv (--encrypted for blob)
-vaultly target add|list|remove ...       Manage human-approved deployment targets
+vaultly target add|adopt|list|remove ... Manage deployment targets
 vaultly deploy <target> [--json]         Deploy a fixed target without exposing credentials
 vaultly gen [-l LENGTH] [-s]              Generate a random secret
 vaultly rotate <vault> <key> [--expired]  Rotate a secret (or all expired) to a new random value
 vaultly doctor [--json]                   Environment diagnostics + health checks
 vaultly cf add|list|remove|zones|pages|secrets  Cloudflare credentials/discovery
 vaultly keychain store|remove             macOS Keychain lock/unlock
-vaultly mcp                               Start the MCP server (24 agent tools)
+vaultly mcp                               Start the MCP server (25 agent tools)
 vaultly keychain store|remove             Manage Keychain auto-unlock
 vaultly kill                              Emergency lock + clear Keychain
 vaultly status                            Session and vault info
@@ -147,8 +150,9 @@ Cloudflare discovery/write-only Worker secret management, and approved
 deployment targets. Agents never choose an arbitrary account, project,
 directory, branch, or command.
 
-Deployment is target-bound: agents use `deploy_targets` to discover approved
-targets and `deploy_target` with only a `targetId`. The old arbitrary
+Deployment is target-bound: agents use `deploy_target_adopt` to derive and
+verify a target from a local Wrangler config, then `deploy_target` with only a
+`targetId`. The old arbitrary
 `vault_run` and `cf_pages_deploy` paths are disabled for agents.
 
 > 🚫 **Write-only for agents.** No MCP tool ever returns a raw secret value;
@@ -169,7 +173,8 @@ targets and `deploy_target` with only a `targetId`. The old arbitrary
 
 **The core invariant:** agents get approved *operations*, never raw secrets.
 Arbitrary credential-injecting commands are disabled for agents; deployments
-must use a human-registered target.
+may use a human-registered target or dynamically adopt one from a validated
+local Wrangler config.
 
 Useful commands:
 

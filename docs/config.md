@@ -7,7 +7,7 @@ Vaultly stores its local state under `~/.vaultly` by default. Set
 ~/.vaultly/
 ├── config.json                 # salt, verifier, policy/session settings
 ├── audit.log                   # hash-chained metadata-only audit log
-├── deployment-targets.json     # non-secret human-approved targets
+├── deployment-targets.json     # non-secret validated deployment targets
 └── vaults/                     # encrypted credential files
 ```
 

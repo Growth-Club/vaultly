@@ -157,7 +157,8 @@ fn tools_list() -> Vec<Tool> {
         Tool { name: "cf_pages_projects", description: "List Pages projects for discovery; deployment requires a registered target.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault")},"required":["vaultName"]}) },
         Tool { name: "cf_workers_list", description: "List Workers for discovery; deployment requires a registered target.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault")},"required":["vaultName"]}) },
         Tool { name: "cf_secrets", description: "List/set/delete Worker secrets. Values are write-only.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault"),"scriptName":str_prop("Worker name"),"action":json!({"type":"string","enum":["list","set","delete"]}),"name":str_prop("Secret name"),"value":str_prop("Secret value; write-only")},"required":["vaultName","scriptName","action"]}) },
-        Tool { name: "deploy_targets", description: "List human-approved deployment targets. Metadata only.", schema: json!({"type":"object","properties":{}}) },
+        Tool { name: "deploy_targets", description: "List deployment targets. Metadata only.", schema: json!({"type":"object","properties":{}}) },
+        Tool { name: "deploy_target_adopt", description: "Discover and idempotently adopt a Pages/Worker target from a Wrangler config in the current workspace. Account and project identity are resolved from the selected Cloudflare vault and live account inventory.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault; account is resolved from this vault"),"configPath":str_prop("Wrangler JSON/JSONC/TOML config inside the current workspace")},"required":["vaultName","configPath"]}) },
         Tool { name: "deploy_target", description: "Deploy one approved target by ID. The agent cannot choose account, project, branch, directory, or command.", schema: json!({"type":"object","properties":{"targetId":str_prop("Registered deployment target ID")},"required":["targetId"]}) },
         Tool { name: "policy_info", description: "Show effective agent operation policy without secrets.", schema: json!({"type":"object","properties":{}}) },
     ]
@@ -219,6 +220,25 @@ async fn tool_deploy_targets(engine: &mut VaultEngine, _ctx: &CallerContext) -> 
     }
 }
 
+async fn tool_deploy_target_adopt(
+    engine: &mut VaultEngine,
+    args: &Value,
+    ctx: &CallerContext,
+) -> Value {
+    require!(args, vault => "vaultName", config => "configPath");
+    match engine
+        .adopt_deployment_target(vault, std::path::Path::new(config), Some(ctx))
+        .await
+    {
+        Ok(target) => json!({
+            "content": [{ "type": "text", "text": serde_json::to_string(&target).unwrap_or_else(|_| "{}".into()) }],
+            "status": "adopted",
+            "target": target,
+        }),
+        Err(e) => fail_err(&e),
+    }
+}
+
 async fn tool_deploy_target(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
     require!(args, target_id => "targetId");
     let targets = match engine.store().load_deployment_targets() {
@@ -273,10 +293,11 @@ async fn call_tool(engine: &mut VaultEngine, name: &str, args: &Value) -> Value 
         "cf_workers_list" => tool_cf_workers_list(engine, args, &ctx).await,
         "cf_secrets" => tool_cf_secrets(engine, args, &ctx).await,
         "deploy_targets" => tool_deploy_targets(engine, &ctx).await,
+        "deploy_target_adopt" => tool_deploy_target_adopt(engine, args, &ctx).await,
         "deploy_target" => tool_deploy_target(engine, args, &ctx).await,
         "policy_info" => tool_policy_info().await,
         "vault_run" | "cf_deploy" | "cf_pages_deploy" => {
-            fail("This operation is disabled for agents. Use a human-approved deployment target.")
+            fail("This operation is disabled for agents. Use deploy_target_adopt or a validated deployment target.")
         }
         _ => fail(
             "Unknown tool or disabled operation. Use tools/list for the supported core interface.",
@@ -879,7 +900,7 @@ async fn tool_vault_import_encrypted(
 
 async fn tool_policy_info() -> Value {
     ok(format!(
-        "Vaultly agent security policy:\n  Session TTL: {} min\n\n  Raw reads and arbitrary credential-injected commands are disabled.\n  Permitted: encrypted credential operations, safe Cloudflare discovery,\n  write-only Worker secrets, and human-approved target deployment.\n  Every tool returns names, metadata, or safe operation status — never raw secret values.",
+        "Vaultly agent security policy:\n  Session TTL: {} min\n\n  Raw reads and arbitrary credential-injected commands are disabled.\n  Permitted: encrypted credential operations, safe Cloudflare discovery,\n  write-only Worker secrets, validated dynamic target adoption, and deployment.\n  Every tool returns names, metadata, or safe operation status — never raw secret values.",
         SESSION_TTL_MINUTES
     ))
 }

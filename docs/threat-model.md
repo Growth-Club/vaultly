@@ -41,7 +41,8 @@ constructs authenticated Cloudflare requests.
 - A compromised host can inspect the Vaultly process memory; host compromise is
   outside the local encryption boundary.
 - A human can intentionally register an unsafe deployment target. Registration
-  is therefore human-only and target metadata is validated before persistence.
+  is therefore restricted to validated target adoption or explicit human
+  registration, and target metadata is validated before persistence.
 - Worker deployment necessarily gives the fixed deployment subprocess the
   approved Cloudflare credential scope. Agents cannot change that subprocess's
   target or command.

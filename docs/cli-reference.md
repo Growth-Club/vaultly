@@ -76,6 +76,24 @@ vaultly target list --json
 vaultly deploy <ID> --json
 ```
 
+### Agent-safe dynamic adoption
+
+An agent can derive a target from a local Wrangler config without receiving or
+choosing a Cloudflare account ID:
+
+```bash
+vaultly target adopt \
+  --vault cf-example \
+  --config apps/api/wrangler.jsonc \
+  --json
+```
+
+Vaultly resolves the account from the selected vault, reads the Worker or Pages
+identity from the config, verifies the resource exists in that account, and
+saves an idempotent target. The config must be inside the current workspace.
+Worker adoption requires `npm run deploy`, preserving repository predeploy
+guards. No raw credential is returned to the agent.
+
 The target record is validated and stored separately from secrets. The agent
 cannot override its account ID, project, branch, paths, or build command.
 Pages builds run without Cloudflare environment variables; Vaultly performs the

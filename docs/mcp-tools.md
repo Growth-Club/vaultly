@@ -1,8 +1,8 @@
 # Vaultly MCP tools
 
 `vaultly mcp` exposes a deliberately small, agent-safe interface over stdio.
-It supports 24 tools: encrypted personal credentials, Cloudflare discovery,
-write-only Worker secrets, and human-approved deployment targets.
+It supports 25 tools: encrypted personal credentials, Cloudflare discovery,
+write-only Worker secrets, and validated deployment targets.
 
 No tool returns a raw credential. Agents never receive the master password,
 Cloudflare token, or any other stored secret. A human unlocks Vaultly once via
@@ -51,12 +51,16 @@ responses are scrubbed before they are returned to the agent.
 
 | Tool | Purpose |
 |---|---|
-| `deploy_targets` | List human-registered target metadata |
+| `deploy_targets` | List registered target metadata |
+| `deploy_target_adopt` | Discover, verify, and idempotently register a target from a local Wrangler config |
 | `deploy_target` | Deploy one target by ID |
 
-Targets are registered by a human with `vaultly target add`. The agent supplies
-only `targetId`; it cannot supply or override the Cloudflare account, project,
-branch, project directory, output directory, or build command.
+Explicit targets may be registered by a human with `vaultly target add`.
+Agents may also call `deploy_target_adopt` with a selected Cloudflare vault and
+a Wrangler config inside the current workspace. The account ID comes only from
+that vault, the project/provider come only from the config, and the live
+Cloudflare account must contain the resource. The agent cannot supply an
+account ID, project name, arbitrary command, or outside-workspace path.
 
 For Pages, Vaultly builds without Cloudflare credentials and performs the
 Cloudflare upload internally. For Workers, Vaultly invokes the fixed target

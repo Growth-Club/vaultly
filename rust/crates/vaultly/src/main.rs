@@ -3,6 +3,7 @@
 //! for identical audit + policy + encryption behavior.
 
 use std::io::IsTerminal;
+use std::path::Path;
 use std::process::exit;
 
 use clap::{Parser, Subcommand};
@@ -182,13 +183,13 @@ enum Command {
         )]
         encrypted: bool,
     },
-    /// Deploy a human-registered target (agent-safe; no arbitrary account/project args)
+    /// Deploy a validated target (agent-safe; no arbitrary account/project args)
     Deploy {
         target: String,
         #[arg(long, help = "Output one JSON object for automation")]
         json: bool,
     },
-    /// Manage deployment targets (metadata only; add/remove are human-only)
+    /// Manage deployment targets
     Target {
         #[command(subcommand)]
         sub: TargetCommand,
@@ -332,6 +333,19 @@ enum TargetCommand {
         output_dir: String,
         #[arg(long)]
         branch: Option<String>,
+    },
+    /// Discover and idempotently adopt the target described by a Wrangler config.
+    /// Account and project identity are resolved from the selected Cloudflare vault and live API.
+    Adopt {
+        #[arg(long, help = "Cloudflare vault name (cf- prefix optional)")]
+        vault: String,
+        #[arg(
+            long,
+            help = "Local Wrangler JSON/JSONC/TOML config inside the current workspace"
+        )]
+        config: String,
+        #[arg(long, help = "Output one JSON object for automation")]
+        json: bool,
     },
     /// List registered deployment targets (never includes secret values)
     List {
@@ -529,6 +543,11 @@ async fn main() {
                     branch.as_deref(),
                 )
             }
+            TargetCommand::Adopt {
+                vault,
+                config,
+                json,
+            } => cmd_target_adopt(&vault, &config, json).await,
             TargetCommand::List { json } => cmd_target_list(json),
             TargetCommand::Remove { id } => {
                 block_in_agent_mode("target remove");
@@ -1405,6 +1424,7 @@ fn cmd_target_add(
         build_command: build_command.to_string(),
         output_dir: output_dir.to_string(),
         branch: branch.map(str::to_string),
+        worker_package_deploy: false,
         created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
     };
     if let Err(e) = target.validate() {
@@ -1440,6 +1460,52 @@ fn cmd_target_add(
         "✓".green(),
         target.id
     );
+}
+
+async fn cmd_target_adopt(vault: &str, config: &str, json_output: bool) {
+    let vault_name = cf_vault(vault);
+    let mut engine = require_unlock();
+    match engine
+        .adopt_deployment_target(&vault_name, Path::new(config), target_context().as_ref())
+        .await
+    {
+        Ok(target) => {
+            if json_output || agent_mode() {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": "adopted",
+                        "target": target,
+                    })
+                );
+            } else {
+                println!(
+                    "{} Adopted target '{}' for {} '{}'",
+                    "✓".green(),
+                    target.id,
+                    match target.provider {
+                        DeploymentProvider::Pages => "Pages project",
+                        DeploymentProvider::Worker => "Worker",
+                    },
+                    target.project
+                );
+            }
+        }
+        Err(e) => {
+            if json_output || agent_mode() {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": "error",
+                        "error": e.to_string(),
+                    })
+                );
+            } else {
+                eprintln!("{} {}", "✗".red(), e);
+            }
+            exit(1);
+        }
+    }
 }
 
 fn cmd_target_remove(id: &str) {

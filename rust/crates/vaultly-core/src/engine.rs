@@ -12,7 +12,9 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command as TokioCommand;
 
 use crate::crypto::SecretMeta;
-use crate::deploy::{DeploymentProvider, DeploymentResult, DeploymentTarget};
+use crate::deploy::{
+    discover_deployment_spec, DeploymentProvider, DeploymentResult, DeploymentTarget,
+};
 use crate::error::{Result, VaultError};
 use crate::policy::{CallerContext, Operation, PolicyEngine};
 use crate::scrubber::scrub_output;
@@ -804,35 +806,51 @@ impl VaultEngine {
         match target.provider {
             DeploymentProvider::Pages => self.deploy_pages_files(target, &output_dir, ctx).await,
             DeploymentProvider::Worker => {
-                // Wrangler is invoked only from target metadata, never from
-                // agent-provided command/args. The child receives the token,
-                // but the agent receives only scrubbed output and cannot choose
-                // the account, script, or command.
-                let args = vec![
-                    "deploy".to_string(),
-                    "--name".to_string(),
-                    target.project.clone(),
-                    "--account-id".to_string(),
-                    target.account_id.clone(),
+                // Dynamically adopted Workers run the repository's fixed
+                // package deploy script. This preserves package predeploy
+                // guards (remote migrations and required secret checks) while
+                // Vaultly injects only the approved Cloudflare credentials.
+                // Legacy human targets retain the old fixed Wrangler path.
+                let allowed_keys = [
+                    "CLOUDFLARE_API_TOKEN".to_string(),
+                    "CLOUDFLARE_EMAIL".to_string(),
+                    "CLOUDFLARE_API_KEY".to_string(),
+                    "CLOUDFLARE_ACCOUNT_ID".to_string(),
                 ];
-                let result = self
-                    .run(
+                let result = if target.worker_package_deploy {
+                    self.run(
+                        &target.vault,
+                        "npm",
+                        &["run".to_string(), "deploy".to_string()],
+                        &RunOptions {
+                            cwd: Some(&target.project_dir),
+                            timeout_ms: Some(1_800_000),
+                            allowed_keys: Some(&allowed_keys),
+                        },
+                        ctx,
+                    )
+                    .await?
+                } else {
+                    let args = vec![
+                        "deploy".to_string(),
+                        "--name".to_string(),
+                        target.project.clone(),
+                        "--account-id".to_string(),
+                        target.account_id.clone(),
+                    ];
+                    self.run(
                         &target.vault,
                         "npx",
                         &args,
                         &RunOptions {
                             cwd: Some(&target.project_dir),
                             timeout_ms: Some(1_800_000),
-                            allowed_keys: Some(&[
-                                "CLOUDFLARE_API_TOKEN".to_string(),
-                                "CLOUDFLARE_EMAIL".to_string(),
-                                "CLOUDFLARE_API_KEY".to_string(),
-                                "CLOUDFLARE_ACCOUNT_ID".to_string(),
-                            ]),
+                            allowed_keys: Some(&allowed_keys),
                         },
                         ctx,
                     )
-                    .await?;
+                    .await?
+                };
                 if result.code != 0 {
                     return Err(VaultError::Policy(format!(
                         "Worker deployment failed for target '{}' with exit code {}",
@@ -849,6 +867,107 @@ impl VaultEngine {
                 })
             }
         }
+    }
+
+    /// Discover and idempotently register a deployment target from a local
+    /// Wrangler config. The agent supplies only the selected Vaultly vault and
+    /// local config path; account identity comes from the vault and the
+    /// Cloudflare resource must already exist in that account.
+    pub async fn adopt_deployment_target(
+        &mut self,
+        vault_name: &str,
+        config_path: &Path,
+        ctx: Option<&CallerContext>,
+    ) -> Result<DeploymentTarget> {
+        self.op(ctx, Operation::Deploy, vault_name)?;
+        let account_id = self.cf_account_id(vault_name)?;
+        let spec = discover_deployment_spec(config_path).map_err(VaultError::Policy)?;
+
+        let resource_exists = match spec.provider {
+            DeploymentProvider::Pages => {
+                let response = self
+                    .cloudflare_account_api(vault_name, "GET", "/pages/projects", None, ctx)
+                    .await?;
+                if !(200..300).contains(&response.status) {
+                    return Err(VaultError::CloudflareResponse(format!(
+                        "Pages discovery failed with HTTP {}",
+                        response.status
+                    )));
+                }
+                response
+                    .data
+                    .get("result")
+                    .and_then(Value::as_array)
+                    .map(|projects| {
+                        projects.iter().any(|project| {
+                            project.get("name").and_then(Value::as_str) == Some(&spec.project)
+                        })
+                    })
+                    .unwrap_or(false)
+            }
+            DeploymentProvider::Worker => {
+                let (resolved_account, workers) = self.list_workers(vault_name, ctx).await?;
+                if resolved_account != account_id {
+                    return Err(VaultError::Policy(
+                        "Cloudflare account identity changed during target adoption".into(),
+                    ));
+                }
+                workers.iter().any(|worker| worker == &spec.project)
+            }
+        };
+        if !resource_exists {
+            return Err(VaultError::Policy(format!(
+                "Cloudflare {} '{}' was not found in the selected account",
+                match spec.provider {
+                    DeploymentProvider::Pages => "Pages project",
+                    DeploymentProvider::Worker => "Worker",
+                },
+                spec.project
+            )));
+        }
+
+        let target = DeploymentTarget {
+            id: spec.target_id(&account_id),
+            provider: spec.provider,
+            vault: vault_name.to_string(),
+            account_id,
+            project: spec.project,
+            project_dir: spec.project_dir.to_string_lossy().to_string(),
+            build_command: spec.build_command,
+            output_dir: spec.output_dir,
+            branch: None,
+            worker_package_deploy: spec.worker_package_deploy,
+            created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        };
+        target.validate().map_err(VaultError::Policy)?;
+
+        let store = self.store();
+        let mut targets = store.load_deployment_targets()?;
+        if let Some(existing) = targets.iter().find(|existing| existing.id == target.id) {
+            if !same_target_identity(existing, &target) {
+                return Err(VaultError::Policy(format!(
+                    "target '{}' already exists with different deployment metadata",
+                    target.id
+                )));
+            }
+            self.audit(
+                "TARGET_ADOPT",
+                &format!("target={} status=already_registered", target.id),
+                ctx,
+            );
+            return Ok(existing.clone());
+        }
+        targets.push(target.clone());
+        store.save_deployment_targets(&targets)?;
+        self.audit(
+            "TARGET_ADOPT",
+            &format!(
+                "target={} provider={:?} project={} vault={}",
+                target.id, target.provider, target.project, target.vault
+            ),
+            ctx,
+        );
+        Ok(target)
     }
 
     async fn deploy_pages_files(
@@ -1720,6 +1839,18 @@ impl VaultEngine {
             eprintln!("⚠ Vaultly: failed to write audit entry: {e}");
         }
     }
+}
+
+fn same_target_identity(left: &DeploymentTarget, right: &DeploymentTarget) -> bool {
+    left.provider == right.provider
+        && left.vault == right.vault
+        && left.account_id == right.account_id
+        && left.project == right.project
+        && left.project_dir == right.project_dir
+        && left.build_command == right.build_command
+        && left.output_dir == right.output_dir
+        && left.branch == right.branch
+        && left.worker_package_deploy == right.worker_package_deploy
 }
 
 async fn read_capped(stream: &mut (impl AsyncRead + Unpin)) -> (Vec<u8>, bool) {
