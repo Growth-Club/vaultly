@@ -56,20 +56,13 @@ VAULTLY_HUMAN_MODE=1 vaultly add github -k GITHUB_TOKEN -v "ghp_xxx"
 # 4. Read it back (humans only — blocked in agent mode)
 VAULTLY_HUMAN_MODE=1 vaultly get github GITHUB_TOKEN
 
-# 5. Register a deployment target as a human
-VAULTLY_HUMAN_MODE=1 vaultly target add gateandtech-web \
-  --provider pages --vault cf-gateandtech \
-  --account-id <ACCOUNT_ID> --project gateandtech-all-in-one-web \
-  --project-dir /path/to/GATEAndTech-All-In-One-Web \
-  --build-command "npm run build" --output-dir apps/web/dist --branch main
-
-# 6. Or let an agent adopt a target from a local Wrangler config
+# 5. Let an agent adopt a target from a local Wrangler config
 vaultly target adopt --vault cf-gateandtech --config apps/api/wrangler.jsonc --json
 
-# 7. Let an agent deploy by target ID only
-vaultly deploy gateandtech-web --json
+# 6. Let an agent deploy by target ID only
+vaultly deploy <ADOPTED_TARGET_ID> --json
 
-# 8. Set up the MCP server for your AI tool
+# 7. Set up the MCP server for your AI tool
 vaultly mcp                          # add to your tool's MCP config (see below)
 ```
 
@@ -80,7 +73,7 @@ For setup, use the CLI help and the one-time human bootstrap above.
 Vaultly runs in agent mode by default. Human-only commands can be enabled for
 one command with `VAULTLY_HUMAN_MODE=1`. Human commands use the stored macOS
 Keychain credential when available and otherwise prompt securely. For
-unattended agents or CI, provide the master password through
+isolated CI only, provide the master password through
 `VAULTLY_MASTER_PASSWORD`:
 
 ```bash
@@ -114,13 +107,13 @@ vaultly delete <vault> [key]              Delete a secret or vault
 vaultly env <vault>                       Output shell export statements (human only)
 vaultly export <vault> <file>             Export plaintext (--encrypted for portable blob)
 vaultly import <file> [--vault name]      Import .env/.json/.yaml/.csv (--encrypted for blob)
-vaultly target add|adopt|list|remove ... Manage deployment targets
+vaultly target adopt|list ...         Agent-safe target discovery and metadata
+vaultly target add|remove ...         Legacy explicit administration (human only)
 vaultly deploy <target> [--json]         Deploy a fixed target without exposing credentials
 vaultly gen [-l LENGTH] [-s]              Generate a random secret
 vaultly rotate <vault> <key> [--expired]  Rotate a secret (or all expired) to a new random value
 vaultly doctor [--json]                   Environment diagnostics + health checks
 vaultly cf add|list|remove|zones|pages|secrets  Cloudflare credentials/discovery
-vaultly keychain store|remove             macOS Keychain lock/unlock
 vaultly mcp                               Start the MCP server (25 agent tools)
 vaultly keychain store|remove             Manage Keychain auto-unlock
 vaultly kill                              Emergency lock + clear Keychain
@@ -160,6 +153,12 @@ verify a target from a local Wrangler config, then `deploy_target` with only a
 > Deployment builds run without vault credentials; Vaultly performs the
 > Cloudflare upload internally and returns only structured deployment status.
 
+Write-only means Vaultly never lets an agent retrieve a value already stored.
+If a human puts a raw value into an agent request, that value is necessarily
+visible to the agent before Vaultly receives it. For agent-generated values,
+use `vault_generate` or `vault_rotate` so the value is created inside Vaultly
+and never returned.
+
 ## 🛡️ Security Model
 
 | Feature | Details |
@@ -173,8 +172,14 @@ verify a target from a local Wrangler config, then `deploy_target` with only a
 
 **The core invariant:** agents get approved *operations*, never raw secrets.
 Arbitrary credential-injecting commands are disabled for agents; deployments
-may use a human-registered target or dynamically adopt one from a validated
-local Wrangler config.
+use a dynamically validated local Wrangler config or a legacy human-registered
+target.
+
+The boundary is the Vaultly process. A credential-bearing Worker deployment
+must run trusted project tooling because that tooling needs Cloudflare
+authentication; a hostile project or compromised host can inspect its own
+process environment. Vaultly therefore never gives credentials to Pages
+builds, arbitrary agent commands, or MCP responses.
 
 Useful commands:
 

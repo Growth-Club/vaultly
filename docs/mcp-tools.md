@@ -30,7 +30,9 @@ macOS Keychain; the MCP process performs the approved operation locally.
 All credential names and values are validated before storage. Expiry may be
 provided as either `ttlSeconds` or `expiresAt`, never both. Plaintext export,
 raw secret reads, and arbitrary credential-injected commands are not part of
-the agent interface.
+the agent interface. A value supplied in a tool request is visible to the
+caller by definition; use `vault_generate` or `vault_rotate` when the caller
+must not see the generated value.
 
 ## Cloudflare tools
 
@@ -55,12 +57,14 @@ responses are scrubbed before they are returned to the agent.
 | `deploy_target_adopt` | Discover, verify, and idempotently register a target from a local Wrangler config |
 | `deploy_target` | Deploy one target by ID |
 
-Explicit targets may be registered by a human with `vaultly target add`.
-Agents may also call `deploy_target_adopt` with a selected Cloudflare vault and
+Agents normally call `deploy_target_adopt` with a selected Cloudflare vault and
 a Wrangler config inside the current workspace. The account ID comes only from
 that vault, the project/provider come only from the config, and the live
 Cloudflare account must contain the resource. The agent cannot supply an
 account ID, project name, arbitrary command, or outside-workspace path.
+
+`vaultly target add` remains a legacy human-only fallback for repositories that
+cannot be discovered from Wrangler configuration.
 
 For Pages, Vaultly builds without Cloudflare credentials and performs the
 Cloudflare upload internally. For Workers, Vaultly invokes the fixed target

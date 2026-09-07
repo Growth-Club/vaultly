@@ -25,7 +25,7 @@ retired deploy/run names are rejected.
 
 ## Deployment protocol
 
-Humans may register a fully explicit target once:
+Legacy fallback: a human may register a fully explicit target once:
 
 ```bash
 VAULTLY_HUMAN_MODE=1 vaultly target add <ID> \

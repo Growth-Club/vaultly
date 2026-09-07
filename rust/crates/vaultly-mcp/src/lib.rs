@@ -154,8 +154,8 @@ fn tools_list() -> Vec<Tool> {
         Tool { name: "cf_account_label", description: "Read or set a non-secret Cloudflare account label.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault"),"label":str_prop("Label; omit to read, empty to clear")},"required":["vaultName"]}) },
         Tool { name: "cf_health", description: "Verify one Cloudflare credential set.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault")},"required":["vaultName"]}) },
         Tool { name: "cf_zones", description: "List domains in a Cloudflare account.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault")},"required":["vaultName"]}) },
-        Tool { name: "cf_pages_projects", description: "List Pages projects for discovery; deployment requires a registered target.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault")},"required":["vaultName"]}) },
-        Tool { name: "cf_workers_list", description: "List Workers for discovery; deployment requires a registered target.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault")},"required":["vaultName"]}) },
+        Tool { name: "cf_pages_projects", description: "List Pages projects for discovery and target adoption.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault")},"required":["vaultName"]}) },
+        Tool { name: "cf_workers_list", description: "List Workers for discovery and target adoption.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault")},"required":["vaultName"]}) },
         Tool { name: "cf_secrets", description: "List/set/delete Worker secrets. Values are write-only.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault"),"scriptName":str_prop("Worker name"),"action":json!({"type":"string","enum":["list","set","delete"]}),"name":str_prop("Secret name"),"value":str_prop("Secret value; write-only")},"required":["vaultName","scriptName","action"]}) },
         Tool { name: "deploy_targets", description: "List deployment targets. Metadata only.", schema: json!({"type":"object","properties":{}}) },
         Tool { name: "deploy_target_adopt", description: "Discover and idempotently adopt a Pages/Worker target from a Wrangler config in the current workspace. Account and project identity are resolved from the selected Cloudflare vault and live account inventory.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault; account is resolved from this vault"),"configPath":str_prop("Wrangler JSON/JSONC/TOML config inside the current workspace")},"required":["vaultName","configPath"]}) },
@@ -163,12 +163,6 @@ fn tools_list() -> Vec<Tool> {
         Tool { name: "policy_info", description: "Show effective agent operation policy without secrets.", schema: json!({"type":"object","properties":{}}) },
     ]
 }
-// ─── R2 Object Storage ───────────────────────────────────
-
-// ─── KV Storage ──────────────────────────────────────────
-
-// ─── D1 Database ─────────────────────────────────────────
-
 // ─── Cloudflare Pages ────────────────────────────────────
 
 async fn tool_cf_pages_projects(
@@ -257,16 +251,6 @@ async fn tool_deploy_target(engine: &mut VaultEngine, args: &Value, ctx: &Caller
         Err(e) => fail_err(&e),
     }
 }
-
-// ─── Workers bindings / triggers ─────────────────────────
-
-// ─── SSL / certificates ──────────────────────────────────
-
-// ─── WAF / firewall rules ────────────────────────────────
-
-// ─── Load balancers ──────────────────────────────────────
-
-// ─── Email routing ───────────────────────────────────────
 
 async fn call_tool(engine: &mut VaultEngine, name: &str, args: &Value) -> Value {
     let ctx = agent_ctx();

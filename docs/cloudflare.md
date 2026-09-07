@@ -40,21 +40,27 @@ vaultly cf pages personal
 | `deploy_target` | Deploy one target by ID |
 
 Agents cannot issue arbitrary Cloudflare API paths, choose an account ID for a
-deployment, or pass an arbitrary project/build command. Dynamic adoption
-resolves the account from a selected Vaultly Cloudflare vault, derives the
-resource from local Wrangler config, and verifies it exists in that account.
+deployment, or pass an arbitrary project/build command. Dynamic adoption is
+the normal path: it resolves the account from a selected Vaultly Cloudflare
+vault, derives the resource from local Wrangler config, and verifies it exists
+in that account.
 
 ## Deployment safety
 
-Humans register deployment metadata with `vaultly target add`. The target
-contains the provider, vault, account ID, project, branch, project directory,
-build command, and output directory. Vaultly validates this record before use.
+The agent normally adopts deployment metadata with `deploy_target_adopt`. A
+legacy explicit target can still be registered with `vaultly target add` by a
+human when a repository cannot be discovered from Wrangler configuration. The
+target contains the provider, vault, vault-bound account ID, project, branch,
+project directory, build command, and output directory. Vaultly validates this
+record before use.
 
 For Pages, Vaultly runs the build without Cloudflare credentials, hashes and
 uploads the generated assets through the Cloudflare API, and returns only a
 structured deployment result. For Workers, Vaultly uses the fixed target data
 and passes only the approved Cloudflare credential scope to the deployment
-tool. The agent receives no token.
+tool. The agent receives no token. The Worker repository and its deployment
+tooling must be trusted; no credential boundary can protect a hostile program
+that is deliberately given the credential to perform the deployment.
 
 Network requests use bounded retries for transient transport and 5xx failures.
 Credential echoes in responses are scrubbed before agent output. All account

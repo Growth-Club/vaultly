@@ -1309,9 +1309,11 @@ fn cmd_cf_add(
         name
     );
     println!(
-        "{} Register deployments with: vaultly target add ...",
-        "".dimmed()
+        "{} Adopt a deployment: vaultly target adopt --vault {} --config <WRANGLER_CONFIG>",
+        "".dimmed(),
+        vault_name
     );
+    println!("{} Legacy fallback: vaultly target add ...", "".dimmed());
 }
 
 // ─── cf list ────────────────────────────────────────────────

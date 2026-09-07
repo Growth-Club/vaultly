@@ -12,9 +12,11 @@ VAULTLY_HUMAN_MODE=1 vaultly keychain store
 VAULTLY_HUMAN_MODE=1 vaultly add personal -k EXAMPLE_TOKEN -v 'value'
 ```
 
-Human-only operations include initialization, adding/importing credentials,
-plaintext reads/exports, deletion, Cloudflare account registration, and target
-registration. The macOS Keychain is the preferred unlock bridge for agents.
+Human-only operations include initialization, plaintext reads/exports,
+deletion, Cloudflare account registration, and legacy explicit target
+registration. Agents manage credentials through the write-only MCP tools and
+use dynamic target adoption. The macOS Keychain is the preferred unlock bridge
+for agents.
 
 ## Core commands
 
@@ -55,7 +57,8 @@ arguments.
 
 ## Target-bound deployment
 
-Register deployment metadata once as a human:
+Legacy explicit target registration (only for repositories that cannot be
+discovered from Wrangler configuration):
 
 ```bash
 VAULTLY_HUMAN_MODE=1 vaultly target add <ID> \

@@ -25,12 +25,17 @@ constructs authenticated Cloudflare requests.
   handle the password.
 - Credential values are write-only on the MCP surface. Key listing returns
   names and expiry metadata only.
+- Write-only protects stored values from later agent reads; it cannot hide a
+  raw value that a human or another system first places in an agent request.
+  `vault_generate` and `vault_rotate` create values inside Vaultly without
+  returning them.
 - Cloudflare responses are scrubbed for credential echoes.
 - The audit log is hash-chained and records operation metadata, not values.
 - Cloudflare requests use bounded retries for transient failures.
-- Deployment is target-bound. A human chooses the account, project, branch,
-  local paths, provider, and build command. The agent supplies only a target
-  ID.
+- Deployment is target-bound. Dynamic adoption derives the provider, project,
+  local path, and build command from a Wrangler config; the account comes from
+  the selected vault and the live resource is verified before registration.
+  The agent supplies only a target ID after adoption.
 - Pages builds run with an empty environment. Arbitrary credential-injected
   commands and generic Cloudflare API tools are not available to agents.
 - Input names, paths, account IDs, target IDs, and output directories are
@@ -43,9 +48,10 @@ constructs authenticated Cloudflare requests.
 - A human can intentionally register an unsafe deployment target. Registration
   is therefore restricted to validated target adoption or explicit human
   registration, and target metadata is validated before persistence.
-- Worker deployment necessarily gives the fixed deployment subprocess the
-  approved Cloudflare credential scope. Agents cannot change that subprocess's
-  target or command.
+- Worker deployment necessarily gives trusted deployment tooling the approved
+  Cloudflare credential scope. Agents cannot read the value through Vaultly,
+  but a hostile project or compromised host could inspect its own subprocess
+  environment; that is outside the Vaultly process boundary.
 - A weak master password reduces the protection of encrypted files.
 
 ## Verification
