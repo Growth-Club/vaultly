@@ -15,7 +15,7 @@ use serde_json::{json, Map, Value};
 use vaultly_core::{generate, keychain, CallerContext, VaultEngine, VaultError};
 
 pub const SERVER_NAME: &str = "vaultly";
-pub const SERVER_VERSION: &str = "1.0.0";
+pub const SERVER_VERSION: &str = "1.1.0";
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
 /// The master password, captured at startup before the env var is removed.
@@ -76,6 +76,7 @@ fn error_code(e: &VaultError) -> &'static str {
         CloudflareCredentials(_, _) => "cf_credentials",
         MissingAccountId(_, _) => "cf_missing_account_id",
         CommandSpawn(_, _) => "command_spawn",
+        CommandFailed(_, _, _) => "command_failed",
         UnknownSecretAction(_) => "unknown_secret_action",
         RequiredField(_, _) => "required_field",
         Audit(_) => "audit",
@@ -160,6 +161,9 @@ fn tools_list() -> Vec<Tool> {
         Tool { name: "deploy_targets", description: "List deployment targets. Metadata only.", schema: json!({"type":"object","properties":{}}) },
         Tool { name: "deploy_target_adopt", description: "Discover and idempotently adopt a Pages/Worker target from a Wrangler config in the current workspace. Account and project identity are resolved from the selected Cloudflare vault and live account inventory.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault; account is resolved from this vault"),"configPath":str_prop("Wrangler JSON/JSONC/TOML config inside the current workspace")},"required":["vaultName","configPath"]}) },
         Tool { name: "deploy_target", description: "Deploy one approved target by ID. The agent cannot choose account, project, branch, directory, or command.", schema: json!({"type":"object","properties":{"targetId":str_prop("Registered deployment target ID")},"required":["targetId"]}) },
+        Tool { name: "deploy_target_preflight", description: "Read-only preflight for one approved target by ID: worker existence, worker secret names, and per-D1-database applied/pending migrations with safety verdicts. No mutations, no credential values.", schema: json!({"type":"object","properties":{"targetId":str_prop("Registered deployment target ID")},"required":["targetId"]}) },
+        Tool { name: "deploy_target_exec", description: "Execute one APPROVED repository maintenance script (check:migrations, backup:d1, backup:verify, migrate:apply, watchdog, smoke) against a registered target. Script bodies come from the repo package.json, never from agent input. Mutating scripts need the typed confirm word and a human-granted run policy (default policy_denied).", schema: json!({"type":"object","properties":{"targetId":str_prop("Registered deployment target ID"),"script":str_prop("Approved script name, e.g. migrate:apply"),"confirm":str_prop("Typed confirmation for mutating scripts (APPLY, BACKUP)")},"required":["targetId","script"]}) },
+        Tool { name: "github_secret_sync", description: "Copy one vault credential into a GitHub Actions repository secret. Value travels vault -> gh only; never returned.", schema: json!({"type":"object","properties":{"sourceVault":str_prop("Vault holding the source credential"),"sourceKey":str_prop("Key of the source credential"),"repo":str_prop("Target repo as owner/name"),"secretName":str_prop("GitHub secret name (A-Z, 0-9, _)"),"environment":str_prop("Optional GitHub environment (its secrets shadow repo secrets)")},"required":["sourceVault","sourceKey","repo","secretName"]}) },
         Tool { name: "policy_info", description: "Show effective agent operation policy without secrets.", schema: json!({"type":"object","properties":{}}) },
     ]
 }
@@ -252,6 +256,79 @@ async fn tool_deploy_target(engine: &mut VaultEngine, args: &Value, ctx: &Caller
     }
 }
 
+async fn tool_deploy_target_preflight(
+    engine: &mut VaultEngine,
+    args: &Value,
+    ctx: &CallerContext,
+) -> Value {
+    require!(args, target_id => "targetId");
+    let targets = match engine.store().load_deployment_targets() {
+        Ok(targets) => targets,
+        Err(e) => return fail_err(&e),
+    };
+    let target = match targets.into_iter().find(|target| target.id == target_id) {
+        Some(target) => target,
+        None => return fail(format!("Deployment target '{}' was not found", target_id)),
+    };
+    match engine.preflight_target(&target, Some(ctx)).await {
+        Ok(result) => json!({
+            "content": [{ "type": "text", "text": serde_json::to_string(&result).unwrap_or_else(|_| "{}".into()) }],
+            "preflight": result,
+        }),
+        Err(e) => fail_err(&e),
+    }
+}
+
+async fn tool_deploy_target_exec(
+    engine: &mut VaultEngine,
+    args: &Value,
+    ctx: &CallerContext,
+) -> Value {
+    require!(args, target_id => "targetId", script => "script");
+    let confirm = args.get("confirm").and_then(|v| v.as_str());
+    let targets = match engine.store().load_deployment_targets() {
+        Ok(targets) => targets,
+        Err(e) => return fail_err(&e),
+    };
+    let target = match targets.into_iter().find(|target| target.id == target_id) {
+        Some(target) => target,
+        None => return fail(format!("Deployment target '{}' was not found", target_id)),
+    };
+    match engine
+        .exec_target_script(&target, script, confirm, Some(ctx))
+        .await
+    {
+        Ok(result) => json!({
+            "content": [{ "type": "text", "text": serde_json::to_string(&result).unwrap_or_else(|_| "{}".into()) }],
+            "execution": result,
+        }),
+        Err(e) => fail_err(&e),
+    }
+}
+
+async fn tool_github_secret_sync(
+    engine: &mut VaultEngine,
+    args: &Value,
+    ctx: &CallerContext,
+) -> Value {
+    require!(args, source_vault => "sourceVault", source_key => "sourceKey", repo => "repo", secret_name => "secretName");
+    let environment = args.get("environment").and_then(|v| v.as_str());
+    match engine
+        .sync_github_secret(
+            source_vault,
+            source_key,
+            repo,
+            secret_name,
+            environment,
+            Some(ctx),
+        )
+        .await
+    {
+        Ok(status) => ok(status),
+        Err(e) => fail_err(&e),
+    }
+}
+
 async fn call_tool(engine: &mut VaultEngine, name: &str, args: &Value) -> Value {
     let ctx = agent_ctx();
     match name {
@@ -279,6 +356,9 @@ async fn call_tool(engine: &mut VaultEngine, name: &str, args: &Value) -> Value 
         "deploy_targets" => tool_deploy_targets(engine, &ctx).await,
         "deploy_target_adopt" => tool_deploy_target_adopt(engine, args, &ctx).await,
         "deploy_target" => tool_deploy_target(engine, args, &ctx).await,
+        "deploy_target_preflight" => tool_deploy_target_preflight(engine, args, &ctx).await,
+        "deploy_target_exec" => tool_deploy_target_exec(engine, args, &ctx).await,
+        "github_secret_sync" => tool_github_secret_sync(engine, args, &ctx).await,
         "policy_info" => tool_policy_info().await,
         "vault_run" | "cf_deploy" | "cf_pages_deploy" => {
             fail("This operation is disabled for agents. Use deploy_target_adopt or a validated deployment target.")
@@ -884,7 +964,7 @@ async fn tool_vault_import_encrypted(
 
 async fn tool_policy_info() -> Value {
     ok(format!(
-        "Vaultly agent security policy:\n  Session TTL: {} min\n\n  Raw reads and arbitrary credential-injected commands are disabled.\n  Permitted: encrypted credential operations, safe Cloudflare discovery,\n  write-only Worker secrets, validated dynamic target adoption, and deployment.\n  Every tool returns names, metadata, or safe operation status — never raw secret values.",
+        "Vaultly agent security policy:\n  Session TTL: {} min\n\n  Raw reads and arbitrary credential-injected commands are disabled.\n  Permitted: encrypted credential operations, safe Cloudflare discovery,\n  write-only Worker secrets, validated dynamic target adoption, deployment,\n  read-only target preflight, and approved target maintenance scripts.\n  Maintenance execution (deploy_target_exec) needs the human-granted `run`\n  operation plus a typed confirmation for mutations; the default agent\n  policy denies it (policy_denied). Every tool returns names, metadata, or\n  safe operation status — never raw secret values.",
         SESSION_TTL_MINUTES
     ))
 }
@@ -914,6 +994,10 @@ fn tool_schema_list() -> Value {
 pub async fn start_mcp_server() {
     let mut engine = VaultEngine::new(Some(SESSION_TTL_MINUTES));
 
+    // Owner-managed grants first; explicit env policy wins when both exist.
+    if let Err(e) = engine.load_default_policy_file() {
+        eprintln!("⚠ Failed to load agent policy file: {e}");
+    }
     if let Err(e) = engine.load_policy_from_env() {
         eprintln!("⚠ Failed to load VAULTLY_AGENT_POLICY: {e}");
     } else if let Ok(n) = std::env::var("VAULTLY_AGENT_POLICY") {

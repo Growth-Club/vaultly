@@ -83,6 +83,9 @@ pub enum VaultError {
     #[error("Command '{0}' failed to start: {1}")]
     CommandSpawn(String, String),
 
+    #[error("{0} failed with exit code {1}: {2}")]
+    CommandFailed(String, i32, String),
+
     #[error("Unknown worker secret action: {0}")]
     UnknownSecretAction(String),
 

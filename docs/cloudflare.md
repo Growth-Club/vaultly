@@ -54,6 +54,13 @@ target contains the provider, vault, vault-bound account ID, project, branch,
 project directory, build command, and output directory. Vaultly validates this
 record before use.
 
+For agents, the registered record must match exactly and its canonical directory
+must be inside the invoking workspace. Worker targets require dynamic adoption;
+legacy explicit Worker targets remain available to human callers. The fixed
+deployment subprocess is authorized by `Deploy`, while generic `Run` remains
+denied. Revalidation after the build catches changed registration, config,
+account, expired sessions and active killswitches before credential injection.
+
 For Pages, Vaultly runs the build without Cloudflare credentials, hashes and
 uploads the generated assets through the Cloudflare API, and returns only a
 structured deployment result. For Workers, Vaultly uses the fixed target data

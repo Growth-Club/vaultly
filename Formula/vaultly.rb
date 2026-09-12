@@ -2,7 +2,7 @@ class Vaultly < Formula
   desc "Agent-first encrypted credential manager with Cloudflare integration"
   homepage "https://github.com/OWNER/vaultly"
   url "https://github.com/OWNER/vaultly/archive/v#{version}.tar.gz"
-  version "1.0.0"
+  version "1.1.0"
   license "MIT"
 
   depends_on "rust" => :build

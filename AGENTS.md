@@ -6,7 +6,7 @@ password, or arbitrary credential-injected child process.
 
 ## Agent-visible MCP surface
 
-The server advertises 25 tools:
+The server advertises 28 tools:
 
 - Vault metadata and lifecycle: `vault_list`, `vault_keys`, `vault_meta`,
   `vault_status`, `vault_audit`, `vault_lock`, `vault_unlock`.
@@ -17,7 +17,20 @@ The server advertises 25 tools:
   `cf_account_label`, `cf_health`, `cf_zones`, `cf_pages_projects`,
   `cf_workers_list`, `cf_secrets`.
 - Approved deployment: `deploy_targets`, `deploy_target_adopt`, `deploy_target`.
-- Policy: `policy_info`.
+- Read-only target preflight: `deploy_target_preflight` (worker existence,
+  secret names, per-D1-database applied/pending migrations with safety
+  verdicts — no mutations).
+- Approved maintenance execution: `deploy_target_exec` runs one allowlisted
+  repository script (`check:migrations`, `backup:d1`, `backup:verify`,
+  `migrate:apply`, `watchdog`, `smoke`) resolved from the repo's own
+  `package.json`. Mutating scripts need the typed confirm word and the
+  human-granted `run` operation; the default agent policy denies it
+  (`policy_denied`). There is deliberately no generic run: the agent supplies
+  only target ID + script name, never a command.
+- Value-blind GitHub sync: `github_secret_sync` copies one vault credential
+  into a GitHub Actions repository secret via the human's `gh` login. The
+  value is never returned, logged, or placed on a command line.
+- Policy: `policy_info` (includes the `github_sync` operation).
 
 `vault_run`, generic Cloudflare API calls, arbitrary Pages deployment, and all
 unrelated Cloudflare product APIs are not exposed. Compatibility calls for
@@ -49,8 +62,18 @@ Workers are both supported, and adoption is idempotent. Agents then use:
 
 ```bash
 vaultly target list --json
+vaultly preflight <ID> --json
 vaultly deploy <ID> --json
+# Maintenance (needs human-granted `run` op + typed confirm):
+vaultly exec <ID> migrate:apply --confirm APPLY --json
 ```
+
+Recommended agent order for a production release: preflight first (shows
+exactly which migrations are pending and their safety verdicts), then exec
+the guarded maintenance script when migrations are pending, then deploy.
+`preflight` is read-only and allowed by default; `exec` returns
+`policy_denied` until a human grants the `run` operation to that agent via
+policy file, scoped to the Cloudflare vault.
 
 The target record remains the authorization. Dynamic adoption cannot accept an
 account ID, project name, arbitrary command, or path outside the current
@@ -59,6 +82,16 @@ vault's account before saving metadata. Pages builds receive an empty
 environment; Vaultly performs the authenticated Cloudflare upload internally.
 Worker adoption runs the repository's fixed `npm run deploy` script with only
 the scoped Cloudflare credentials.
+
+Run CLI/MCP from the repository root. Agent deployments require exact registered
+metadata and a canonical target directory inside that root; Worker targets need
+dynamic adoption and exactly one default Wrangler config. `Deploy` permits the
+fixed deployment subprocess without enabling generic `Run`; `Exec` permits only
+the closed maintenance-script allowlist (still gated on the separately granted
+`run` operation plus typed confirmations for mutations). Vaultly rechecks
+permissions, registration, config and account after building. Expired selected
+credentials are rejected. Keep repository scripts and deployment dependencies
+reviewed: scoped subprocess credentials are available to that trusted code.
 
 ## Secret rules
 

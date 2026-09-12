@@ -36,6 +36,7 @@ pub enum Operation {
     Deploy,
     Run,
     CfApi,
+    GithubSync,
     Admin,
 }
 
@@ -51,6 +52,7 @@ impl Operation {
             Operation::Deploy => "deploy",
             Operation::Run => "run",
             Operation::CfApi => "cf_api",
+            Operation::GithubSync => "github_sync",
             Operation::Admin => "admin",
         }
     }
@@ -63,6 +65,7 @@ const DEFAULT_AGENT_OPS: &[Operation] = &[
     Operation::Delete,
     Operation::Deploy,
     Operation::CfApi,
+    Operation::GithubSync,
 ];
 // NOTE: read_value, delete_vault, admin are NOT in default agent ops
 

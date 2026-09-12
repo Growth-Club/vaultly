@@ -490,15 +490,20 @@ mod tests {
             assert_eq!(decrypt(&payload, &key).unwrap(), s);
         }
 
-        /// Ciphertext is authenticated and never equal to the plaintext bytes
-        /// for non-empty inputs (empty input legitimately maps to empty
-        /// AES-GCM output, so it is excluded here).
+        /// Ciphertext is length-preserving and never equal to the plaintext
+        /// bytes for longer inputs (a no-op/echo implementation fails
+        /// deterministically there). Single-byte inputs are excluded from the
+        /// inequality: randomized encryption maps any given byte to itself
+        /// with probability 1/256, so asserting inequality there is flaky.
         #[test]
         fn proptest_ciphertext_differs_from_plaintext(s in "[a-z0-9_]{1,96}") {
             let key = vec![9u8; 32];
             let payload = encrypt(&s, &key).unwrap();
             let ct = hex::decode(&payload.ciphertext).unwrap();
-            assert_ne!(ct, s.as_bytes(), "ciphertext echoes plaintext");
+            assert_eq!(ct.len(), s.len(), "ciphertext length changed");
+            if s.len() >= 16 {
+                assert_ne!(ct, s.as_bytes(), "ciphertext echoes plaintext");
+            }
         }
 
         /// SecretEntry (value + metadata) must round-trip through JSON with the
@@ -511,23 +516,28 @@ mod tests {
         ) {
             let entry = SecretEntry {
                 value: value.clone(),
-                created_at: created,
-                updated_at: updated,
+                created_at: created.clone(),
+                updated_at: updated.clone(),
                 expires_at: None,
             };
             let json = serde_json::to_value(&entry).unwrap();
             let parsed: SecretEntry = serde_json::from_value(json).unwrap();
             assert_eq!(parsed.value, value);
-            // Debug must never surface the value regardless of content. The
-            // Debug impl only ever emits the fixed placeholder "[REDACTED]"
-            // plus struct/field scaffolding — so a short value that happens to
-            // be a substring of that fixed text (e.g. a lone "C" inside
-            // "[REDACTED]") is not a leak and must be excluded from the check.
+            // Debug must never surface the value regardless of content.
+            // Timestamps are non-secret metadata and ARE emitted, so a
+            // substring check false-positives whenever a short value (e.g.
+            // "Z", "0", "at") appears in them or in the field scaffolding.
+            // Instead assert the exact redacted shape: the value may only
+            // ever appear as the fixed "[REDACTED]" placeholder.
             let debug = format!("{:?}", parsed);
-            let scaffolding = "[REDACTED] SecretEntry value created_at updated_at expires_at";
-            if !scaffolding.contains(&value) {
-                assert!(!debug.contains(&value), "value leaked in Debug: {}", debug);
-            }
+            assert_eq!(
+                debug,
+                format!(
+                    "SecretEntry {{ value: \"[REDACTED]\", created_at: {:?}, updated_at: {:?}, expires_at: None }}",
+                    created, updated
+                ),
+                "Debug output diverged from the redacted shape"
+            );
         }
     }
 }

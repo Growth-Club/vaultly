@@ -1827,7 +1827,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "vaultly"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "chrono",
  "clap",
@@ -1844,7 +1844,7 @@ dependencies = [
 
 [[package]]
 name = "vaultly-core"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -1853,6 +1853,7 @@ dependencies = [
  "dirs",
  "hex",
  "hmac",
+ "libc",
  "pbkdf2",
  "proptest",
  "rand 0.8.7",
@@ -1869,7 +1870,7 @@ dependencies = [
 
 [[package]]
 name = "vaultly-mcp"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "chrono",
  "serde",

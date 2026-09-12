@@ -49,7 +49,14 @@ vaultly cf remove <NAME>
 vaultly cf zones <NAME>
 vaultly cf pages <NAME>
 vaultly cf secrets <NAME> <SCRIPT> [--list|--set|--delete]
+vaultly cf sync-github-secret --from-vault <VAULT> --from-key <KEY> --repo <OWNER/NAME> --secret <NAME>
 ```
+
+Copy one vault credential into a GitHub Actions repository secret. The value
+travels vault -> `gh` only (via the human's existing `gh` login) and is never
+shown, logged, or placed on a command line. Repo must be `owner/name`;
+secret names are `A-Z, 0-9, _`. Agents may use it: authorization is enforced
+by the `github_sync` policy op, which is allowed by default.
 
 Cloudflare credentials are stored in normal Vaultly vaults using the `cf-`
 prefix. Account/project selection for deployments is never taken from agent
@@ -76,7 +83,10 @@ Then an agent may run only:
 
 ```bash
 vaultly target list --json
+vaultly preflight <ID> --json
 vaultly deploy <ID> --json
+# Maintenance scripts (needs human-granted `run` op + typed confirm):
+vaultly exec <ID> migrate:apply --confirm APPLY --json
 ```
 
 ### Agent-safe dynamic adoption
@@ -101,6 +111,27 @@ The target record is validated and stored separately from secrets. The agent
 cannot override its account ID, project, branch, paths, or build command.
 Pages builds run without Cloudflare environment variables; Vaultly performs the
 authenticated upload itself.
+
+### Preflight and maintenance execution
+
+```bash
+vaultly preflight <ID> --json
+vaultly exec <ID> <script> [--confirm WORD] --json
+```
+
+`preflight` is read-only (allowed by default): worker existence, worker
+secret names, and per-D1-database applied/pending migrations with safety
+verdicts. Run it before any deploy or migration.
+
+`exec` runs one approved maintenance script from the repo's own
+`package.json` (`check:migrations`, `backup:d1`, `backup:verify`,
+`migrate:apply`, `watchdog`, `smoke`) with the target's Cloudflare scope
+plus `D1_BACKUP_*` keys when the vault holds them. Mutating scripts require
+the typed confirmation and fail closed on unsafe or unverifiable migration
+state. Execution is gated on the `run` policy operation (default-deny for
+agents; a human grants it via policy file). Migration backup keys are added
+once by a human: `vaultly add --vault <cf-vault> --key D1_BACKUP_R2_BUCKET
+--value ...` (same for `D1_BACKUP_PASSPHRASE`).
 
 ## Agent unlock
 

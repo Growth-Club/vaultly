@@ -11,7 +11,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 const PASSWORD: &str = "mcp-test-password";
 const SECRET_VALUE: &str = "sk-e2e-super-secret-token-1234567890";
 const SECRET_KEY: &str = "E2E_SECRET_KEY";
-const EXPECTED_TOOLS: [&str; 25] = [
+const EXPECTED_TOOLS: [&str; 28] = [
     "cf_account_label",
     "cf_accounts",
     "cf_health",
@@ -21,7 +21,10 @@ const EXPECTED_TOOLS: [&str; 25] = [
     "cf_zones",
     "deploy_target",
     "deploy_target_adopt",
+    "deploy_target_exec",
+    "deploy_target_preflight",
     "deploy_targets",
+    "github_secret_sync",
     "policy_info",
     "vault_add",
     "vault_audit",
@@ -589,4 +592,44 @@ async fn mcp_unknown_tool_returns_error() {
     })
     .await
     .expect("mcp_unknown_tool_returns_error timed out");
+}
+
+#[tokio::test]
+async fn mcp_target_exec_and_preflight_reject_unknown_targets() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mcp = new_client(dir.path()).await;
+
+        // Unknown target IDs fail cleanly without touching the network.
+        let res = mcp
+            .call_tool(
+                2,
+                "deploy_target_exec",
+                json!({ "targetId": "no-such-target", "script": "watchdog" }),
+            )
+            .await;
+        assert!(mcp.result_text(&res).contains("was not found"), "{}", res);
+
+        let res = mcp
+            .call_tool(
+                3,
+                "deploy_target_preflight",
+                json!({ "targetId": "no-such-target" }),
+            )
+            .await;
+        assert!(mcp.result_text(&res).contains("was not found"), "{}", res);
+
+        // Missing required args are reported, not panics.
+        let res = mcp
+            .call_tool(4, "deploy_target_exec", json!({ "targetId": "x" }))
+            .await;
+        assert!(
+            mcp.result_text(&res)
+                .contains("Missing required argument 'script'"),
+            "{}",
+            res
+        );
+    })
+    .await
+    .expect("mcp_target_exec_and_preflight_reject_unknown_targets timed out");
 }

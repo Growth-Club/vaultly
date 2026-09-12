@@ -6,6 +6,7 @@ Vaultly stores its local state under `~/.vaultly` by default. Set
 ```text
 ~/.vaultly/
 ├── config.json                 # salt, verifier, policy/session settings
+├── agent-policy.json           # owner-managed per-agent operation grants
 ├── audit.log                   # hash-chained metadata-only audit log
 ├── deployment-targets.json     # non-secret validated deployment targets
 └── vaults/                     # encrypted credential files
@@ -14,6 +15,19 @@ Vaultly stores its local state under `~/.vaultly` by default. Set
 Files are created with restrictive permissions and written atomically. Vault
 files contain ciphertext only. Deployment targets contain account/project
 metadata but never Cloudflare tokens.
+
+## Agent policy grants
+
+`agent-policy.json` is the owner-managed grant mechanism: per-agent
+operation allowlists, optionally scoped to specific vaults. Both the CLI
+and the MCP server load it automatically on startup (an explicit
+`VAULTLY_AGENT_POLICY` file is loaded afterwards and wins on conflict).
+This is how a human grants the `run` operation so approval-gated
+maintenance scripts work (`vaultly exec <ID> migrate:apply --confirm
+APPLY`): the grant plus the per-run typed confirmation word together
+record owner approval. The file must not be group/other-writable —
+Vaultly refuses to load it otherwise, so an agent cannot widen its own
+permissions.
 
 ## Environment variables
 

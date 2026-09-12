@@ -4,7 +4,7 @@ All notable changes to Vaultly are documented here, grouped by release.
 Format follows [Keep a Changelog](https://keepachangelog.com/) and
 [Conventional Commits](https://www.conventionalcommits.org/). The current
 source version, per `rust/Cargo.toml` (`[workspace.package].version`), is
-**1.0.0**.
+**1.1.0**.
 
 ## [Unreleased]
 
@@ -13,6 +13,37 @@ removed). Highlights of the current unreleased feature set:
 
 ### Added
 
+- **Owner-managed agent policy grants** — the CLI and MCP server now load
+  `agent-policy.json` from the vault directory on startup (explicit
+  `VAULTLY_AGENT_POLICY` still wins on conflict). This makes the documented
+  human grant effective: e.g. granting `run` to an agent scoped to one
+  vault enables approval-gated maintenance (`vaultly exec <ID>
+  migrate:apply --confirm APPLY`, typed word still required per run).
+  Group/other-writable grant files are refused fail-closed so an agent
+  cannot widen its own permissions.
+- **Target preflight** — `vaultly preflight <ID>` and the MCP
+  `deploy_target_preflight` tool report worker existence, worker secret
+  names, and per-D1-database applied/pending migrations with safety verdicts
+  (destructive statements refused unless guarded by `_migration_guard_abort`).
+  Read-only, allowed by default, no credential values.
+- **Approved maintenance execution** — `vaultly exec <ID> <script>` and the
+  MCP `deploy_target_exec` tool run one allowlisted repository script
+  (`check:migrations`, `backup:d1`, `backup:verify`, `migrate:apply`,
+  `watchdog`, `smoke`) resolved from the repo's own `package.json` with the
+  target's Cloudflare scope (plus `D1_BACKUP_*` keys when the vault holds
+  them). Mutating scripts require the typed confirmation word and pass
+  Vaultly's own pending-migration safety verdicts fail-closed. Gated on the
+  `run` policy operation, which stays default-deny for agents
+  (`policy_denied` until a human grants it).
+- **Agent-safe failure output** — Worker deploy and build failures now include
+  scrubbed stdout/stderr tails (already secret-scrubbed), so agents can
+  diagnose guard refusals without a human re-run.
+- **GitHub secret sync** — `vaultly cf sync-github-secret` and the MCP
+  `github_secret_sync` tool copy one vault credential into a GitHub Actions
+  repository secret via the human's existing `gh` login. The value is never
+  returned, logged, or placed on a command line; repo/secret names are
+  strictly validated; gated by the new default-allowed `github_sync` policy
+  op. Lets agents keep CI credentials fresh without handling secret values.
 - **CLI exports** — `vaultly env <vault>` emits shell export statements and
   `vaultly run <vault> -- <cmd>` runs a command with injected (then cleared)
   environment, with output scrubbed of any secret values.

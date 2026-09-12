@@ -47,6 +47,15 @@ fn quiet() -> bool {
 
 fn engine() -> VaultEngine {
     let mut engine = VaultEngine::new(None);
+    // Owner-managed grants first (`agent-policy.json` in the vault dir);
+    // an explicit VAULTLY_AGENT_POLICY wins when both exist.
+    if let Err(e) = engine.load_default_policy_file() {
+        eprintln!(
+            "{} Failed to load agent policy file: {}",
+            "⚠".yellow(),
+            e
+        );
+    }
     if let Err(e) = engine.load_policy_from_env() {
         eprintln!(
             "{} Failed to load VAULTLY_AGENT_POLICY: {}",
@@ -189,6 +198,23 @@ enum Command {
         #[arg(long, help = "Output one JSON object for automation")]
         json: bool,
     },
+    /// Execute an approved maintenance script against a validated target
+    /// (agent-safe; script allowlist + typed confirmation for mutations)
+    Exec {
+        target: String,
+        #[arg(help = "Approved script name (e.g. migrate:apply)")]
+        script: String,
+        #[arg(long, help = "Typed confirmation for mutating scripts (APPLY, BACKUP)")]
+        confirm: Option<String>,
+        #[arg(long, help = "Output one JSON object for automation")]
+        json: bool,
+    },
+    /// Read-only preflight for a validated target (agent-safe; no mutations)
+    Preflight {
+        target: String,
+        #[arg(long, help = "Output one JSON object for automation")]
+        json: bool,
+    },
     /// Manage deployment targets
     Target {
         #[command(subcommand)]
@@ -310,6 +336,22 @@ enum CfCommand {
     },
     /// List Cloudflare Pages projects
     Pages { name: String },
+    /// Copy one vault credential into a GitHub Actions repository secret.
+    /// The value travels vault -> `gh` only; it is never shown.
+    SyncGithubSecret {
+        #[arg(long, help = "Vault holding the source credential")]
+        from_vault: String,
+        #[arg(long, help = "Key of the source credential")]
+        from_key: String,
+        #[arg(long, help = "Target repo as owner/name")]
+        repo: String,
+        #[arg(long, help = "GitHub secret name (A-Z, 0-9, _)")]
+        secret: String,
+        #[arg(long, help = "GitHub environment (its secrets shadow repo secrets)")]
+        env: Option<String>,
+        #[arg(long, help = "Output one JSON object for automation")]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -518,6 +560,13 @@ async fn main() {
             }
         }
         Some(Command::Deploy { target, json }) => cmd_deploy_target(&target, json).await,
+        Some(Command::Exec {
+            target,
+            script,
+            confirm,
+            json,
+        }) => cmd_exec_target(&target, &script, confirm.as_deref(), json).await,
+        Some(Command::Preflight { target, json }) => cmd_preflight_target(&target, json).await,
         Some(Command::Target { sub }) => match sub {
             TargetCommand::Add {
                 id,
@@ -605,6 +654,24 @@ async fn main() {
                 delete,
             } => cmd_cf_secrets(&name, &script_name, list, set, value, delete).await,
             CfCommand::Pages { name } => cmd_cf_pages(&name).await,
+            CfCommand::SyncGithubSecret {
+                from_vault,
+                from_key,
+                repo,
+                secret,
+                env,
+                json,
+            } => {
+                cmd_cf_sync_github_secret(
+                    &from_vault,
+                    &from_key,
+                    &repo,
+                    &secret,
+                    env.as_deref(),
+                    json,
+                )
+                .await
+            }
         },
         Some(Command::Keychain { sub }) => match sub {
             KeychainCommand::Store => {
@@ -1533,6 +1600,121 @@ fn cmd_target_remove(id: &str) {
     println!("{} Removed deployment target '{}'", "✓".green(), id);
 }
 
+fn load_target_or_exit(engine: &VaultEngine, id: &str) -> vaultly_core::DeploymentTarget {
+    let targets = match engine.store().load_deployment_targets() {
+        Ok(targets) => targets,
+        Err(e) => {
+            eprintln!("{} {}", "✗".red(), e);
+            exit(1);
+        }
+    };
+    match targets.into_iter().find(|target| target.id == id) {
+        Some(target) => target,
+        None => {
+            eprintln!(
+                "{} Deployment target '{}' not found. Run: vaultly target list",
+                "✗".red(),
+                id
+            );
+            exit(1);
+        }
+    }
+}
+
+async fn cmd_exec_target(id: &str, script: &str, confirm: Option<&str>, json_output: bool) {
+    let mut engine = require_unlock();
+    let target = load_target_or_exit(&engine, id);
+    let context = target_context();
+    match engine
+        .exec_target_script(&target, script, confirm, context.as_ref())
+        .await
+    {
+        Ok(result) => {
+            if json_output || agent_mode() {
+                println!(
+                    "{}",
+                    serde_json::to_string(&result).unwrap_or_else(|_| "{}".into())
+                );
+            } else {
+                println!(
+                    "{} Ran '{}' on '{}'",
+                    "✓".green(),
+                    result.script,
+                    result.target
+                );
+                println!("  Injected keys: {}", result.injected_keys.join(", "));
+            }
+        }
+        Err(e) => {
+            if json_output || agent_mode() {
+                println!(
+                    "{}",
+                    serde_json::json!({"target": id, "script": script, "status": "failed", "error": e.to_string()})
+                );
+            } else {
+                eprintln!("{} {}", "✗".red(), e);
+            }
+            exit(1);
+        }
+    }
+}
+
+async fn cmd_preflight_target(id: &str, json_output: bool) {
+    let mut engine = require_unlock();
+    let target = load_target_or_exit(&engine, id);
+    let context = target_context();
+    match engine.preflight_target(&target, context.as_ref()).await {
+        Ok(result) => {
+            if json_output || agent_mode() {
+                println!(
+                    "{}",
+                    serde_json::to_string(&result).unwrap_or_else(|_| "{}".into())
+                );
+            } else {
+                println!("{} Preflight '{}'", "✓".green(), result.target);
+                println!(
+                    "  Worker '{}' found: {}",
+                    target.project, result.worker_found
+                );
+                println!(
+                    "  Worker secrets: {}",
+                    result.worker_secret_names.join(", ")
+                );
+                for db in &result.databases {
+                    println!(
+                        "  D1 '{}': applied={}, pending={}",
+                        db.database_name,
+                        db.applied,
+                        db.pending.len()
+                    );
+                    for v in &db.verdicts {
+                        println!(
+                            "    [{}] {} — {}",
+                            if v.safe { "ok" } else { "UNSAFE" },
+                            v.file,
+                            v.reason
+                        );
+                    }
+                    if let Some(err) = &db.error {
+                        println!("    error: {}", err);
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            if json_output || agent_mode() {
+                println!(
+                    "{}",
+                    serde_json::json!({"target": id, "status": "failed", "error": e.to_string()})
+                );
+            } else {
+                eprintln!("{} {}", "✗".red(), e);
+            }
+            exit(1);
+        }
+    }
+}
+
 async fn cmd_deploy_target(id: &str, json_output: bool) {
     let mut engine = require_unlock();
     let store = engine.store();
@@ -1685,6 +1867,54 @@ async fn cmd_cf_pages(name: &str) {
 // ─── cf lb ──────────────────────────────────────────────────
 
 // ─── cf email ───────────────────────────────────────────────
+
+// ─── cf github sync ─────────────────────────────────────────
+
+async fn cmd_cf_sync_github_secret(
+    from_vault: &str,
+    from_key: &str,
+    repo: &str,
+    secret: &str,
+    env: Option<&str>,
+    json_output: bool,
+) {
+    // Agent-safe by construction: the value never reaches CLI output.
+    // Authorization is enforced by the engine's github_sync policy op.
+    let mut engine = require_unlock();
+    match engine
+        .sync_github_secret(
+            from_vault,
+            from_key,
+            repo,
+            secret,
+            env,
+            target_context().as_ref(),
+        )
+        .await
+    {
+        Ok(status) => {
+            if json_output || agent_mode() {
+                println!(
+                    "{}",
+                    serde_json::json!({"repo": repo, "env": env, "secret": secret, "status": "synced", "detail": status})
+                );
+            } else {
+                println!("{} {}", "✓".green(), status);
+            }
+        }
+        Err(e) => {
+            if json_output || agent_mode() {
+                println!(
+                    "{}",
+                    serde_json::json!({"repo": repo, "env": env, "secret": secret, "status": "failed", "error": e.to_string()})
+                );
+            } else {
+                eprintln!("{} {}", "✗".red(), e);
+            }
+            exit(1);
+        }
+    }
+}
 
 // ─── cf secrets ─────────────────────────────────────────────
 
