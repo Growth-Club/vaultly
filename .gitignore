@@ -3,3 +3,8 @@
 
 # Rust build output
 rust/target/
+
+# Secrets
+.env*
+*.pem
+*.key

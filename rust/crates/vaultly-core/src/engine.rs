@@ -1561,8 +1561,51 @@ impl VaultEngine {
                 .headers(api_headers.clone()),
         )
         .await?;
-        let token_status = token_response.status();
-        let token_data: Value = token_response.json().await?;
+        let mut token_status = token_response.status();
+        let mut token_data: Value = token_response.json().await?;
+        if token_status.as_u16() == 404 {
+            // Target-bound first-boot: the registered target already authorizes
+            // this exact account + project (human-registered, validated), so
+            // create that Pages project before retrying — mirroring how a
+            // first Worker deploy creates the Worker. No arbitrary names:
+            // only target.project in target.account_id.
+            let create_body = serde_json::json!({
+                "name": target.project,
+                "production_branch": target.branch.clone().unwrap_or_else(|| "main".to_string()),
+            });
+            let create_res = self
+                .cloudflare_account_api(
+                    &target.vault,
+                    "POST",
+                    "/pages/projects",
+                    Some(create_body),
+                    ctx,
+                )
+                .await?;
+            if !(200..300).contains(&create_res.status) {
+                return Err(VaultError::CloudflareResponse(format!(
+                    "Pages project auto-create failed with HTTP {}: {}",
+                    create_res.status,
+                    cloudflare_response_detail(&create_res.data)
+                )));
+            }
+            self.audit(
+                "DEPLOY",
+                &format!(
+                    "target={} provider=pages project_created={}",
+                    target.id, target.project
+                ),
+                ctx,
+            );
+            let retry_response = send_with_retry(
+                client
+                    .get(format!("{}/upload-token", base))
+                    .headers(api_headers.clone()),
+            )
+            .await?;
+            token_status = retry_response.status();
+            token_data = retry_response.json().await?;
+        }
         if !token_status.is_success() {
             return Err(VaultError::CloudflareResponse(format!(
                 "upload-token failed with HTTP {}",
