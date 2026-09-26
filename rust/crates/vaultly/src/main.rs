@@ -50,11 +50,7 @@ fn engine() -> VaultEngine {
     // Owner-managed grants first (`agent-policy.json` in the vault dir);
     // an explicit VAULTLY_AGENT_POLICY wins when both exist.
     if let Err(e) = engine.load_default_policy_file() {
-        eprintln!(
-            "{} Failed to load agent policy file: {}",
-            "⚠".yellow(),
-            e
-        );
+        eprintln!("{} Failed to load agent policy file: {}", "⚠".yellow(), e);
     }
     if let Err(e) = engine.load_policy_from_env() {
         eprintln!(
@@ -386,6 +382,11 @@ enum TargetCommand {
             help = "Local Wrangler JSON/JSONC/TOML config inside the current workspace"
         )]
         config: String,
+        #[arg(
+            long,
+            help = "Register even if the Cloudflare resource does not exist yet (created on first deploy, with D1/R2 bootstrapped from the config's own bindings)"
+        )]
+        create: bool,
         #[arg(long, help = "Output one JSON object for automation")]
         json: bool,
     },
@@ -595,8 +596,9 @@ async fn main() {
             TargetCommand::Adopt {
                 vault,
                 config,
+                create,
                 json,
-            } => cmd_target_adopt(&vault, &config, json).await,
+            } => cmd_target_adopt(&vault, &config, create, json).await,
             TargetCommand::List { json } => cmd_target_list(json),
             TargetCommand::Remove { id } => {
                 block_in_agent_mode("target remove");
@@ -1531,11 +1533,16 @@ fn cmd_target_add(
     );
 }
 
-async fn cmd_target_adopt(vault: &str, config: &str, json_output: bool) {
+async fn cmd_target_adopt(vault: &str, config: &str, allow_create: bool, json_output: bool) {
     let vault_name = cf_vault(vault);
     let mut engine = require_unlock();
     match engine
-        .adopt_deployment_target(&vault_name, Path::new(config), target_context().as_ref())
+        .adopt_deployment_target(
+            &vault_name,
+            Path::new(config),
+            target_context().as_ref(),
+            allow_create,
+        )
         .await
     {
         Ok(target) => {
@@ -1549,8 +1556,13 @@ async fn cmd_target_adopt(vault: &str, config: &str, json_output: bool) {
                 );
             } else {
                 println!(
-                    "{} Adopted target '{}' for {} '{}'",
+                    "{} {} target '{}' for {} '{}'",
                     "✓".green(),
+                    if allow_create {
+                        "Adopted (provisioning)"
+                    } else {
+                        "Adopted"
+                    },
                     target.id,
                     match target.provider {
                         DeploymentProvider::Pages => "Pages project",

@@ -744,6 +744,368 @@ fn toml_d1_bindings(raw: &str) -> Result<Vec<D1Binding>, String> {
     Ok(out)
 }
 
+/// An R2 bucket binding read from a Wrangler config. Account identity is
+/// bound separately by the engine from the vault — never from agent input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct R2Binding {
+    pub binding: String,
+    pub bucket_name: String,
+    pub preview_bucket_name: Option<String>,
+    /// `remote: true` references a bucket owned elsewhere; Vaultly never
+    /// creates those, it only ensures locally-owned buckets exist.
+    pub remote: bool,
+}
+
+/// Read the `r2_buckets` bindings from a Wrangler JSON/JSONC config.
+/// TOML configs are parsed for `[[r2_buckets]]` sections on a best-effort
+/// basis using the same dependency-free line parser as identity discovery.
+pub fn wrangler_r2_bindings(config_path: &Path) -> Result<Vec<R2Binding>, String> {
+    let raw = fs::read_to_string(config_path).map_err(|e| {
+        format!(
+            "cannot read Wrangler config '{}': {e}",
+            config_path.display()
+        )
+    })?;
+    let ext = config_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default();
+    if ext == "toml" {
+        return toml_r2_bindings(&raw);
+    }
+    let stripped = strip_json_comments(&raw)?;
+    let config: Value = serde_json::from_str(&stripped)
+        .map_err(|e| format!("invalid Wrangler JSON '{}': {e}", config_path.display()))?;
+    let mut out = Vec::new();
+    if let Some(arr) = config.get("r2_buckets").and_then(Value::as_array) {
+        for entry in arr {
+            let get = |k: &str| {
+                entry
+                    .get(k)
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            };
+            let (binding, bucket) = (get("binding"), get("bucket_name"));
+            if binding.is_empty() || bucket.is_empty() {
+                return Err("r2_buckets entries need binding and bucket_name".into());
+            }
+            let preview = entry
+                .get("preview_bucket_name")
+                .and_then(Value::as_str)
+                .map(|s| s.to_string());
+            let remote = entry
+                .get("remote")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            out.push(R2Binding {
+                binding,
+                bucket_name: bucket,
+                preview_bucket_name: preview,
+                remote,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Minimal `[[r2_buckets]]` section parser for Wrangler TOML.
+fn toml_r2_bindings(raw: &str) -> Result<Vec<R2Binding>, String> {
+    #[derive(Default)]
+    struct Partial {
+        binding: Option<String>,
+        bucket_name: Option<String>,
+        preview_bucket_name: Option<String>,
+        remote: bool,
+    }
+    impl Partial {
+        fn set(&mut self, key: &str, raw_value: &str) {
+            match key {
+                "binding" => self.binding = parse_toml_string(raw_value),
+                "bucket_name" => self.bucket_name = parse_toml_string(raw_value),
+                "preview_bucket_name" => self.preview_bucket_name = parse_toml_string(raw_value),
+                "remote" => self.remote = raw_value.trim() == "true",
+                _ => {}
+            }
+        }
+        fn finish(self) -> Result<R2Binding, String> {
+            match (self.binding, self.bucket_name) {
+                (Some(binding), Some(bucket_name))
+                    if !binding.is_empty() && !bucket_name.is_empty() =>
+                {
+                    Ok(R2Binding {
+                        binding,
+                        bucket_name,
+                        preview_bucket_name: self.preview_bucket_name,
+                        remote: self.remote,
+                    })
+                }
+                _ => Err("r2_buckets entries need binding and bucket_name".into()),
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut current: Option<Partial> = None;
+    let mut in_r2 = false;
+    for raw_line in raw.lines() {
+        let line = strip_toml_comment(raw_line).trim().to_string();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            if let Some(slot) = current.take() {
+                out.push(slot.finish()?);
+            }
+            in_r2 = line == "[[r2_buckets]]";
+            continue;
+        }
+        if !in_r2 {
+            continue;
+        }
+        let Some((key, raw_value)) = line.split_once('=') else {
+            continue;
+        };
+        current
+            .get_or_insert_with(Partial::default)
+            .set(key.trim(), raw_value.trim());
+    }
+    if let Some(slot) = current.take() {
+        out.push(slot.finish()?);
+    }
+    Ok(out)
+}
+
+fn is_plain_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Rewrite the `database_id` paired with `database_name` inside a Wrangler
+/// config document (JSON/JSONC or TOML), preserving every other byte.
+/// Used after Vaultly provisions a missing D1 so the repository keeps
+/// pointing at the account's database. Only plain ASCII name/id tokens are
+/// accepted; anything exotic fails safe with a manual-edit message.
+pub fn patch_d1_database_id(
+    raw: &str,
+    database_name: &str,
+    new_id: &str,
+) -> Result<String, String> {
+    if !is_plain_token(database_name) || !is_plain_token(new_id) {
+        return Err(
+            "refusing to patch database_id for unexpected characters; update it manually".into(),
+        );
+    }
+    if raw.contains("[[d1_databases]]") {
+        patch_toml_d1_id(raw, database_name, new_id)
+    } else if raw.contains("d1_databases") {
+        patch_json_d1_id(raw, database_name, new_id)
+    } else {
+        Err("no d1_databases section found; add the provisioned database_id manually".into())
+    }
+}
+
+/// Skip JSON whitespace starting at `i`, returning the new index.
+fn skip_json_ws(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len()
+        && (bytes[i] == b' ' || bytes[i] == b'\t' || bytes[i] == b'\n' || bytes[i] == b'\r')
+    {
+        i += 1;
+    }
+    i
+}
+
+/// Parse a JSON `"string"` starting at `i` (which must point at the opening
+/// quote). Returns the unescaped value and the index just past the closing
+/// quote. Only the escapes Wrangler configs plausibly contain are handled;
+/// anything else fails safe.
+fn parse_json_string_at(raw: &str, i: usize) -> Result<(String, usize), String> {
+    let bytes = raw.as_bytes();
+    if bytes.get(i) != Some(&b'"') {
+        return Err("expected string".into());
+    }
+    let mut value = String::new();
+    let mut j = i + 1;
+    while j < bytes.len() {
+        match bytes[j] {
+            b'"' => return Ok((value, j + 1)),
+            b'\\' => {
+                j += 1;
+                match bytes.get(j) {
+                    Some(b'"') => value.push('"'),
+                    Some(b'\\') => value.push('\\'),
+                    Some(b'n') => value.push('\n'),
+                    Some(b't') => value.push('\t'),
+                    Some(b'r') => value.push('\r'),
+                    _ => return Err("unsupported string escape".into()),
+                }
+                j += 1;
+            }
+            _ => {
+                let c = raw[j..].chars().next().ok_or("bad string")?;
+                value.push(c);
+                j += c.len_utf8();
+            }
+        }
+    }
+    Err("unterminated string".into())
+}
+
+fn patch_json_d1_id(raw: &str, database_name: &str, new_id: &str) -> Result<String, String> {
+    let key = "\"database_name\"";
+    let mut from = 0;
+    while let Some(rel) = raw[from..].find(key) {
+        let mut i = skip_json_ws(raw.as_bytes(), from + rel + key.len());
+        if raw.as_bytes().get(i) != Some(&b':') {
+            from += rel + key.len();
+            continue;
+        }
+        i = skip_json_ws(raw.as_bytes(), i + 1);
+        let Ok((name, after_name)) = parse_json_string_at(raw, i) else {
+            from += rel + key.len();
+            continue;
+        };
+        if name != database_name {
+            from = after_name;
+            continue;
+        }
+        // Found our entry: locate "database_id" within a bounded window.
+        let window_end = (after_name + 800).min(raw.len());
+        let id_key = "\"database_id\"";
+        let Some(id_rel) = raw[after_name..window_end].find(id_key) else {
+            return Err(format!(
+                "database '{database_name}' has no database_id nearby; update it manually"
+            ));
+        };
+        let mut k = skip_json_ws(raw.as_bytes(), after_name + id_rel + id_key.len());
+        if raw.as_bytes().get(k) != Some(&b':') {
+            return Err(format!(
+                "database '{database_name}' has a malformed database_id; update it manually"
+            ));
+        }
+        k = skip_json_ws(raw.as_bytes(), k + 1);
+        let Ok((_, after_id)) = parse_json_string_at(raw, k) else {
+            return Err(format!(
+                "database '{database_name}' has a malformed database_id; update it manually"
+            ));
+        };
+        // `k` points at the opening quote; `after_id - 1` at the closing one.
+        let mut patched = String::with_capacity(raw.len() + new_id.len());
+        patched.push_str(&raw[..k + 1]);
+        patched.push_str(new_id);
+        patched.push_str(&raw[after_id - 1..]);
+        return Ok(patched);
+    }
+    Err(format!(
+        "database '{database_name}' not found in d1_databases; add the provisioned database_id manually"
+    ))
+}
+
+fn patch_toml_d1_id(raw: &str, database_name: &str, new_id: &str) -> Result<String, String> {
+    // Work line-wise while preserving original terminators.
+    let lines: Vec<&str> = raw.split_inclusive('\n').collect();
+    // First pass: find which [[d1_databases]] sections declare our name.
+    let mut section_of_line: Vec<usize> = Vec::with_capacity(lines.len());
+    let mut section_idx = 0usize;
+    let mut in_d1 = false;
+    for line in &lines {
+        let stripped = strip_toml_comment(line).trim().to_string();
+        if stripped.starts_with('[') {
+            section_idx += 1;
+            in_d1 = stripped == "[[d1_databases]]";
+        }
+        section_of_line.push(if in_d1 { section_idx } else { 0 });
+    }
+    let mut matched_sections = std::collections::HashSet::new();
+    for (line, section) in lines.iter().zip(section_of_line.iter()) {
+        if *section == 0 {
+            continue;
+        }
+        let stripped = strip_toml_comment(line).trim().to_string();
+        let Some((key, value)) = stripped.split_once('=') else {
+            continue;
+        };
+        if key.trim() == "database_name"
+            && parse_toml_string(value.trim()).as_deref() == Some(database_name)
+        {
+            matched_sections.insert(*section);
+        }
+    }
+    if matched_sections.is_empty() {
+        return Err(format!(
+            "database '{database_name}' not found in [[d1_databases]]; add the provisioned database_id manually"
+        ));
+    }
+    // Second pass: rewrite database_id values inside matched sections.
+    let mut out = String::with_capacity(raw.len() + 64);
+    let mut patched_any = false;
+    for (line, section) in lines.iter().zip(section_of_line.iter()) {
+        if !matched_sections.contains(section) {
+            out.push_str(line);
+            continue;
+        }
+        let stripped = strip_toml_comment(line).trim().to_string();
+        let is_id_line = stripped
+            .split_once('=')
+            .map(|(key, _)| key.trim() == "database_id")
+            .unwrap_or(false);
+        if !is_id_line {
+            out.push_str(line);
+            continue;
+        }
+        // Replace the quoted value on the ORIGINAL line, keeping comments.
+        let eq = line.find('=').unwrap_or(0);
+        let after_eq = &line[eq + 1..];
+        let quote_off = after_eq.find(['"', '\'']);
+        let Some(q_rel) = quote_off else {
+            return Err(format!(
+                "database '{database_name}' has a malformed database_id; update it manually"
+            ));
+        };
+        let quote = after_eq.as_bytes()[q_rel];
+        let rest = &after_eq[q_rel + 1..];
+        let close_rel = if quote == b'\'' {
+            rest.find('\'')
+        } else {
+            // Double-quoted: honor backslash escapes (ids never contain them,
+            // but refuse to guess if they do).
+            let mut idx = 0usize;
+            let bytes = rest.as_bytes();
+            let mut found = None;
+            while idx < bytes.len() {
+                if bytes[idx] == b'\\' {
+                    idx += 2;
+                    continue;
+                }
+                if bytes[idx] == b'"' {
+                    found = Some(idx);
+                    break;
+                }
+                idx += 1;
+            }
+            found
+        };
+        let Some(c_rel) = close_rel else {
+            return Err(format!(
+                "database '{database_name}' has a malformed database_id; update it manually"
+            ));
+        };
+        let abs_open = eq + 1 + q_rel;
+        let abs_close = abs_open + 1 + c_rel;
+        out.push_str(&line[..abs_open + 1]);
+        out.push_str(new_id);
+        out.push_str(&line[abs_close..]);
+        patched_any = true;
+    }
+    if !patched_any {
+        return Err(format!(
+            "database '{database_name}' has no database_id nearby; update it manually"
+        ));
+    }
+    Ok(out)
+}
+
 /// Normalize the query-response shapes emitted for D1 queries across
 /// transports into individual query-response objects:
 /// - Wrangler CLI: `[{results:[…], success:…}]` (array of responses)
@@ -785,6 +1147,24 @@ pub fn extract_applied_migration_names(payload: &Value) -> Vec<String> {
 /// `d1_migrations` table means a fresh database: zero applied migrations.
 /// Any other API failure is returned as an error string.
 pub fn parse_d1_migration_query(payload: &Value) -> Result<Vec<String>, String> {
+    // REST envelopes report failures at the top level with an empty
+    // `result` array, leaving no per-batch object to inspect. A missing
+    // d1_migrations table still means a fresh database in that shape.
+    if payload.get("success").and_then(Value::as_bool) == Some(false) {
+        let top_errors: Vec<String> = payload
+            .get("errors")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| e.get("message").and_then(Value::as_str))
+                    .map(|s| s.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if top_errors.iter().any(|m| m.contains("d1_migrations")) {
+            return Ok(Vec::new());
+        }
+    }
     let batches = flatten_d1_batches(payload);
     if batches.is_empty() {
         return Err("unexpected D1 response shape".into());
@@ -1125,6 +1505,17 @@ IGNORED = "value"
             parse_d1_migration_query(&fresh).unwrap(),
             Vec::<String>::new()
         );
+        // REST envelope shape for a fresh database: top-level failure with
+        // an empty result array (exactly what provisioning leaves behind).
+        let fresh_envelope = serde_json::json!({
+            "success": false,
+            "errors": [{"message": "no such table: d1_migrations (code: 7500)"}],
+            "result": []
+        });
+        assert_eq!(
+            parse_d1_migration_query(&fresh_envelope).unwrap(),
+            Vec::<String>::new()
+        );
         // Any other API failure surfaces as an error string.
         let denied = serde_json::json!([{
             "success": false,
@@ -1143,5 +1534,86 @@ IGNORED = "value"
             vec!["AUTH_SIGNING_SECRET", "UPI_ID"]
         );
         assert!(extract_secret_names(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn r2_bindings_parse_from_jsonc_config() {
+        let dir = std::env::temp_dir().join("vaultly-r2-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("wrangler.jsonc");
+        std::fs::write(
+            &cfg,
+            r#"{
+              // comment
+              "name": "api",
+              "r2_buckets": [
+                { "binding": "MEDIA", "bucket_name": "postly-media" },
+                { "binding": "CONTENT_BUCKET", "bucket_name": "gate-2027-content",
+                  "preview_bucket_name": "gate-2027-content-preview" },
+                { "binding": "BACKUPS", "bucket_name": "gate-2027-d1-backups", "remote": true }
+              ]
+            }"#,
+        )
+        .unwrap();
+        let bindings = wrangler_r2_bindings(&cfg).unwrap();
+        assert_eq!(bindings.len(), 3);
+        assert_eq!(bindings[0].bucket_name, "postly-media");
+        assert!(bindings[0].preview_bucket_name.is_none());
+        assert!(!bindings[0].remote);
+        assert_eq!(
+            bindings[1].preview_bucket_name.as_deref(),
+            Some("gate-2027-content-preview")
+        );
+        assert!(bindings[2].remote);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn r2_bindings_parse_from_toml_sections() {
+        let parsed = toml_r2_bindings(
+            "name = 'api'\n[[r2_buckets]]\nbinding = 'MEDIA'\nbucket_name = 'postly-media'\n\
+             [[r2_buckets]]\nbinding = 'B'\nbucket_name = 'b2'\nremote = true\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].binding, "MEDIA");
+        assert!(!parsed[0].remote);
+        assert!(parsed[1].remote);
+        assert!(toml_r2_bindings("name = 'x'\n").unwrap().is_empty());
+    }
+
+    #[test]
+    fn patch_d1_id_rewrites_jsonc_preserving_rest() {
+        let raw = "{\n  // keep me\n  \"name\": \"cloud\",\n  \"d1_databases\": [\n    {\n      \"binding\": \"DB\",\n      \"database_name\": \"omnipulse-cloud\",\n      \"database_id\": \"11111111-2222-4333-8444-555555555555\",\n      \"migrations_dir\": \"db\"\n    }\n  ]\n}\n";
+        let patched = patch_d1_database_id(
+            raw,
+            "omnipulse-cloud",
+            "aaaaaaaa-bbbb-4ccc-dddd-eeeeeeeeeeee",
+        )
+        .unwrap();
+        assert!(patched.contains("// keep me"));
+        assert!(patched.contains("\"database_id\": \"aaaaaaaa-bbbb-4ccc-dddd-eeeeeeeeeeee\""));
+        assert!(!patched.contains("11111111-2222-4333-8444-555555555555"));
+        assert!(patched.contains("\"migrations_dir\": \"db\""));
+    }
+
+    #[test]
+    fn patch_d1_id_rewrites_toml_preserving_comments() {
+        let raw = "name = \"web\"\n[[d1_databases]]\nbinding = \"DB\" # keep\n\
+                   database_name = \"gateandtech-allinone-db\"\n\
+                   database_id = \"52812ef8-984c-4509-8947-1ff3b66a73a9\"\n";
+        let patched = patch_d1_database_id(raw, "gateandtech-allinone-db", "abc123").unwrap();
+        assert!(patched.contains("# keep"));
+        assert!(patched.contains("database_id = \"abc123\""));
+        assert!(!patched.contains("52812ef8"));
+    }
+
+    #[test]
+    fn patch_d1_id_fails_safe() {
+        let raw = "{\"d1_databases\": [{\"binding\": \"DB\", \"database_name\": \"a\", \"database_id\": \"b\"}]}";
+        assert!(patch_d1_database_id(raw, "missing", "c").is_err());
+        assert!(patch_d1_database_id(raw, "a; DROP", "c").is_err());
+        assert!(patch_d1_database_id("{\"name\": \"x\"}", "a", "c").is_err());
+        assert!(patch_d1_database_id("name = 'x'\n", "a", "c").is_err());
     }
 }

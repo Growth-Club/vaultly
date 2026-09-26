@@ -14,9 +14,10 @@ use tokio::process::Command as TokioCommand;
 use crate::crypto::SecretMeta;
 use crate::deploy::{
     approved_target_script, discover_deployment_spec, extract_secret_names, is_migration_file,
-    migration_safety_verdict, parse_d1_migration_query, pending_migrations,
-    target_exec_allowed_keys, wrangler_d1_bindings, D1Preflight, DeploymentProvider,
-    DeploymentResult, DeploymentTarget, TargetExecResult, TargetPreflight, APPROVED_TARGET_SCRIPTS,
+    migration_safety_verdict, parse_d1_migration_query, patch_d1_database_id, pending_migrations,
+    target_exec_allowed_keys, wrangler_d1_bindings, wrangler_r2_bindings, D1Preflight,
+    DeploymentProvider, DeploymentResult, DeploymentTarget, TargetExecResult, TargetPreflight,
+    APPROVED_TARGET_SCRIPTS,
 };
 use crate::error::{Result, VaultError};
 use crate::policy::{CallerContext, Operation, PolicyEngine};
@@ -939,6 +940,10 @@ impl VaultEngine {
             ));
         }
 
+        // End-to-end provisioning: declared D1/R2 storage exists before
+        // publish, so first deploys succeed without manual setup.
+        self.bootstrap_target_storage(target, ctx).await?;
+
         self.publish_target(target, &output_dir, ctx).await
     }
 
@@ -1423,11 +1428,230 @@ impl VaultEngine {
     /// Wrangler config. The agent supplies only the selected Vaultly vault and
     /// local config path; account identity comes from the vault and the
     /// Cloudflare resource must already exist in that account.
+    /// Default Wrangler config in a project directory: exactly one of
+    /// wrangler.json/jsonc/toml. Anything else (zero, several) means a
+    /// legacy layout where storage bootstrap stays out of the way.
+    fn default_wrangler_config(project_dir: &str) -> Option<PathBuf> {
+        let dir = Path::new(project_dir);
+        let configs: Vec<PathBuf> = ["wrangler.json", "wrangler.jsonc", "wrangler.toml"]
+            .iter()
+            .map(|name| dir.join(name))
+            .filter(|path| path.is_file())
+            .collect();
+        if configs.len() == 1 {
+            configs.into_iter().next()
+        } else {
+            None
+        }
+    }
+
+    /// Bucket names from an R2 list response, accepting both the bare-array
+    /// shape and the `{"buckets": [...]}` object shape Cloudflare emits.
+    fn r2_bucket_names(payload: &Value) -> Vec<String> {
+        let items = match payload.get("result") {
+            Some(Value::Array(arr)) => arr.clone(),
+            Some(obj) => obj
+                .get("buckets")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        items
+            .iter()
+            .filter_map(|b| b.get("name").and_then(Value::as_str))
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    /// Ensure the D1 databases and R2 buckets declared in the target's own
+    /// Wrangler config exist in the target's account, creating the missing
+    /// ones so a first deploy succeeds end to end.
+    ///
+    /// Target-bound provisioning guarantees (same as Pages first-boot):
+    /// - Only names declared in the repository's own config, only in the
+    ///   vault-bound account. No arbitrary names, no arbitrary accounts.
+    /// - `remote: true` R2 references are never created (owned elsewhere).
+    /// - New D1 ids are patched back into the same config file so later
+    ///   preflight/migrate/deploy keep pointing at the account's database.
+    /// - Every creation is audited; API outputs are scrubbed; only names
+    ///   (never values) reach results or errors.
+    /// Runs only when the project directory holds exactly one default
+    /// Wrangler config; legacy layouts keep prior behavior untouched.
+    async fn bootstrap_target_storage(
+        &mut self,
+        target: &DeploymentTarget,
+        ctx: Option<&CallerContext>,
+    ) -> Result<()> {
+        let Some(config_path) = Self::default_wrangler_config(&target.project_dir) else {
+            return Ok(());
+        };
+
+        // ── D1 ──
+        let d1 = wrangler_d1_bindings(&config_path).map_err(VaultError::Policy)?;
+        if !d1.is_empty() {
+            let list = self
+                .cloudflare_account_api(&target.vault, "GET", "/d1/database", None, ctx)
+                .await?;
+            if !(200..300).contains(&list.status) {
+                return Err(VaultError::CloudflareResponse(format!(
+                    "D1 discovery failed with HTTP {}",
+                    list.status
+                )));
+            }
+            let known: Vec<(String, String)> = list
+                .data
+                .get("result")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|db| {
+                            let name = db.get("name")?.as_str()?.to_string();
+                            let uuid = db.get("uuid")?.as_str()?.to_string();
+                            Some((name, uuid))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut raw: Option<String> = None;
+            for binding in &d1 {
+                match known
+                    .iter()
+                    .find(|(name, _)| name == &binding.database_name)
+                {
+                    Some((_, uuid)) if uuid == &binding.database_id => {}
+                    Some((_, uuid)) => {
+                        let text =
+                            raw.get_or_insert(fs::read_to_string(&config_path).map_err(|e| {
+                                VaultError::Policy(format!(
+                                    "cannot re-read Wrangler config '{}': {e}",
+                                    config_path.display()
+                                ))
+                            })?);
+                        *text = patch_d1_database_id(text, &binding.database_name, uuid)
+                            .map_err(VaultError::Policy)?;
+                        self.audit(
+                            "D1_REUSED",
+                            &format!("database={} target={}", binding.database_name, target.id),
+                            ctx,
+                        );
+                    }
+                    None => {
+                        let created = self
+                            .cloudflare_account_api(
+                                &target.vault,
+                                "POST",
+                                "/d1/database",
+                                Some(serde_json::json!({ "name": binding.database_name })),
+                                ctx,
+                            )
+                            .await?;
+                        if !(200..300).contains(&created.status) {
+                            return Err(VaultError::CloudflareResponse(format!(
+                                "D1 creation failed with HTTP {}",
+                                created.status
+                            )));
+                        }
+                        let uuid = created
+                            .data
+                            .get("result")
+                            .and_then(|r| r.get("uuid"))
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| {
+                                VaultError::CloudflareResponse(format!(
+                                    "D1 '{}' creation returned no database id; create it manually and set database_id",
+                                    binding.database_name
+                                ))
+                            })?;
+                        let text =
+                            raw.get_or_insert(fs::read_to_string(&config_path).map_err(|e| {
+                                VaultError::Policy(format!(
+                                    "cannot re-read Wrangler config '{}': {e}",
+                                    config_path.display()
+                                ))
+                            })?);
+                        *text = patch_d1_database_id(text, &binding.database_name, uuid)
+                            .map_err(VaultError::Policy)?;
+                        self.audit(
+                            "D1_CREATED",
+                            &format!("database={} target={}", binding.database_name, target.id),
+                            ctx,
+                        );
+                    }
+                }
+            }
+            if let Some(text) = raw {
+                fs::write(&config_path, text).map_err(|e| {
+                    VaultError::Policy(format!(
+                        "cannot update database_id in '{}': {e}; set it manually",
+                        config_path.display()
+                    ))
+                })?;
+            }
+        }
+
+        // ── R2 ──
+        let r2 = wrangler_r2_bindings(&config_path).map_err(VaultError::Policy)?;
+        let mut wanted: Vec<String> = Vec::new();
+        for bucket in &r2 {
+            if bucket.remote {
+                continue;
+            }
+            for name in [&bucket.bucket_name]
+                .into_iter()
+                .chain(bucket.preview_bucket_name.as_ref())
+            {
+                if !wanted.iter().any(|w| w == name) {
+                    wanted.push(name.clone());
+                }
+            }
+        }
+        if !wanted.is_empty() {
+            let list = self
+                .cloudflare_account_api(&target.vault, "GET", "/r2/buckets", None, ctx)
+                .await?;
+            if !(200..300).contains(&list.status) {
+                return Err(VaultError::CloudflareResponse(format!(
+                    "R2 discovery failed with HTTP {}",
+                    list.status
+                )));
+            }
+            let existing = Self::r2_bucket_names(&list.data);
+            for name in &wanted {
+                if existing.iter().any(|b| b == name) {
+                    continue;
+                }
+                let created = self
+                    .cloudflare_account_api(
+                        &target.vault,
+                        "POST",
+                        "/r2/buckets",
+                        Some(serde_json::json!({ "name": name })),
+                        ctx,
+                    )
+                    .await?;
+                if !(200..300).contains(&created.status) {
+                    return Err(VaultError::CloudflareResponse(format!(
+                        "R2 bucket creation failed with HTTP {}",
+                        created.status
+                    )));
+                }
+                self.audit(
+                    "R2_CREATED",
+                    &format!("bucket={} target={}", name, target.id),
+                    ctx,
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub async fn adopt_deployment_target(
         &mut self,
         vault_name: &str,
         config_path: &Path,
         ctx: Option<&CallerContext>,
+        allow_create: bool,
     ) -> Result<DeploymentTarget> {
         self.op(ctx, Operation::Deploy, vault_name)?;
         let account_id = self.cf_account_id(vault_name)?;
@@ -1465,7 +1689,7 @@ impl VaultEngine {
                 workers.iter().any(|worker| worker == &spec.project)
             }
         };
-        if !resource_exists {
+        if !resource_exists && !allow_create {
             return Err(VaultError::Policy(format!(
                 "Cloudflare {} '{}' was not found in the selected account",
                 match spec.provider {
@@ -1475,6 +1699,13 @@ impl VaultEngine {
                 spec.project
             )));
         }
+        // End-to-end provisioning: with explicit opt-in, a missing resource
+        // is registered anyway and created on first deploy (Workers via the
+        // repository's `npm run deploy`; D1/R2 via deploy-time bootstrap of
+        // the config's own bindings). Account identity is still verified
+        // from the vault above, and only the config-derived project name in
+        // that account can ever be created — no arbitrary names.
+        let provisioning = !resource_exists;
 
         let target = DeploymentTarget {
             id: spec.target_id(&account_id),
@@ -1512,8 +1743,8 @@ impl VaultEngine {
         self.audit(
             "TARGET_ADOPT",
             &format!(
-                "target={} provider={:?} project={} vault={}",
-                target.id, target.provider, target.project, target.vault
+                "target={} provider={:?} project={} vault={} provisioning={}",
+                target.id, target.provider, target.project, target.vault, provisioning
             ),
             ctx,
         );
@@ -3681,6 +3912,110 @@ mod tests {
         (format!("http://{}", addr), requests)
     }
 
+    #[derive(Clone, Copy)]
+    struct MockRoute {
+        method: &'static str,
+        path_prefix: &'static str,
+        status: u16,
+        body: &'static str,
+    }
+
+    /// Route-aware variant of the canned server: matches (method, path
+    /// prefix) in order, answering 404 JSON when nothing matches.
+    async fn spawn_cf_router(
+        routes: Vec<MockRoute>,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<CapturedRequest>>>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests: std::sync::Arc<std::sync::Mutex<Vec<CapturedRequest>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reqs = requests.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                let reqs = reqs.clone();
+                let routes = routes.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 2048];
+                    let header_end = loop {
+                        match sock.read(&mut tmp).await {
+                            Ok(0) | Err(_) => break None,
+                            Ok(n) => {
+                                buf.extend_from_slice(&tmp[..n]);
+                                if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                    break Some(i);
+                                }
+                            }
+                        }
+                    };
+                    let Some(end) = header_end else { return };
+                    let head = String::from_utf8_lossy(&buf[..end]).to_string();
+                    let mut lines = head.lines();
+                    let req_line = lines.next().unwrap_or("").to_string();
+                    let mut headers = Vec::new();
+                    let mut content_length = 0usize;
+                    for l in lines {
+                        if let Some((k, v)) = l.split_once(':') {
+                            let k = k.trim().to_string();
+                            let v = v.trim().to_string();
+                            if k.eq_ignore_ascii_case("content-length") {
+                                content_length = v.parse().unwrap_or(0);
+                            }
+                            headers.push((k, v));
+                        }
+                    }
+                    while buf.len() < end + 4 + content_length {
+                        match sock.read(&mut tmp).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        }
+                    }
+                    let body = String::from_utf8_lossy(&buf[end + 4..end + 4 + content_length])
+                        .to_string();
+                    let parts: Vec<&str> = req_line.split_whitespace().collect();
+                    let method = parts.first().unwrap_or(&"").to_string();
+                    let path = parts.get(1).unwrap_or(&"").to_string();
+                    let (status, resp_body) = routes
+                        .iter()
+                        .find(|r| method == r.method && path.starts_with(r.path_prefix))
+                        .map(|r| (r.status, r.body))
+                        .unwrap_or((
+                            404,
+                            r#"{"success":false,"errors":[{"code":7003,"message":"not found"}]}"#,
+                        ));
+                    reqs.lock().unwrap().push(CapturedRequest {
+                        method,
+                        path,
+                        headers,
+                        body,
+                    });
+                    let reason = match status {
+                        200 => "OK",
+                        201 => "Created",
+                        400 => "Bad Request",
+                        404 => "Not Found",
+                        _ => "OK",
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        resp_body.len(),
+                        resp_body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{}", addr), requests)
+    }
+
     fn cf_setup() -> (VaultEngine, PathBuf) {
         let (mut engine, dir) = setup();
         engine
@@ -4422,11 +4757,7 @@ mod tests {
         // Value reads stay denied even with the grant.
         assert!(engine
             .policy
-            .check(
-                Some(&ctx),
-                Operation::ReadValue,
-                "cf-test"
-            )
+            .check(Some(&ctx), Operation::ReadValue, "cf-test")
             .is_err());
     }
 
@@ -4449,5 +4780,178 @@ mod tests {
             err.to_string().contains("group/other-writable"),
             "got: {err}"
         );
+    }
+
+    // ─── End-to-end provisioning (adopt --create + storage bootstrap) ──
+
+    fn adopt_project_dir(name: &str, wrangler: &str) -> PathBuf {
+        // discover_deployment_spec confines configs to the current
+        // workspace, so the fixture lives under the crate directory.
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("vaultly-test-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("wrangler.jsonc"), wrangler).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"name":"t","scripts":{"build":"echo build","deploy":"wrangler deploy"}}"#,
+        )
+        .unwrap();
+        dir
+    }
+
+    const ADOPT_WRANGLER: &str = r#"{
+      "name": "new-worker",
+      "main": "src/index.ts",
+      "compatibility_date": "2026-09-01"
+    }"#;
+
+    fn provisioning_engine() -> (VaultEngine, String) {
+        let (mut engine, _dir) = setup();
+        engine
+            .add_secret("cf", "CLOUDFLARE_API_TOKEN", "tok", Some(&agent_ctx()))
+            .unwrap();
+        engine
+            .add_secret(
+                "cf",
+                "CLOUDFLARE_ACCOUNT_ID",
+                "0123456789abcdef0123456789abcdef",
+                Some(&agent_ctx()),
+            )
+            .unwrap();
+        (engine, "cf".to_string())
+    }
+
+    #[tokio::test]
+    async fn adopt_rejects_missing_worker_without_create() {
+        let (mut engine, _) = provisioning_engine();
+        let (base, _reqs) = spawn_cf_server(r#"{"success":true,"result":[]}"#).await;
+        engine.cf_base = base;
+        let proj = adopt_project_dir("adopt-strict", ADOPT_WRANGLER);
+        let err = engine
+            .adopt_deployment_target(
+                "cf",
+                &proj.join("wrangler.jsonc"),
+                Some(&agent_ctx()),
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("was not found"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    #[tokio::test]
+    async fn adopt_registers_provisioning_target_with_create() {
+        let (mut engine, _) = provisioning_engine();
+        let (base, _reqs) = spawn_cf_server(r#"{"success":true,"result":[]}"#).await;
+        engine.cf_base = base;
+        let proj = adopt_project_dir("adopt-create", ADOPT_WRANGLER);
+        let target = engine
+            .adopt_deployment_target("cf", &proj.join("wrangler.jsonc"), Some(&agent_ctx()), true)
+            .await
+            .unwrap();
+        assert_eq!(target.project, "new-worker");
+        assert!(target.worker_package_deploy);
+        assert_eq!(target.vault, "cf");
+        assert_eq!(target.account_id, "0123456789abcdef0123456789abcdef");
+        // Idempotent re-adopt returns the same target.
+        let again = engine
+            .adopt_deployment_target("cf", &proj.join("wrangler.jsonc"), Some(&agent_ctx()), true)
+            .await
+            .unwrap();
+        assert_eq!(again.id, target.id);
+        let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_creates_missing_d1_and_r2() {
+        let (mut engine, _) = provisioning_engine();
+        let proj = std::env::temp_dir().join("vaultly-test-bootstrap");
+        let _ = std::fs::remove_dir_all(&proj);
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("wrangler.jsonc"),
+            r#"{
+          "name": "w",
+          "d1_databases": [
+            {"binding": "DB", "database_name": "have-db", "database_id": "stale-id"},
+            {"binding": "DB2", "database_name": "need-db", "database_id": "00000000-0000-4000-8000-000000000000"}
+          ],
+          "r2_buckets": [
+            {"binding": "A", "bucket_name": "have-bucket", "preview_bucket_name": "need-preview"},
+            {"binding": "B", "bucket_name": "need-bucket"},
+            {"binding": "C", "bucket_name": "remote-bucket", "remote": true}
+          ]
+        }"#,
+        )
+        .unwrap();
+        let (base, reqs) = spawn_cf_router(vec![
+            MockRoute {
+                method: "GET",
+                path_prefix: "/accounts/0123456789abcdef0123456789abcdef/d1/database",
+                status: 200,
+                body: r#"{"success":true,"result":[{"uuid":"uuid-have","name":"have-db"}]}"#,
+            },
+            MockRoute {
+                method: "POST",
+                path_prefix: "/accounts/0123456789abcdef0123456789abcdef/d1/database",
+                status: 200,
+                body: r#"{"success":true,"result":{"uuid":"uuid-new"}}"#,
+            },
+            MockRoute {
+                method: "GET",
+                path_prefix: "/accounts/0123456789abcdef0123456789abcdef/r2/buckets",
+                status: 200,
+                body: r#"{"success":true,"result":{"buckets":[{"name":"have-bucket"}]}}"#,
+            },
+            MockRoute {
+                method: "POST",
+                path_prefix: "/accounts/0123456789abcdef0123456789abcdef/r2/buckets",
+                status: 200,
+                body: r#"{"success":true,"result":{}}"#,
+            },
+        ])
+        .await;
+        engine.cf_base = base;
+        let target = DeploymentTarget {
+            id: "t".to_string(),
+            provider: DeploymentProvider::Worker,
+            vault: "cf".to_string(),
+            account_id: "0123456789abcdef0123456789abcdef".to_string(),
+            project: "w".to_string(),
+            project_dir: proj.to_string_lossy().to_string(),
+            build_command: "npm run build".to_string(),
+            output_dir: ".".to_string(),
+            branch: None,
+            worker_package_deploy: true,
+            created_at: "2026-01-01T00:00:00.000Z".to_string(),
+        };
+        engine
+            .bootstrap_target_storage(&target, Some(&agent_ctx()))
+            .await
+            .unwrap();
+        let cfg = std::fs::read_to_string(proj.join("wrangler.jsonc")).unwrap();
+        assert!(cfg.contains("\"database_id\": \"uuid-have\""), "{cfg}");
+        assert!(cfg.contains("\"database_id\": \"uuid-new\""), "{cfg}");
+        assert!(!cfg.contains("stale-id"), "{cfg}");
+        let reqs = reqs.lock().unwrap();
+        let posts: Vec<&CapturedRequest> = reqs.iter().filter(|r| r.method == "POST").collect();
+        // 1 D1 create + 2 R2 creates (need-bucket, need-preview).
+        assert_eq!(posts.len(), 3, "{reqs:?}");
+        assert!(posts
+            .iter()
+            .any(|r| r.path.contains("/d1/database") && r.body.contains("need-db")));
+        assert!(posts
+            .iter()
+            .any(|r| r.path.contains("/r2/buckets") && r.body.contains("need-bucket")));
+        assert!(posts
+            .iter()
+            .any(|r| r.path.contains("/r2/buckets") && r.body.contains("need-preview")));
+        assert!(!posts.iter().any(|r| r.body.contains("remote-bucket")));
+        assert!(!posts.iter().any(|r| r.body.contains("have-bucket")));
+        let _ = std::fs::remove_dir_all(&proj);
     }
 }

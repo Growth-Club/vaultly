@@ -159,7 +159,7 @@ fn tools_list() -> Vec<Tool> {
         Tool { name: "cf_workers_list", description: "List Workers for discovery and target adoption.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault")},"required":["vaultName"]}) },
         Tool { name: "cf_secrets", description: "List/set/delete Worker secrets. Values are write-only.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault"),"scriptName":str_prop("Worker name"),"action":json!({"type":"string","enum":["list","set","delete"]}),"name":str_prop("Secret name"),"value":str_prop("Secret value; write-only")},"required":["vaultName","scriptName","action"]}) },
         Tool { name: "deploy_targets", description: "List deployment targets. Metadata only.", schema: json!({"type":"object","properties":{}}) },
-        Tool { name: "deploy_target_adopt", description: "Discover and idempotently adopt a Pages/Worker target from a Wrangler config in the current workspace. Account and project identity are resolved from the selected Cloudflare vault and live account inventory.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault; account is resolved from this vault"),"configPath":str_prop("Wrangler JSON/JSONC/TOML config inside the current workspace")},"required":["vaultName","configPath"]}) },
+        Tool { name: "deploy_target_adopt", description: "Discover and idempotently adopt a Pages/Worker target from a Wrangler config in the current workspace. Account and project identity are resolved from the selected Cloudflare vault and live account inventory. Pass allowCreate=true to register a target whose resource does not exist yet; it is created on first deploy (Workers via npm run deploy, D1/R2 bootstrapped from the config's own bindings).", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault; account is resolved from this vault"),"configPath":str_prop("Wrangler JSON/JSONC/TOML config inside the current workspace"),"allowCreate":json!({"type":"boolean","description":"Register even if the Cloudflare resource does not exist yet (created on first deploy)."})},"required":["vaultName","configPath"]}) },
         Tool { name: "deploy_target", description: "Deploy one approved target by ID. The agent cannot choose account, project, branch, directory, or command.", schema: json!({"type":"object","properties":{"targetId":str_prop("Registered deployment target ID")},"required":["targetId"]}) },
         Tool { name: "deploy_target_preflight", description: "Read-only preflight for one approved target by ID: worker existence, worker secret names, and per-D1-database applied/pending migrations with safety verdicts. No mutations, no credential values.", schema: json!({"type":"object","properties":{"targetId":str_prop("Registered deployment target ID")},"required":["targetId"]}) },
         Tool { name: "deploy_target_exec", description: "Execute one APPROVED repository maintenance script (check:migrations, backup:d1, backup:verify, migrate:apply, watchdog, smoke) against a registered target. Script bodies come from the repo package.json, never from agent input. Mutating scripts need the typed confirm word and a human-granted run policy (default policy_denied).", schema: json!({"type":"object","properties":{"targetId":str_prop("Registered deployment target ID"),"script":str_prop("Approved script name, e.g. migrate:apply"),"confirm":str_prop("Typed confirmation for mutating scripts (APPLY, BACKUP)")},"required":["targetId","script"]}) },
@@ -224,8 +224,12 @@ async fn tool_deploy_target_adopt(
     ctx: &CallerContext,
 ) -> Value {
     require!(args, vault => "vaultName", config => "configPath");
+    let allow_create = args
+        .get("allowCreate")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     match engine
-        .adopt_deployment_target(vault, std::path::Path::new(config), Some(ctx))
+        .adopt_deployment_target(vault, std::path::Path::new(config), Some(ctx), allow_create)
         .await
     {
         Ok(target) => json!({

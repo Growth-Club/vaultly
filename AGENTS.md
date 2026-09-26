@@ -54,7 +54,16 @@ the project name is read from the config and verified against that account:
 
 ```bash
 vaultly target adopt --vault cf-example --config apps/api/wrangler.jsonc --json
+# First-time provisioning (resource does not exist yet):
+vaultly target adopt --vault cf-example --config apps/api/wrangler.jsonc --create --json
 ```
+
+With `--create` (MCP: `allowCreate`), adoption registers a provisioning
+target and the first deploy creates it end to end: the Worker via the
+repository's own `npm run deploy`, plus any missing D1 databases / R2
+buckets declared in the config's own bindings (new D1 ids patched back into
+the config). Only config-declared names in the vault-bound account can ever
+be created.
 
 For Workers, adoption requires an `npm run deploy` script so repository
 predeploy guards run with Vaultly's scoped Cloudflare environment. Pages and

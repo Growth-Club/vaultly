@@ -13,6 +13,15 @@ removed). Highlights of the current unreleased feature set:
 
 ### Added
 
+- **End-to-end provisioning** — `vaultly target adopt --create` (MCP:
+  `deploy_target_adopt` with `allowCreate`) registers a target whose
+  Worker/Pages resource does not exist yet (audited as provisioning), and
+  the first deploy creates it: Workers via the repository's own `npm run
+  deploy`, with missing D1 databases / R2 buckets from the config's own
+  `d1_databases` / `r2_buckets` bindings provisioned in the vault-bound
+  account first (new D1 ids patched back into the config, `remote: true`
+  R2 references skipped). Only config-declared names in that account can
+  ever be created; no values reach the agent.
 - **Owner-managed agent policy grants** — the CLI and MCP server now load
   `agent-policy.json` from the vault directory on startup (explicit
   `VAULTLY_AGENT_POLICY` still wins on conflict). This makes the documented

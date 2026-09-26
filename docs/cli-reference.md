@@ -99,6 +99,12 @@ vaultly target adopt \
   --vault cf-example \
   --config apps/api/wrangler.jsonc \
   --json
+# First-time provisioning (resource does not exist yet):
+vaultly target adopt \
+  --vault cf-example \
+  --config apps/api/wrangler.jsonc \
+  --create \
+  --json
 ```
 
 Vaultly resolves the account from the selected vault, reads the Worker or Pages
@@ -106,6 +112,14 @@ identity from the config, verifies the resource exists in that account, and
 saves an idempotent target. The config must be inside the current workspace.
 Worker adoption requires `npm run deploy`, preserving repository predeploy
 guards. No raw credential is returned to the agent.
+
+With `--create`, adoption registers a target whose resource does not exist
+yet (audited as provisioning); the first deploy then creates it end to end:
+Workers are created by the repository's own `npm run deploy`, and missing D1
+databases / R2 buckets declared in the config's `d1_databases` / `r2_buckets`
+bindings are provisioned in the vault-bound account first (new D1 ids are
+patched back into the config). Only config-declared names in that account can
+ever be created; `remote: true` R2 references are skipped.
 
 The target record is validated and stored separately from secrets. The agent
 cannot override its account ID, project, branch, paths, or build command.

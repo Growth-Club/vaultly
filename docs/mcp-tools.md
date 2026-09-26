@@ -56,7 +56,7 @@ responses are scrubbed before they are returned to the agent.
 | Tool | Purpose |
 |---|---|
 | `deploy_targets` | List registered target metadata |
-| `deploy_target_adopt` | Discover, verify, and idempotently register a target from a local Wrangler config |
+| `deploy_target_adopt` | Discover, verify, and idempotently register a target from a local Wrangler config (`allowCreate` provisions missing resources on first deploy) |
 | `deploy_target` | Deploy one target by ID |
 | `deploy_target_preflight` | Read-only check: worker existence, secret names, per-D1-database applied/pending migrations with safety verdicts |
 | `deploy_target_exec` | Run one approved maintenance script (`check:migrations`, `backup:d1`, `backup:verify`, `migrate:apply`, `watchdog`, `smoke`); mutating scripts need typed confirm + granted `run` op |
@@ -65,8 +65,11 @@ responses are scrubbed before they are returned to the agent.
 Agents normally call `deploy_target_adopt` with a selected Cloudflare vault and
 a Wrangler config inside the current workspace. The account ID comes only from
 that vault, the project/provider come only from the config, and the live
-Cloudflare account must contain the resource. The agent cannot supply an
-account ID, project name, arbitrary command, or outside-workspace path.
+Cloudflare account must contain the resource — unless `allowCreate` is passed,
+which registers a provisioning target whose Worker/Pages resource is created
+on first deploy (missing D1/R2 bindings from the config are provisioned first).
+The agent cannot supply an account ID, project name, arbitrary command, or
+outside-workspace path.
 
 `vaultly target add` remains a legacy human-only fallback for repositories that
 cannot be discovered from Wrangler configuration.
