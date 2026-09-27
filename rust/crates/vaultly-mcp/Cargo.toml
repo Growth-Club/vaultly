@@ -3,7 +3,7 @@ name = "vaultly-mcp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Vaultly MCP server — 32 agent-safe tools, no raw secret exposure"
+description = "Vaultly MCP server — 31 agent-safe tools, no raw secret exposure"
 
 [dependencies]
 vaultly-core = { path = "../vaultly-core" }

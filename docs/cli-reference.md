@@ -37,6 +37,7 @@ for agents.
 | `vaultly keychain store\|remove` | Manage automatic Keychain unlock |
 | `vaultly kill` | Lock and clear the Keychain entry |
 | `vaultly keychain store\|remove` | Manage automatic unlock |
+| `vaultly completions <SHELL> [--install]` | Print or install shell completions (bash/zsh/fish) |
 | `vaultly doctor [--json]` | Diagnose local setup |
 | `vaultly version` | Print the installed version |
 
@@ -48,6 +49,9 @@ vaultly cf list
 vaultly cf remove <NAME>
 vaultly cf zones <NAME>
 vaultly cf pages <NAME>
+vaultly cf d1 <NAME>
+vaultly cf r2 <NAME>
+vaultly cf kv <NAME>
 vaultly cf secrets <NAME> <SCRIPT> [--list|--set|--delete]
 vaultly cf sync-github-secret --from-vault <VAULT> --from-key <KEY> --repo <OWNER/NAME> --secret <NAME>
 ```

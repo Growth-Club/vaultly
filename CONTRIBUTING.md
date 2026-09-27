@@ -15,7 +15,7 @@ vaultly/
 │   └── crates/
 │       ├── vaultly-core/       # storage, crypto, policy, scrubber, Cloudflare API
 │       ├── vaultly/            # CLI + interactive TUI + HTTP server
-│       └── vaultly-mcp/        # MCP server (32 agent-safe tools)
+│       └── vaultly-mcp/        # MCP server (31 agent-safe tools)
 ├── docs/                       # user-facing reference docs & examples
 ├── AGENTS.md                   # guidance for AI coding agents
 ├── ARCHITECTURE.md             # system design & diagrams

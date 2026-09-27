@@ -137,6 +137,14 @@ pub struct CfAccountHealth {
     pub ok: bool,
     pub message: String,
 }
+/// Agent-safe inventory entry for a D1 database, R2 bucket, or KV namespace:
+/// the resource name and its non-secret id. Never any stored value.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageResource {
+    pub name: String,
+    pub id: String,
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AuditEntry {
@@ -977,8 +985,10 @@ impl VaultEngine {
             })?;
             if !target_dir.starts_with(&workspace) {
                 return Err(VaultError::Policy(format!(
-                    "Agent deployment target directory must be inside the current workspace: {}",
-                    target_dir.display()
+                    "Agent deployment target directory must be inside the current workspace: {}. \
+Run this command from the repository that owns '{}' (its root or a subdirectory).",
+                    target_dir.display(),
+                    target.project_dir
                 )));
             }
             if target.worker_package_deploy {
@@ -1167,8 +1177,10 @@ impl VaultEngine {
         })?;
         if !target_dir.starts_with(&root) {
             return Err(VaultError::Policy(format!(
-                "Agent exec target directory must be inside the current workspace: {}",
-                target_dir.display()
+                "Agent exec target directory must be inside the current workspace: {}. \
+Run this command from the repository that owns '{}' (its root or a subdirectory).",
+                target_dir.display(),
+                target.project_dir
             )));
         }
         let package_raw = fs::read_to_string(root.join("package.json"))
@@ -1476,6 +1488,7 @@ impl VaultEngine {
     ///   preflight/migrate/deploy keep pointing at the account's database.
     /// - Every creation is audited; API outputs are scrubbed; only names
     ///   (never values) reach results or errors.
+    ///
     /// Runs only when the project directory holds exactly one default
     /// Wrangler config; legacy layouts keep prior behavior untouched.
     async fn bootstrap_target_storage(
@@ -2383,7 +2396,118 @@ impl VaultEngine {
         Ok(versions)
     }
 
+    // ─── Storage List (D1 / R2 / KV) ──────────────────────
+    //
+    // Read-only discovery, mirroring `list_workers`: names and ids only, no
+    // stored values, no mutations. The account is always the one bound to the
+    // selected vault, so an agent can never point these at another account.
+
+    /// D1 databases in the vault's account.
+    pub async fn list_d1_databases(
+        &mut self,
+        vault_name: &str,
+        ctx: Option<&CallerContext>,
+    ) -> Result<Vec<StorageResource>> {
+        self.list_account_storage(vault_name, "D1", "/d1/database", ctx)
+            .await
+    }
+
+    /// R2 buckets in the vault's account.
+    pub async fn list_r2_buckets(
+        &mut self,
+        vault_name: &str,
+        ctx: Option<&CallerContext>,
+    ) -> Result<Vec<StorageResource>> {
+        self.list_account_storage(vault_name, "R2", "/r2/buckets", ctx)
+            .await
+    }
+
+    /// Workers KV namespaces in the vault's account.
+    pub async fn list_kv_namespaces(
+        &mut self,
+        vault_name: &str,
+        ctx: Option<&CallerContext>,
+    ) -> Result<Vec<StorageResource>> {
+        self.list_account_storage(vault_name, "KV", "/storage/kv/namespaces", ctx)
+            .await
+    }
+
+    /// Shared account-scoped inventory call. `label` is only used for audit and
+    /// error text; `path` is a fixed literal from the callers above, never
+    /// agent input.
+    async fn list_account_storage(
+        &mut self,
+        vault_name: &str,
+        label: &str,
+        path: &str,
+        ctx: Option<&CallerContext>,
+    ) -> Result<Vec<StorageResource>> {
+        self.op(ctx, Operation::CfApi, vault_name)?;
+        self.audit(
+            &format!("CF_{}", label),
+            &format!("list {label} resources (vault={})", vault_name),
+            ctx,
+        );
+
+        let r = self
+            .cloudflare_account_api(vault_name, "GET", path, None, ctx)
+            .await?;
+        if !(200..300).contains(&r.status) {
+            return Err(VaultError::CloudflareResponse(format!(
+                "{} discovery failed: {}",
+                label,
+                Self::cf_failure_detail(path, r.status, &r.data)
+            )));
+        }
+        Ok(Self::storage_resources(&r.data))
+    }
+
+    /// Extract `name`/`id` pairs from a Cloudflare inventory response. Accepts
+    /// the bare-array shape and the `{"result": {"<key>": [...]}}` object shape
+    /// (R2 answers with `buckets`), and falls back to the array's first string
+    /// field for the id, which is how KV namespaces and D1 databases differ.
+    fn storage_resources(data: &Value) -> Vec<StorageResource> {
+        let items = match data.get("result") {
+            Some(Value::Array(arr)) => arr.clone(),
+            Some(obj) => ["databases", "buckets", "namespaces", "items"]
+                .iter()
+                .find_map(|key| obj.get(*key).and_then(Value::as_array).cloned())
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        items
+            .iter()
+            .filter_map(|item| {
+                let name = item
+                    .get("name")
+                    .or_else(|| item.get("title"))
+                    .and_then(Value::as_str)?
+                    .to_string();
+                let id = ["uuid", "id", "namespace_id"]
+                    .iter()
+                    .find_map(|key| item.get(*key).and_then(Value::as_str))
+                    .unwrap_or_default()
+                    .to_string();
+                Some(StorageResource { name, id })
+            })
+            .collect()
+    }
+
     // ─── Worker Secrets ───────────────────────────────────
+
+    /// Request body for `PUT .../workers/scripts/{script}/secrets`.
+    ///
+    /// Cloudflare requires an explicit `type` on a secret; omitting it fails with
+    /// `Secret '<name>' has unsupported type ''`. `secret_text` is the plain-string
+    /// type, which is what any CLI-supplied secret is. Kept separate from the
+    /// request so the shape is unit-testable without a network.
+    pub fn cf_secret_body(name: &str, value: &str) -> Value {
+        serde_json::json!({
+            "name": name,
+            "text": value,
+            "type": "secret_text",
+        })
+    }
 
     pub async fn worker_secrets(
         &mut self,
@@ -2445,7 +2569,7 @@ impl VaultEngine {
                 let value = value.ok_or_else(|| {
                     VaultError::RequiredField("value".into(), script_name.to_string())
                 })?;
-                let body = serde_json::json!({ "name": name, "text": value });
+                let body = Self::cf_secret_body(name, value);
                 send_with_retry(client.put(&base).headers(headers).json(&body)).await?
             }
             "delete" => {
@@ -2474,6 +2598,74 @@ impl VaultEngine {
 
     // ─── Health Check ─────────────────────────────────────
 
+    /// Probe one read-only endpoint and describe the outcome for a health
+    /// message: `(healthy, detail)`, where `detail` is the probe path on success
+    /// and Cloudflare's own error text on failure. Never returns credential
+    /// material, and never echoes response bodies (the account email is a
+    /// scrubbed credential, so it would only ever come back redacted).
+    async fn cf_probe(
+        &mut self,
+        vault_name: &str,
+        path: &str,
+        ctx: Option<&CallerContext>,
+    ) -> Result<(bool, String)> {
+        match self
+            .cloudflare_api(vault_name, "GET", path, None, ctx)
+            .await
+        {
+            Ok(r) => {
+                if !(200..300).contains(&r.status) {
+                    return Ok((false, Self::cf_failure_detail(path, r.status, &r.data)));
+                }
+                // A user-scoped token verify can answer 200 while reporting a
+                // dead token; treat any non-active status as a failure.
+                if let Some(status) = r
+                    .data
+                    .get("result")
+                    .and_then(|x| x.get("status"))
+                    .and_then(|s| s.as_str())
+                {
+                    if status != "active" {
+                        return Ok((false, format!("Token status: {}", status)));
+                    }
+                }
+                Ok((true, format!("verified via GET {}", path)))
+            }
+            Err(e) => Ok((false, format!("GET {} failed: {}", path, e))),
+        }
+    }
+
+    /// One-line, value-free description of a Cloudflare failure.
+    fn cf_failure_detail(path: &str, status: u16, data: &Value) -> String {
+        let msgs: Vec<String> = data
+            .get("errors")
+            .and_then(|e| e.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| e.get("message").and_then(|m| m.as_str()))
+                    .map(|s| s.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if msgs.is_empty() {
+            format!("GET {} failed with HTTP {}", path, status)
+        } else {
+            format!(
+                "GET {} failed with HTTP {}: {}",
+                path,
+                status,
+                msgs.join(", ")
+            )
+        }
+    }
+
+    /// Verify one Cloudflare credential set without exposing it.
+    ///
+    /// Probes are tried in order of how much they prove about the operations
+    /// Vaultly actually performs, and the first success wins. The user-level
+    /// endpoint is probed LAST on purpose: account-scoped API tokens are
+    /// rejected there with HTTP 401 even when every account operation works,
+    /// so trusting it alone reported healthy credentials as broken.
     pub async fn health_check(
         &mut self,
         vault_name: &str,
@@ -2484,6 +2676,9 @@ impl VaultEngine {
         let token = secrets.get("CLOUDFLARE_API_TOKEN").and_then(|v| v.as_str());
         let email = secrets.get("CLOUDFLARE_EMAIL").and_then(|v| v.as_str());
         let api_key = secrets.get("CLOUDFLARE_API_KEY").and_then(|v| v.as_str());
+        let account_id = secrets
+            .get("CLOUDFLARE_ACCOUNT_ID")
+            .and_then(|v| v.as_str());
 
         if token.is_none() && !(email.is_some() && api_key.is_some()) {
             return Ok((
@@ -2495,67 +2690,29 @@ impl VaultEngine {
             ));
         }
 
-        let result = if token.is_some() {
-            self.cloudflare_api(vault_name, "GET", "/user/tokens/verify", None, ctx)
-                .await
-        } else {
-            self.cloudflare_api(vault_name, "GET", "/user", None, ctx)
-                .await
-        };
-
-        match result {
-            Ok(r) => {
-                let data = &r.data;
-                if token.is_some() {
-                    let status = data
-                        .get("result")
-                        .and_then(|x| x.get("status"))
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("unknown");
-                    if status == "active" {
-                        Ok((true, "Token is active and valid ✓".to_string()))
-                    } else {
-                        Ok((false, format!("Token status: {}", status)))
-                    }
-                } else {
-                    let ok = data
-                        .get("success")
-                        .and_then(|s| s.as_bool())
-                        .unwrap_or(false);
-                    if ok {
-                        let user = data
-                            .get("result")
-                            .and_then(|x| x.get("username").or_else(|| x.get("email")))
-                            .and_then(|u| u.as_str())
-                            .unwrap_or("unknown");
-                        Ok((true, format!("Global API key is valid ✓ (user: {})", user)))
-                    } else {
-                        let msgs: Vec<String> = data
-                            .get("errors")
-                            .and_then(|e| e.as_array())
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|e| e.get("message").and_then(|m| m.as_str()))
-                                    .map(|s| s.to_string())
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        Ok((
-                            false,
-                            format!(
-                                "Global API key invalid: {}",
-                                if msgs.is_empty() {
-                                    "unknown error".into()
-                                } else {
-                                    msgs.join(", ")
-                                }
-                            ),
-                        ))
-                    }
-                }
-            }
-            Err(e) => Ok((false, format!("Health check failed: {}", e))),
+        let mut probes: Vec<String> = Vec::new();
+        if let Some(id) = account_id {
+            probes.push(format!("/accounts/{}", urlencode(id)));
         }
+        probes.push("/zones?per_page=1".to_string());
+        probes.push(if token.is_some() {
+            "/user/tokens/verify".to_string()
+        } else {
+            "/user".to_string()
+        });
+
+        let mut failures: Vec<String> = Vec::new();
+        for path in probes {
+            let (ok, detail) = self.cf_probe(vault_name, &path, ctx).await?;
+            if ok {
+                return Ok((true, format!("Credential is valid ✓ ({})", detail)));
+            }
+            failures.push(detail);
+        }
+        Ok((
+            false,
+            format!("Credential is not usable: {}", failures.join("; ")),
+        ))
     }
 
     // ─── GitHub secret sync ─────────────────────────────
@@ -3088,6 +3245,27 @@ pub fn urlencode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cf_secret_body_includes_the_type_cloudflare_requires() {
+        // Regression: the body used to be {name, text} with no `type`, and
+        // Cloudflare rejected it with "unsupported type ''". A secret set through
+        // `vaultly cf secrets --set` could therefore never succeed.
+        let body = VaultEngine::cf_secret_body("GITHUB_CLIENT_ID", "Iv1.abc123");
+        assert_eq!(body["name"], "GITHUB_CLIENT_ID");
+        assert_eq!(body["text"], "Iv1.abc123");
+        assert_eq!(
+            body["type"], "secret_text",
+            "Cloudflare rejects a secret with no type"
+        );
+    }
+
+    #[test]
+    fn cf_secret_body_sends_no_unexpected_fields() {
+        let body = VaultEngine::cf_secret_body("K", "v");
+        let keys: Vec<&String> = body.as_object().expect("object").keys().collect();
+        assert_eq!(keys.len(), 3, "unexpected fields: {keys:?}");
+    }
+
     use super::*;
     use crate::policy::{Caller, CallerContext};
     use std::fs as std_fs;
@@ -3545,7 +3723,7 @@ mod tests {
         };
         engine
             .store
-            .save_deployment_targets(&[target.clone()])
+            .save_deployment_targets(std::slice::from_ref(&target))
             .unwrap();
         let ctx = agent_ctx();
         let result = engine.deploy_target(&target, Some(&ctx)).await.unwrap();
@@ -4260,7 +4438,114 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cf_health_check_verifies_token_via_user_tokens_verify() {
+    async fn cf_health_check_prefers_the_account_probe() {
+        let (mut engine, _dir) = cf_setup();
+        engine
+            .add_secret(
+                "cf",
+                "CLOUDFLARE_API_TOKEN",
+                "cf-token-abcdef123456",
+                Some(&agent_ctx()),
+            )
+            .unwrap();
+        let (base, reqs) = spawn_cf_router(vec![
+            MockRoute {
+                method: "GET",
+                path_prefix: "/accounts/",
+                status: 200,
+                body: r#"{"success":true,"result":{"id":"acc-123"}}"#,
+            },
+            MockRoute {
+                method: "GET",
+                path_prefix: "/user/tokens/verify",
+                status: 401,
+                body: r#"{"success":false,"errors":[{"code":1000,"message":"Invalid API Token"}]}"#,
+            },
+        ])
+        .await;
+        engine.cf_base = base;
+
+        let (ok, msg) = engine.health_check("cf", Some(&agent_ctx())).await.unwrap();
+        assert!(ok, "{}", msg);
+        // The account probe answers first, so nothing else is called.
+        let sent = reqs.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].path, "/accounts/acc-123");
+    }
+
+    /// Regression: an account-scoped API token is rejected by the user-level
+    /// verify endpoint even though every account operation works. Health must
+    /// not report that credential as broken.
+    #[tokio::test]
+    async fn cf_health_check_survives_account_token_401_on_user_endpoint() {
+        let (mut engine, _dir) = cf_setup();
+        engine
+            .add_secret(
+                "cf",
+                "CLOUDFLARE_API_TOKEN",
+                "cf-token-abcdef123456",
+                Some(&agent_ctx()),
+            )
+            .unwrap();
+        let (base, reqs) = spawn_cf_router(vec![
+            MockRoute {
+                method: "GET",
+                path_prefix: "/accounts/",
+                status: 403,
+                body: r#"{"success":false,"errors":[{"code":9109,"message":"Missing X-Auth-Key"}]}"#,
+            },
+            MockRoute {
+                method: "GET",
+                path_prefix: "/zones",
+                status: 200,
+                body: r#"{"success":true,"result":[]}"#,
+            },
+            MockRoute {
+                method: "GET",
+                path_prefix: "/user/tokens/verify",
+                status: 401,
+                body: r#"{"success":false,"errors":[{"code":1000,"message":"Invalid API Token"}]}"#,
+            },
+        ])
+        .await;
+        engine.cf_base = base;
+
+        let (ok, msg) = engine.health_check("cf", Some(&agent_ctx())).await.unwrap();
+        assert!(ok, "{}", msg);
+        assert!(!msg.contains("unknown"), "{}", msg);
+        let sent = reqs.lock().unwrap();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[1].path, "/zones?per_page=1");
+    }
+
+    #[tokio::test]
+    async fn cf_health_check_reports_every_failed_probe() {
+        let (mut engine, _dir) = cf_setup();
+        engine
+            .add_secret(
+                "cf",
+                "CLOUDFLARE_API_TOKEN",
+                "cf-token-abcdef123456",
+                Some(&agent_ctx()),
+            )
+            .unwrap();
+        let (base, _reqs) = spawn_cf_router(vec![MockRoute {
+            method: "GET",
+            path_prefix: "/",
+            status: 401,
+            body: r#"{"success":false,"errors":[{"code":1000,"message":"Invalid API Token"}]}"#,
+        }])
+        .await;
+        engine.cf_base = base;
+
+        let (ok, msg) = engine.health_check("cf", Some(&agent_ctx())).await.unwrap();
+        assert!(!ok);
+        assert!(msg.contains("Invalid API Token"), "{}", msg);
+        assert!(!msg.contains("unknown"), "{}", msg);
+    }
+
+    #[tokio::test]
+    async fn cf_health_check_flags_a_non_active_token_status() {
         let (mut engine, _dir) = setup();
         engine
             .add_secret(
@@ -4270,13 +4555,27 @@ mod tests {
                 Some(&agent_ctx()),
             )
             .unwrap();
-        let (base, reqs) =
-            spawn_cf_server(r#"{"success":true,"result":{"status":"active"}}"#).await;
+        let (base, reqs) = spawn_cf_router(vec![
+            MockRoute {
+                method: "GET",
+                path_prefix: "/zones",
+                status: 403,
+                body: r#"{"success":false,"errors":[{"code":9109,"message":"Missing X-Auth-Key"}]}"#,
+            },
+            MockRoute {
+                method: "GET",
+                path_prefix: "/user/tokens/verify",
+                status: 200,
+                body: r#"{"success":true,"result":{"status":"expired"}}"#,
+            },
+        ])
+        .await;
         engine.cf_base = base;
 
-        let (ok, _msg) = engine.health_check("cf", Some(&agent_ctx())).await.unwrap();
-        assert!(ok);
-        assert_eq!(reqs.lock().unwrap()[0].path, "/user/tokens/verify");
+        let (ok, msg) = engine.health_check("cf", Some(&agent_ctx())).await.unwrap();
+        assert!(!ok);
+        assert!(msg.contains("Token status: expired"), "{}", msg);
+        assert_eq!(reqs.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -4298,13 +4597,70 @@ mod tests {
                 Some(&agent_ctx()),
             )
             .unwrap();
-        let (base, reqs) =
-            spawn_cf_server(r#"{"success":true,"result":{"email":"admin@example.com"}}"#).await;
+        let (base, reqs) = spawn_cf_router(vec![
+            MockRoute {
+                method: "GET",
+                path_prefix: "/zones",
+                status: 200,
+                body: r#"{"success":true,"result":[]}"#,
+            },
+            MockRoute {
+                method: "GET",
+                path_prefix: "/user",
+                status: 200,
+                body: r#"{"success":true,"result":{"email":"admin@example.com"}}"#,
+            },
+        ])
+        .await;
+        engine.cf_base = base;
+
+        let (ok, msg) = engine.health_check("cf", Some(&agent_ctx())).await.unwrap();
+        assert!(ok, "{}", msg);
+        assert!(!msg.contains("admin@example.com"), "{}", msg);
+        assert_eq!(reqs.lock().unwrap()[0].path, "/zones?per_page=1");
+    }
+
+    #[tokio::test]
+    async fn cf_health_check_falls_back_to_the_user_endpoint_for_global_keys() {
+        let (mut engine, _dir) = setup();
+        engine
+            .add_secret(
+                "cf",
+                "CLOUDFLARE_EMAIL",
+                "admin@example.com",
+                Some(&agent_ctx()),
+            )
+            .unwrap();
+        engine
+            .add_secret(
+                "cf",
+                "CLOUDFLARE_API_KEY",
+                "cf-global-key-secret",
+                Some(&agent_ctx()),
+            )
+            .unwrap();
+        let (base, reqs) = spawn_cf_router(vec![
+            MockRoute {
+                method: "GET",
+                path_prefix: "/zones",
+                status: 403,
+                body: r#"{"success":false,"errors":[{"code":9109,"message":"Missing X-Auth-Key"}]}"#,
+            },
+            MockRoute {
+                method: "GET",
+                path_prefix: "/user",
+                status: 200,
+                body: r#"{"success":true,"result":{"email":"admin@example.com"}}"#,
+            },
+        ])
+        .await;
         engine.cf_base = base;
 
         let (ok, _msg) = engine.health_check("cf", Some(&agent_ctx())).await.unwrap();
         assert!(ok);
-        assert_eq!(reqs.lock().unwrap()[0].path, "/user");
+        let sent = reqs.lock().unwrap();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[1].path, "/user");
     }
 
     #[tokio::test]
@@ -4406,11 +4762,142 @@ mod tests {
         let body: Value = serde_json::from_str(&req.body).unwrap();
         assert_eq!(
             body,
-            serde_json::json!({ "name": "MY_SECRET", "text": "raw-value-777" })
+            serde_json::json!({
+                "name": "MY_SECRET",
+                "text": "raw-value-777",
+                "type": "secret_text",
+            })
         );
         assert!(!serde_json::to_string(&r.data)
             .unwrap()
             .contains("raw-value-777"));
+    }
+
+    #[tokio::test]
+    async fn cf_storage_lists_are_read_only_and_account_scoped() {
+        let (mut engine, _dir) = cf_setup();
+        engine
+            .add_secret(
+                "cf",
+                "CLOUDFLARE_API_TOKEN",
+                "cf-token-abcdef123456",
+                Some(&agent_ctx()),
+            )
+            .unwrap();
+        let (base, reqs) = spawn_cf_router(vec![
+            MockRoute {
+                method: "GET",
+                path_prefix: "/accounts/acc-123/d1/database",
+                status: 200,
+                body: r#"{"success":true,"result":[{"name":"app-db","uuid":"db-uuid-1"},{"name":"logs","uuid":"db-uuid-2"}]}"#,
+            },
+            MockRoute {
+                method: "GET",
+                path_prefix: "/accounts/acc-123/r2/buckets",
+                status: 200,
+                body: r#"{"success":true,"result":{"buckets":[{"name":"media"},{"name":"backups"}]}}"#,
+            },
+            MockRoute {
+                method: "GET",
+                path_prefix: "/accounts/acc-123/storage/kv/namespaces",
+                status: 200,
+                body: r#"{"success":true,"result":[{"id":"kv-1","title":"sessions"},{"id":"kv-2","title":"cache"}]}"#,
+            },
+        ])
+        .await;
+        engine.cf_base = base;
+
+        let dbs = engine
+            .list_d1_databases("cf", Some(&agent_ctx()))
+            .await
+            .unwrap();
+        assert_eq!(
+            dbs,
+            vec![
+                StorageResource {
+                    name: "app-db".into(),
+                    id: "db-uuid-1".into()
+                },
+                StorageResource {
+                    name: "logs".into(),
+                    id: "db-uuid-2".into()
+                },
+            ]
+        );
+
+        let buckets = engine
+            .list_r2_buckets("cf", Some(&agent_ctx()))
+            .await
+            .unwrap();
+        assert_eq!(
+            buckets,
+            vec![
+                StorageResource {
+                    name: "media".into(),
+                    id: String::new()
+                },
+                StorageResource {
+                    name: "backups".into(),
+                    id: String::new()
+                },
+            ]
+        );
+
+        let namespaces = engine
+            .list_kv_namespaces("cf", Some(&agent_ctx()))
+            .await
+            .unwrap();
+        assert_eq!(
+            namespaces,
+            vec![
+                StorageResource {
+                    name: "sessions".into(),
+                    id: "kv-1".into()
+                },
+                StorageResource {
+                    name: "cache".into(),
+                    id: "kv-2".into()
+                },
+            ]
+        );
+
+        // Read-only, and always against the vault's own account.
+        let sent = reqs.lock().unwrap();
+        assert_eq!(sent.len(), 3);
+        for req in sent.iter() {
+            assert_eq!(req.method, "GET");
+            assert!(req.path.starts_with("/accounts/acc-123/"), "{}", req.path);
+        }
+    }
+
+    #[tokio::test]
+    async fn cf_storage_lists_surface_api_errors_without_values() {
+        let (mut engine, _dir) = cf_setup();
+        engine
+            .add_secret(
+                "cf",
+                "CLOUDFLARE_API_TOKEN",
+                "cf-token-abcdef123456",
+                Some(&agent_ctx()),
+            )
+            .unwrap();
+        let (base, _reqs) = spawn_cf_router(vec![MockRoute {
+            method: "GET",
+            path_prefix: "/",
+            status: 403,
+            body: r#"{"success":false,"errors":[{"code":9109,"message":"Missing X-Auth-Key"}]}"#,
+        }])
+        .await;
+        engine.cf_base = base;
+
+        let err = engine
+            .list_d1_databases("cf", Some(&agent_ctx()))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("D1 discovery failed"), "{}", err);
+        assert!(err.contains("Missing X-Auth-Key"), "{}", err);
+        assert!(!err.contains("cf-token-abcdef123456"), "{}", err);
     }
 
     #[tokio::test]

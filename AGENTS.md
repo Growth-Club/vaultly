@@ -6,7 +6,7 @@ password, or arbitrary credential-injected child process.
 
 ## Agent-visible MCP surface
 
-The server advertises 28 tools:
+The server advertises 31 tools:
 
 - Vault metadata and lifecycle: `vault_list`, `vault_keys`, `vault_meta`,
   `vault_status`, `vault_audit`, `vault_lock`, `vault_unlock`.
@@ -15,7 +15,7 @@ The server advertises 28 tools:
   `vault_import_encrypted`.
 - Cloudflare discovery and write-only secret management: `cf_accounts`,
   `cf_account_label`, `cf_health`, `cf_zones`, `cf_pages_projects`,
-  `cf_workers_list`, `cf_secrets`.
+  `cf_workers_list`, `cf_d1_list`, `cf_r2_list`, `cf_kv_list`, `cf_secrets`.
 - Approved deployment: `deploy_targets`, `deploy_target_adopt`, `deploy_target`.
 - Read-only target preflight: `deploy_target_preflight` (worker existence,
   secret names, per-D1-database applied/pending migrations with safety

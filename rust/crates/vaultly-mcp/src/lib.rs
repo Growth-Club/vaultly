@@ -157,6 +157,9 @@ fn tools_list() -> Vec<Tool> {
         Tool { name: "cf_zones", description: "List domains in a Cloudflare account.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault")},"required":["vaultName"]}) },
         Tool { name: "cf_pages_projects", description: "List Pages projects for discovery and target adoption.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault")},"required":["vaultName"]}) },
         Tool { name: "cf_workers_list", description: "List Workers for discovery and target adoption.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault")},"required":["vaultName"]}) },
+        Tool { name: "cf_d1_list", description: "List D1 databases (names and ids) in the vault's account. Read-only.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault")},"required":["vaultName"]}) },
+        Tool { name: "cf_r2_list", description: "List R2 buckets (names) in the vault's account. Read-only.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault")},"required":["vaultName"]}) },
+        Tool { name: "cf_kv_list", description: "List Workers KV namespaces (titles and ids) in the vault's account. Read-only.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault")},"required":["vaultName"]}) },
         Tool { name: "cf_secrets", description: "List/set/delete Worker secrets. Values are write-only.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault"),"scriptName":str_prop("Worker name"),"action":json!({"type":"string","enum":["list","set","delete"]}),"name":str_prop("Secret name"),"value":str_prop("Secret value; write-only")},"required":["vaultName","scriptName","action"]}) },
         Tool { name: "deploy_targets", description: "List deployment targets. Metadata only.", schema: json!({"type":"object","properties":{}}) },
         Tool { name: "deploy_target_adopt", description: "Discover and idempotently adopt a Pages/Worker target from a Wrangler config in the current workspace. Account and project identity are resolved from the selected Cloudflare vault and live account inventory. Pass allowCreate=true to register a target whose resource does not exist yet; it is created on first deploy (Workers via npm run deploy, D1/R2 bootstrapped from the config's own bindings).", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault; account is resolved from this vault"),"configPath":str_prop("Wrangler JSON/JSONC/TOML config inside the current workspace"),"allowCreate":json!({"type":"boolean","description":"Register even if the Cloudflare resource does not exist yet (created on first deploy)."})},"required":["vaultName","configPath"]}) },
@@ -356,6 +359,9 @@ async fn call_tool(engine: &mut VaultEngine, name: &str, args: &Value) -> Value 
         "cf_zones" => tool_cf_zones(engine, args, &ctx).await,
         "cf_pages_projects" => tool_cf_pages_projects(engine, args, &ctx).await,
         "cf_workers_list" => tool_cf_workers_list(engine, args, &ctx).await,
+        "cf_d1_list" => tool_cf_storage_list(engine, args, &ctx, StorageKind::D1).await,
+        "cf_r2_list" => tool_cf_storage_list(engine, args, &ctx, StorageKind::R2).await,
+        "cf_kv_list" => tool_cf_storage_list(engine, args, &ctx, StorageKind::Kv).await,
         "cf_secrets" => tool_cf_secrets(engine, args, &ctx).await,
         "deploy_targets" => tool_deploy_targets(engine, &ctx).await,
         "deploy_target_adopt" => tool_deploy_target_adopt(engine, args, &ctx).await,
@@ -721,6 +727,57 @@ async fn tool_cf_workers_list(
             workers
                 .iter()
                 .map(|w| format!("  - {}", w))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )),
+        Err(e) => fail_err(&e),
+    }
+}
+
+/// Which account storage inventory a `cf_*_list` call reports.
+enum StorageKind {
+    D1,
+    R2,
+    Kv,
+}
+
+impl StorageKind {
+    fn label(&self) -> &'static str {
+        match self {
+            StorageKind::D1 => "D1 databases",
+            StorageKind::R2 => "R2 buckets",
+            StorageKind::Kv => "KV namespaces",
+        }
+    }
+}
+
+/// Read-only D1/R2/KV discovery for one Cloudflare vault. Names and ids only.
+async fn tool_cf_storage_list(
+    engine: &mut VaultEngine,
+    args: &Value,
+    ctx: &CallerContext,
+    kind: StorageKind,
+) -> Value {
+    require!(args, vault => "vaultName");
+    let listed = match kind {
+        StorageKind::D1 => engine.list_d1_databases(vault, Some(ctx)).await,
+        StorageKind::R2 => engine.list_r2_buckets(vault, Some(ctx)).await,
+        StorageKind::Kv => engine.list_kv_namespaces(vault, Some(ctx)).await,
+    };
+    match listed {
+        Ok(items) => ok(format!(
+            "{} ({}):\n{}",
+            kind.label(),
+            items.len(),
+            items
+                .iter()
+                .map(|item| {
+                    if item.id.is_empty() {
+                        format!("  - {}", item.name)
+                    } else {
+                        format!("  - {} (id: {})", item.name, item.id)
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join("\n")
         )),

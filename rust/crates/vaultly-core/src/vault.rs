@@ -130,9 +130,7 @@ impl VaultStore {
         let targets: Vec<DeploymentTarget> = serde_json::from_str(&raw)
             .map_err(|e| VaultError::ConfigCorrupt(format!("deployment targets: {e}")))?;
         for target in &targets {
-            target
-                .validate()
-                .map_err(|e| VaultError::ConfigCorrupt(e))?;
+            target.validate().map_err(VaultError::ConfigCorrupt)?;
         }
         Ok(targets)
     }

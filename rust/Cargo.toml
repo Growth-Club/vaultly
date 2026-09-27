@@ -20,6 +20,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "mul
 dirs = "5"
 shell-words = "1"
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 serde_yaml = "0.9"
 colored = "2"
 rpassword = "7"

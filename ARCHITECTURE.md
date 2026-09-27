@@ -323,7 +323,7 @@
    vault_keys                ✅                 ✅               ✅
    vault_add                 ✅                 ✅               ✅
    vault_delete              ✅                 ✅               ✅
-   vault_run                 ✅                 ✅               ✅
+   vault_run                 ❌ NEVER           ❌ NEVER         ✅
    vault_status              ✅                 ✅               ✅
    vault_audit               ✅                 ✅               ✅
    vault_meta                ✅                 ✅               ✅
@@ -333,12 +333,15 @@
    vault_rotate              ✅                 ✅               ✅
    vault_policy              ✅                 ✅               ✅
    cf_api                    ✅                 ❌               ✅
-   cf_deploy                 ✅                 ❌               ✅
+   cf_deploy                 ❌ NEVER           ❌ NEVER         ✅
    cf_zones                  ✅                 ❌               ✅
    cf_dns_list               ✅                 ❌               ✅
    cf_dns_upsert             ✅                 ❌               ✅
    cf_dns_delete             ✅                 ❌               ✅
-   cf_workers_list           ✅                 ❌               ✅
+   cf_workers_list           ✅                 ✅               ✅
+   cf_d1_list                ✅                 ✅               ✅
+   cf_r2_list                ✅                 ✅               ✅
+   cf_kv_list                ✅                 ✅               ✅
    cf_workers_versions       ✅                 ❌               ✅
    cf_secrets                ✅                 ❌               ✅
    cf_health                 ✅                 ❌               ✅
@@ -360,7 +363,8 @@
    serve                     ❌                 ❌               ✅
    gen / rotate              ❌                 ❌               ✅
    copy / rename / mv / cp   ❌                 ❌               ✅
-   completions               ❌                 ❌               ✅
+   completions (generate)    ✅                 ✅               ✅
+   completions --install     ❌                 ❌               ✅
    inspect / stats / doctor  ❌                 ❌               ✅
 
 
@@ -392,7 +396,7 @@
   │   │   │   └── prompt.rs      24 LOC  Secure password input
   │   │   │                              ─────────
   │   │   │                      6,162 LOC total (cli)
-  │  │   │   └── vaultly-mcp/      MCP server: 61 agent tools (JSON-RPC stdio)
+  │  │   │   └── vaultly-mcp/      MCP server: 31 agent tools (JSON-RPC stdio)
   │   │       ├── lib.rs      1,566 LOC  Tool dispatch + schema + e2e tests
   │   │       └── main.rs         6 LOC  Binary entrypoint
   │   │                                  ─────────

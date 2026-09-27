@@ -2,11 +2,11 @@
 //! Rust port of src/index.ts (clap). All commands route through vaultly_core::VaultEngine
 //! for identical audit + policy + encryption behavior.
 
-use std::io::IsTerminal;
-use std::path::Path;
+use std::io::{IsTerminal, Write};
+use std::path::{Path, PathBuf};
 use std::process::exit;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use colored::Colorize;
 use serde_json::{Map, Value};
 use vaultly_core::keychain;
@@ -234,6 +234,12 @@ enum Command {
     Status,
     /// Print version and exit
     Version,
+    /// Generate or install shell completions for vaultly
+    Completions {
+        shell: clap_complete::Shell,
+        #[arg(long, help = "Write the script to the shell's completion directory")]
+        install: bool,
+    },
     /// Generate a random secret
     #[command(alias = "gen")]
     Generate {
@@ -332,6 +338,12 @@ enum CfCommand {
     },
     /// List Cloudflare Pages projects
     Pages { name: String },
+    /// List D1 databases in a CF account
+    D1 { name: String },
+    /// List R2 buckets in a CF account
+    R2 { name: String },
+    /// List Workers KV namespaces in a CF account
+    Kv { name: String },
     /// Copy one vault credential into a GitHub Actions repository secret.
     /// The value travels vault -> `gh` only; it is never shown.
     SyncGithubSecret {
@@ -656,6 +668,9 @@ async fn main() {
                 delete,
             } => cmd_cf_secrets(&name, &script_name, list, set, value, delete).await,
             CfCommand::Pages { name } => cmd_cf_pages(&name).await,
+            CfCommand::D1 { name } => cmd_cf_storage(&name, StorageListing::D1).await,
+            CfCommand::R2 { name } => cmd_cf_storage(&name, StorageListing::R2).await,
+            CfCommand::Kv { name } => cmd_cf_storage(&name, StorageListing::Kv).await,
             CfCommand::SyncGithubSecret {
                 from_vault,
                 from_key,
@@ -700,6 +715,20 @@ async fn main() {
         Some(Command::Version) => {
             println!("{}", env!("CARGO_PKG_VERSION"));
         }
+        Some(Command::Completions { shell, install }) => {
+            // Generating a script touches nothing and reads no secret, so it is
+            // always allowed. Installing writes outside the vault directory, so
+            // it stays human-only like the other host-modifying commands.
+            if install && agent_mode() {
+                eprintln!(
+                    "{} 'completions --install' is blocked in agent mode.\n  It writes to the shell's completion directory. A human can run:\n    VAULTLY_HUMAN_MODE=1 vaultly completions {} --install",
+                    "✗".red(),
+                    shell
+                );
+                exit(1);
+            }
+            cmd_completions(shell, install);
+        }
         Some(Command::Generate { length, symbols }) => {
             println!(
                 "{}",
@@ -740,7 +769,6 @@ async fn main() {
         Some(Command::Doctor { json }) => cmd_doctor(json),
         None => {
             // No subcommand (piped/non-TTY): print help
-            use clap::CommandFactory;
             let mut cli = Cli::command();
             let _ = cli.print_help();
             println!();
@@ -750,9 +778,63 @@ async fn main() {
 
 // ─── completions ─────────────────────────────────────────────
 
-/// Install completions to the standard directory for the shell.
-/// Non-destructive: only ever creates directories and writes the
-/// completion file for vaultly; leaves other files untouched.
+/// Standard completion file for a shell, or `None` when that shell has no
+/// well-known install directory. `VAULTLY_COMPLETIONS_DIR` overrides the base
+/// directory so an install never has to guess a user's layout.
+fn completions_path(shell: clap_complete::Shell) -> Option<PathBuf> {
+    let base = match std::env::var_os("VAULTLY_COMPLETIONS_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => dirs::data_dir()?,
+    };
+    let (sub, file) = match shell {
+        clap_complete::Shell::Bash => ("bash-completion/completions", "vaultly"),
+        clap_complete::Shell::Zsh => ("zsh/vendor-completions", "_vaultly"),
+        clap_complete::Shell::Fish => ("fish/vendor_completions.d", "vaultly.fish"),
+        _ => return None,
+    };
+    Some(base.join(sub).join(file))
+}
+
+/// Print a completion script, or install it into the shell's completion
+/// directory. Non-destructive: it only creates directories and writes its own
+/// completion file, and never touches an existing one beyond overwriting that
+/// single file.
+fn cmd_completions(shell: clap_complete::Shell, install: bool) {
+    let mut cli = Cli::command();
+    let name = cli.get_name().to_string();
+    if !install {
+        clap_complete::generate(shell, &mut cli, name, &mut std::io::stdout());
+        return;
+    }
+    let Some(path) = completions_path(shell) else {
+        eprintln!(
+            "{} No standard completion directory for {}. Write the script yourself:\n  vaultly completions {} > <path>",
+            "✗".red(),
+            shell,
+            shell
+        );
+        exit(1);
+    };
+    let mut script: Vec<u8> = Vec::new();
+    clap_complete::generate(shell, &mut cli, name, &mut script);
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!("{} Cannot create '{}': {e}", "✗".red(), parent.display());
+            exit(1);
+        }
+    }
+    if let Err(e) = std::fs::File::create(&path).and_then(|mut f| f.write_all(&script)) {
+        eprintln!("{} Cannot write '{}': {e}", "✗".red(), path.display());
+        exit(1);
+    }
+    println!(
+        "{} Installed {} completions to {}",
+        "✓".green(),
+        shell,
+        path.display()
+    );
+}
+
 // ─── init ───────────────────────────────────────────────────
 
 async fn cmd_init() {
@@ -1459,6 +1541,8 @@ fn cmd_target_list(json_output: bool) {
     }
 }
 
+// One parameter per CLI flag; the shape is the command line, not a data model.
+#[allow(clippy::too_many_arguments)]
 fn cmd_target_add(
     id: &str,
     provider: &str,
@@ -1870,8 +1954,52 @@ async fn cmd_cf_pages(name: &str) {
     }
 }
 
-// ─── cf bindings / triggers ─────────────────────────────────
+/// Which account storage inventory `cf d1|r2|kv` reports.
+enum StorageListing {
+    D1,
+    R2,
+    Kv,
+}
 
+impl StorageListing {
+    fn label(&self) -> &'static str {
+        match self {
+            StorageListing::D1 => "D1 databases",
+            StorageListing::R2 => "R2 buckets",
+            StorageListing::Kv => "KV namespaces",
+        }
+    }
+}
+
+/// List D1 databases / R2 buckets / KV namespaces in a CF account. Names and
+/// ids only, matching the agent-safe MCP tools.
+async fn cmd_cf_storage(name: &str, listing: StorageListing) {
+    let vault_name = cf_vault(name);
+    let mut engine = require_unlock();
+    let listed = match listing {
+        StorageListing::D1 => engine.list_d1_databases(&vault_name, None).await,
+        StorageListing::R2 => engine.list_r2_buckets(&vault_name, None).await,
+        StorageListing::Kv => engine.list_kv_namespaces(&vault_name, None).await,
+    };
+    match listed {
+        Ok(items) => {
+            println!("☁️  {} for '{}' ({}):", listing.label(), name, items.len());
+            for item in &items {
+                if item.id.is_empty() {
+                    println!("  - {}", item.name.green());
+                } else {
+                    println!("  - {} id={}", item.name.green(), item.id);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("{} Failed: {}", "✗".red(), e);
+            exit(1);
+        }
+    }
+}
+
+// ─── cf bindings / triggers ─────────────────────────────────
 // ─── cf ssl / certificates ──────────────────────────────────
 
 // ─── cf firewall ────────────────────────────────────────────

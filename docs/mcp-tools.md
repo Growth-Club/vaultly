@@ -1,7 +1,7 @@
 # Vaultly MCP tools
 
 `vaultly mcp` exposes a deliberately small, agent-safe interface over stdio.
-It supports 28 tools: encrypted personal credentials, Cloudflare discovery,
+It supports 31 tools: encrypted personal credentials, Cloudflare discovery,
 write-only Worker secrets, value-blind GitHub secret sync, validated
 deployment targets, read-only target preflight, and approved target
 maintenance execution.
@@ -46,6 +46,9 @@ must not see the generated value.
 | `cf_zones` | List zones/domains |
 | `cf_pages_projects` | Discover Pages projects |
 | `cf_workers_list` | Discover Workers |
+| `cf_d1_list` | Discover D1 databases (names and ids) |
+| `cf_r2_list` | Discover R2 buckets (names) |
+| `cf_kv_list` | Discover Workers KV namespaces (titles and ids) |
 | `cf_secrets` | List, set, or delete Worker secrets; values are write-only |
 
 Cloudflare credentials remain inside Vaultly's authenticated request path. API

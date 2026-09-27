@@ -34,6 +34,9 @@ vaultly cf pages personal
 | `cf_zones` | List domains and zone IDs |
 | `cf_pages_projects` | Discover Pages projects |
 | `cf_workers_list` | Discover Workers |
+| `cf_d1_list` | Discover D1 databases |
+| `cf_r2_list` | Discover R2 buckets |
+| `cf_kv_list` | Discover Workers KV namespaces |
 | `cf_secrets` | List, set, or delete Worker secrets; values are write-only |
 | `deploy_targets` | List deployment metadata |
 | `deploy_target_adopt` | Derive and verify a target from a local Wrangler config |

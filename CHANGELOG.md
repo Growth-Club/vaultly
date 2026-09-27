@@ -13,6 +13,11 @@ removed). Highlights of the current unreleased feature set:
 
 ### Added
 
+- **Storage discovery** — `vaultly cf d1|r2|kv <ACCOUNT>` and the MCP tools
+  `cf_d1_list`, `cf_r2_list`, `cf_kv_list` list D1 databases, R2 buckets, and
+  Workers KV namespaces in the vault's account (names and non-secret ids, never
+  stored values). Read-only, `GET`-only, always account-scoped, mirroring
+  `cf_zones` / `cf_workers_list`. The agent surface is now 31 tools.
 - **End-to-end provisioning** — `vaultly target adopt --create` (MCP:
   `deploy_target_adopt` with `allowCreate`) registers a target whose
   Worker/Pages resource does not exist yet (audited as provisioning), and
@@ -56,10 +61,9 @@ removed). Highlights of the current unreleased feature set:
 - **CLI exports** — `vaultly env <vault>` emits shell export statements and
   `vaultly run <vault> -- <cmd>` runs a command with injected (then cleared)
   environment, with output scrubbed of any secret values.
-- **MCP server** (`vaultly mcp`) — 61 agent-safe tools covering vault
-  operations and Cloudflare management (cache purge, R2, KV, D1, Pages,
-  Workers bindings/triggers, SSL/certs, WAF, load balancers, email routing).
-  No tool returns a raw secret value.
+- **MCP server** (`vaultly mcp`) — 31 agent-safe tools covering vault
+  operations, Cloudflare discovery, write-only Worker secrets, and validated
+  deployment. No tool returns a raw secret value.
 - **`cf_accounts` MCP tool** — discover which vaults hold Cloudflare
   credentials (account name + auth method + per-account scope), so agents can
   pick an account without guessing vault names. Inspects key names only —
@@ -95,6 +99,25 @@ removed). Highlights of the current unreleased feature set:
 
 ### Fixed
 
+- **Cloudflare health checks no longer report working credentials as broken** —
+  `cf_health` / `cf_accounts --health` trusted a single call to the user-level
+  `/user/tokens/verify` endpoint, which rejects account-scoped API tokens with
+  HTTP 401 even when every account operation succeeds. Health now probes the
+  account, then zones, then the user-level endpoint, and reports the first
+  success (or every failure, with Cloudflare's own error text) instead of
+  `Token status: unknown`.
+- **Shell completions** — `vaultly completions <shell>` (generate to stdout)
+  and `--install` (write to the shell's completion directory, honoring
+  `VAULTLY_COMPLETIONS_DIR`) were documented and called by `install.sh` but were
+  never implemented, so the installer aborted at that step. Implemented with
+  `clap_complete`; `--install` is human-only because it writes outside the
+  vault directory.
+- Workspace-boundary refusals for `deploy_target` / `deploy_target_exec` now
+  name the repository that owns the target, so an agent knows where to re-run
+  the command.
+- Worker secret `set` now sends the explicit `secret_text` type Cloudflare
+  requires; the unit test asserting the old body shape was stale and now
+  matches.
 - Updated all `run`/`run_command` call sites (CLI, TUI, MCP, HTTP server) to
   match the new `RunOptions` signature — the workspace now builds cleanly.
 - `vaultly doctor` now returns a non-zero exit code when any ERROR finding is
@@ -104,7 +127,7 @@ removed). Highlights of the current unreleased feature set:
   self-contained AES-256-GCM blob that carries its own salt, making it portable
   across any vaultly instance that knows the master password.
 - **MCP encrypted tools** — `vault_export_encrypted` and `vault_import_encrypted`
-  (2 new MCP tools, 32 total) let agents safely transfer vaults between instances
+  (2 new MCP tools) let agents safely transfer vaults between instances
   without ever exposing plaintext values.
 
 ### Security & reliability

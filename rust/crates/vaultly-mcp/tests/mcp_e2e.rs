@@ -11,11 +11,14 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 const PASSWORD: &str = "mcp-test-password";
 const SECRET_VALUE: &str = "sk-e2e-super-secret-token-1234567890";
 const SECRET_KEY: &str = "E2E_SECRET_KEY";
-const EXPECTED_TOOLS: [&str; 28] = [
+const EXPECTED_TOOLS: [&str; 31] = [
     "cf_account_label",
     "cf_accounts",
+    "cf_d1_list",
     "cf_health",
+    "cf_kv_list",
     "cf_pages_projects",
+    "cf_r2_list",
     "cf_secrets",
     "cf_workers_list",
     "cf_zones",

@@ -78,7 +78,7 @@ case "$SHELL_NAME" in
 esac
 if [ -n "$COMP_SHELL" ]; then
   log "Installing ${COMP_SHELL} completions..."
-  vaultly completions "$COMP_SHELL" --install
+  VAULTLY_HUMAN_MODE=1 vaultly completions "$COMP_SHELL" --install
 else
   warn "Could not detect your shell. Install completions manually, e.g.:"
   warn "  vaultly completions bash --install"
