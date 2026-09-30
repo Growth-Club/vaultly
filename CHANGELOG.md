@@ -4,12 +4,14 @@ All notable changes to Vaultly are documented here, grouped by release.
 Format follows [Keep a Changelog](https://keepachangelog.com/) and
 [Conventional Commits](https://www.conventionalcommits.org/). The current
 source version, per `rust/Cargo.toml` (`[workspace.package].version`), is
-**1.1.0**.
+**1.2.0**.
 
 ## [Unreleased]
 
-The Rust port is now the only codebase (the TypeScript implementation was
-removed). Highlights of the current unreleased feature set:
+## [1.2.0] - 2026-09-30
+
+First tagged release of the Rust port, which is now the only codebase (the
+TypeScript implementation was removed). Highlights:
 
 ### Added
 
