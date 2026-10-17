@@ -1154,6 +1154,35 @@ pub fn extract_applied_migration_names(payload: &Value) -> Vec<String> {
 /// `d1_migrations` table means a fresh database: zero applied migrations.
 /// Any other API failure is returned as an error string.
 pub fn parse_d1_migration_query(payload: &Value) -> Result<Vec<String>, String> {
+    // Some Cloudflare API responses wrap the query batches in an empty
+    // `result` array when the database has no migration rows. Treat an empty
+    // successful result as zero applied migrations, but preserve real API
+    // errors instead of converting them into a fresh-database result.
+    if let Value::Object(map) = payload {
+        if let Some(Value::Array(result)) = map.get("result") {
+            if result.is_empty() {
+                let top_errors: Vec<String> = map
+                    .get("errors")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|e| e.get("message").and_then(Value::as_str))
+                            .map(|s| s.to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !top_errors.is_empty() {
+                    if top_errors.iter().any(|m| m.contains("d1_migrations")) {
+                        return Ok(Vec::new());
+                    }
+                    return Err(top_errors.join("; "));
+                }
+                if map.get("success").and_then(Value::as_bool) == Some(true) {
+                    return Ok(Vec::new());
+                }
+            }
+        }
+    }
     // REST envelopes report failures at the top level with an empty
     // `result` array, leaving no per-batch object to inspect. A missing
     // d1_migrations table still means a fresh database in that shape.
@@ -1174,7 +1203,15 @@ pub fn parse_d1_migration_query(payload: &Value) -> Result<Vec<String>, String> 
     }
     let batches = flatten_d1_batches(payload);
     if batches.is_empty() {
-        return Err("unexpected D1 response shape".into());
+        let shape = match payload {
+            Value::Null => "null",
+            Value::Bool(_) => "boolean",
+            Value::Number(_) => "number",
+            Value::String(_) => "string",
+            Value::Array(_) => "array",
+            Value::Object(_) => "object",
+        };
+        return Err(format!("unexpected D1 response shape: {shape}"));
     }
     let mut errors = Vec::new();
     let mut names = Vec::new();
@@ -1521,6 +1558,15 @@ IGNORED = "value"
         });
         assert_eq!(
             parse_d1_migration_query(&fresh_envelope).unwrap(),
+            Vec::<String>::new()
+        );
+        let empty_success_envelope = serde_json::json!({
+            "success": true,
+            "errors": [],
+            "result": []
+        });
+        assert_eq!(
+            parse_d1_migration_query(&empty_success_envelope).unwrap(),
             Vec::<String>::new()
         );
         // Any other API failure surfaces as an error string.
