@@ -62,7 +62,7 @@ responses are scrubbed before they are returned to the agent.
 | `deploy_target_adopt` | Discover, verify, and idempotently register a target from a local Wrangler config (`allowCreate` provisions missing resources on first deploy) |
 | `deploy_target` | Deploy one target by ID |
 | `deploy_target_preflight` | Read-only check: worker existence, secret names, per-D1-database applied/pending migrations with safety verdicts |
-| `deploy_target_exec` | Run one approved maintenance script (`check:migrations`, `backup:d1`, `backup:verify`, `migrate:apply`, `watchdog`, `smoke`); mutating scripts need typed confirm + granted `run` op |
+| `deploy_target_exec` | Run one approved maintenance script (`check:migrations`, `backup:d1`, `backup:verify`, `migrate:apply`, `watchdog`, `smoke`, `purge:test-accounts`); mutating scripts need typed confirm + granted `run` op |
 | `github_secret_sync` | Copy one vault credential into a GitHub Actions repo secret; value never returned |
 
 Agents normally call `deploy_target_adopt` with a selected Cloudflare vault and
@@ -100,9 +100,10 @@ trigger, mirroring the repository migration-gate convention).
 
 `deploy_target_exec` runs one approved maintenance script from the
 repository's own `package.json` against the target (`check:migrations`,
-`backup:d1`, `backup:verify`, `migrate:apply`, `watchdog`, `smoke`). The
+`backup:d1`, `backup:verify`, `migrate:apply`, `watchdog`, `smoke`,
+`purge:test-accounts`). The
 agent supplies only the target ID, the script name, and — for mutating
-scripts — the typed confirmation word (`APPLY`, `BACKUP`); command bodies
+scripts — the typed confirmation word (`APPLY`, `BACKUP`, `PURGE`); command bodies
 come from the repo, never from agent input. Execution re-validates the
 target exactly like a deploy, runs with a cleared environment plus a fixed
 credential key set (`CLOUDFLARE_*` and `D1_BACKUP_*` when present in the

@@ -4,9 +4,17 @@ All notable changes to Vaultly are documented here, grouped by release.
 Format follows [Keep a Changelog](https://keepachangelog.com/) and
 [Conventional Commits](https://www.conventionalcommits.org/). The current
 source version, per `rust/Cargo.toml` (`[workspace.package].version`), is
-**1.2.0**.
+**1.2.1**.
 
 ## [Unreleased]
+
+### Added
+- `purge:test-accounts` as an approved mutating target maintenance script
+  (`exec`/`deploy_target_exec`, typed confirm word `PURGE`). The script
+  resolves from the repository's own `package.json` and implements its own
+  population assertions, verified pre-delete backup, explicit dependent-row
+  deletes, and zero-remain proof; Vaultly adds identity binding, the `run`
+  policy gate, migration-verdict fail-closed checks, scrubbing, and audit.
 
 ## [1.2.0] - 2026-09-30
 

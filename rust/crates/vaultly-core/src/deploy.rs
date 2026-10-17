@@ -119,6 +119,13 @@ pub const APPROVED_TARGET_SCRIPTS: &[ApprovedTargetScript] = &[
         confirm_word: None,
         description: "Production smoke checks (read-only)",
     },
+    ApprovedTargetScript {
+        name: "purge:test-accounts",
+        mutating: true,
+        confirm_word: Some("PURGE"),
+        description:
+            "Delete the repository's synthetic check identities behind their own assertions and verified backup",
+    },
 ];
 
 /// Look up an approved script by exact name.

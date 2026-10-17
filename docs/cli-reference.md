@@ -143,9 +143,9 @@ verdicts. Run it before any deploy or migration.
 
 `exec` runs one approved maintenance script from the repo's own
 `package.json` (`check:migrations`, `backup:d1`, `backup:verify`,
-`migrate:apply`, `watchdog`, `smoke`) with the target's Cloudflare scope
+`migrate:apply`, `watchdog`, `smoke`, `purge:test-accounts`) with the target's Cloudflare scope
 plus `D1_BACKUP_*` keys when the vault holds them. Mutating scripts require
-the typed confirmation and fail closed on unsafe or unverifiable migration
+the typed confirmation (`APPLY`, `BACKUP`, `PURGE`) and fail closed on unsafe or unverifiable migration
 state. Execution is gated on the `run` policy operation (default-deny for
 agents; a human grants it via policy file). Migration backup keys are added
 once by a human: `vaultly add --vault <cf-vault> --key D1_BACKUP_R2_BUCKET

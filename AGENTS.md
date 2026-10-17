@@ -22,8 +22,9 @@ The server advertises 31 tools:
   verdicts — no mutations).
 - Approved maintenance execution: `deploy_target_exec` runs one allowlisted
   repository script (`check:migrations`, `backup:d1`, `backup:verify`,
-  `migrate:apply`, `watchdog`, `smoke`) resolved from the repo's own
-  `package.json`. Mutating scripts need the typed confirm word and the
+  `migrate:apply`, `watchdog`, `smoke`, `purge:test-accounts`) resolved from the repo's own
+  `package.json`. Mutating scripts need the typed confirm word (`APPLY`,
+  `BACKUP`, `PURGE`) and the
   human-granted `run` operation; the default agent policy denies it
   (`policy_denied`). There is deliberately no generic run: the agent supplies
   only target ID + script name, never a command.
