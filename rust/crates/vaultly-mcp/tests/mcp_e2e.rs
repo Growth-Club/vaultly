@@ -53,14 +53,17 @@ struct McpClient {
 
 impl McpClient {
     async fn start(dir: &std::path::Path) -> Self {
-        let mut child = tokio::process::Command::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/debug/vaultly-mcp"))
-            .env("VAULTLY_DIR", dir)
-            .env("VAULTLY_MASTER_PASSWORD", PASSWORD)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
+        let mut child = tokio::process::Command::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../target/debug/vaultly-mcp"
+        ))
+        .env("VAULTLY_DIR", dir)
+        .env("VAULTLY_MASTER_PASSWORD", PASSWORD)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
         let stderr = child.stderr.take().unwrap();
         tokio::spawn(async move {
             let mut err = BufReader::new(stderr).lines();

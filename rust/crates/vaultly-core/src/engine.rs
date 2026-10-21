@@ -5232,7 +5232,11 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std_fs::set_permissions(dir.join("agent-policy.json"), std_fs::Permissions::from_mode(0o600)).unwrap();
+            std_fs::set_permissions(
+                dir.join("agent-policy.json"),
+                std_fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
         }
         let n = engine.load_default_policy_file().unwrap();
         assert!(n >= 2, "expected default + test-agent policies, got {n}");
