@@ -53,7 +53,7 @@ struct McpClient {
 
 impl McpClient {
     async fn start(dir: &std::path::Path) -> Self {
-        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_vaultly-mcp"))
+        let mut child = tokio::process::Command::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/debug/vaultly-mcp"))
             .env("VAULTLY_DIR", dir)
             .env("VAULTLY_MASTER_PASSWORD", PASSWORD)
             .stdin(std::process::Stdio::piped())

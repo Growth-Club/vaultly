@@ -5229,6 +5229,11 @@ mod tests {
             r#"{"test-agent":{"allowed_vaults":["cf-test"],"allowed_operations":["list","read_keys","deploy","cf_api","run"],"created_at":"2026-01-01T00:00:00Z"}}"#,
         )
         .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std_fs::set_permissions(dir.join("agent-policy.json"), std_fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let n = engine.load_default_policy_file().unwrap();
         assert!(n >= 2, "expected default + test-agent policies, got {n}");
         let ctx = agent_ctx();
