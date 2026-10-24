@@ -10,7 +10,9 @@ use clap::{CommandFactory, Parser, Subcommand};
 use colored::Colorize;
 use serde_json::{Map, Value};
 use vaultly_core::keychain;
-use vaultly_core::{Caller, CallerContext, DeploymentProvider, DeploymentTarget, VaultEngine};
+use vaultly_core::{
+    Caller, CallerContext, DeploymentProvider, DeploymentTarget, VaultEngine, VaultError,
+};
 
 mod prompt;
 
@@ -74,28 +76,46 @@ fn require_unlock() -> VaultEngine {
     // Try both sources so a stale env var does not prevent a valid Keychain
     // unlock, and never pass either value to a child process.
     let mut candidates = Vec::new();
+    let mut empty_env = false;
     if let Ok(password) = std::env::var("VAULTLY_MASTER_PASSWORD") {
-        candidates.push(password);
-    }
-    if let Some(password) = keychain::get_from_keychain() {
-        candidates.push(password);
-    }
-
-    for password in candidates {
-        if engine.unlock(&password).is_ok() {
-            return engine;
+        if password.is_empty() {
+            empty_env = true;
+        } else {
+            candidates.push((true, password));
         }
     }
-
+    if let Some(password) = keychain::get_from_keychain() {
+        candidates.push((false, password));
+    }
+    let mut rejected_env = false;
+    let mut rejected_store = false;
+    let mut store_error = false;
+    for (from_env, password) in candidates {
+        match engine.unlock(&password) {
+            Ok(()) => return engine,
+            Err(VaultError::WrongPassword) => {
+                if from_env {
+                    rejected_env = true;
+                } else {
+                    rejected_store = true;
+                }
+            }
+            Err(_) => store_error = true,
+        }
+    }
+    if store_error {
+        eprintln!("{} Vault store could not be read or unlocked. Check its configuration and permissions with `vaultly doctor`; no password value was printed.", "✗".red());
+        exit(1);
+    }
     if non_interactive() {
-        let detail = if std::env::var("VAULTLY_DIR").is_ok()
-            && std::env::var("VAULTLY_ALLOW_KEYCHAIN").as_deref() != Ok("1")
-        {
-            "VAULTLY_DIR is set; use the default store or set VAULTLY_ALLOW_KEYCHAIN=1 for an intentional custom-store Keychain setup."
-        } else if keychain::is_keychain_available() && !keychain::keychain_entry_exists() {
-            "No macOS Keychain entry exists yet; run `VAULTLY_HUMAN_MODE=1 vaultly keychain store` once as a human."
+        let detail = if rejected_env {
+            "VAULTLY_MASTER_PASSWORD was rejected for this vault. Use the original master password for the selected store."
+        } else if rejected_store {
+            "The OS credential-store password was rejected for this vault. The owner must update that store's saved master password."
+        } else if empty_env {
+            "VAULTLY_MASTER_PASSWORD is empty. No password was supplied; use the owner-facing hidden prompt or a configured OS credential store."
         } else {
-            "Set VAULTLY_MASTER_PASSWORD or configure macOS Keychain with `VAULTLY_HUMAN_MODE=1 vaultly keychain store`."
+            keychain::unlock_setup_hint()
         };
         eprintln!(
             "{} Non-interactive unlock unavailable. {}",
@@ -223,7 +243,7 @@ enum Command {
         #[command(subcommand)]
         sub: CfCommand,
     },
-    /// Manage macOS Keychain integration
+    /// Manage OS credential-store integration
     Keychain {
         #[command(subcommand)]
         sub: KeychainCommand,
@@ -413,9 +433,9 @@ enum TargetCommand {
 
 #[derive(Subcommand)]
 enum KeychainCommand {
-    /// Store master password in macOS Keychain for auto-unlock
+    /// Store master password in the OS credential store for auto-unlock
     Store,
-    /// Remove master password from macOS Keychain
+    /// Remove master password from the OS credential store
     Remove,
     /// Check Keychain status
     Status,
@@ -903,7 +923,9 @@ async fn cmd_init() {
 
     if keychain::is_keychain_available()
         && std::env::var("VAULTLY_MASTER_PASSWORD").is_err()
-        && prompt::prompt_confirm("Store master password in macOS Keychain for auto-unlock?")
+        && prompt::prompt_confirm(
+            "Store master password in the OS credential store for auto-unlock?",
+        )
     {
         if keychain::store_in_keychain(&pw1) {
             println!(
@@ -2159,13 +2181,18 @@ async fn cmd_cf_secrets(
 fn cmd_keychain_store() {
     if !keychain::is_keychain_available() {
         eprintln!(
-            "{} macOS Keychain not available (requires macOS).",
-            "✗".red()
+            "{} OS credential store is unavailable. {}",
+            "✗".red(),
+            keychain::unlock_setup_hint()
         );
         exit(1);
     }
     let pw = std::env::var("VAULTLY_MASTER_PASSWORD")
-        .unwrap_or_else(|_| prompt::prompt_password("🔑 Master password to store in Keychain: "));
+        .ok()
+        .filter(|password| !password.is_empty())
+        .unwrap_or_else(|| {
+            prompt::prompt_password("🔑 Master password to store in the OS credential store: ")
+        });
 
     let mut engine = engine();
     if engine.unlock(&pw).is_err() {
@@ -2173,13 +2200,18 @@ fn cmd_keychain_store() {
         exit(1);
     }
     if keychain::store_in_keychain(&pw) {
-        println!("{} Master password stored in macOS Keychain.", "✓".green());
+        println!(
+            "{} Master password stored in {}.",
+            "✓".green(),
+            keychain::backend_name()
+        );
         println!(
             "{}",
             "  MCP server will auto-unlock without password prompt.".dimmed()
         );
     } else {
-        eprintln!("{} Failed to store in Keychain.", "✗".red());
+        eprintln!("{} Failed to store in the OS credential store.", "✗".red());
+        exit(1);
     }
 }
 
@@ -2193,7 +2225,11 @@ fn cmd_keychain_remove() {
 
 fn cmd_keychain_status() {
     if !keychain::is_keychain_available() {
-        println!("{} Keychain not available (requires macOS).", "⚠".yellow());
+        println!(
+            "{} OS credential store unavailable. {}",
+            "⚠".yellow(),
+            keychain::unlock_setup_hint()
+        );
         return;
     }
     if keychain::keychain_entry_exists() {
@@ -2254,7 +2290,7 @@ fn cmd_status() {
         }
     );
     let kc = if !keychain::is_keychain_available() {
-        "not available (macOS only)".dimmed().to_string()
+        "not available".dimmed().to_string()
     } else if keychain::keychain_entry_exists() {
         "stored ✓".green().to_string()
     } else {
@@ -2344,7 +2380,7 @@ fn master_password() -> String {
     }
     if non_interactive() {
         eprintln!(
-            "{} Non-interactive encrypted export needs VAULTLY_MASTER_PASSWORD or a configured macOS Keychain.",
+            "{} Non-interactive encrypted export needs VAULTLY_MASTER_PASSWORD or a configured OS credential store.",
             "✗".red()
         );
         exit(1);
@@ -2539,7 +2575,7 @@ fn cmd_doctor(json: bool) {
         findings.push(DoctorFinding {
             severity: "info".into(),
             check: "keychain".into(),
-            message: "Keychain N/A (macOS only)".into(),
+            message: "OS credential store unavailable".into(),
         });
     }
 
@@ -2547,7 +2583,7 @@ fn cmd_doctor(json: bool) {
     let pw_source = if std::env::var_os("VAULTLY_MASTER_PASSWORD").is_some() {
         "VAULTLY_MASTER_PASSWORD env"
     } else if keychain::keychain_entry_exists() {
-        "macOS Keychain"
+        keychain::backend_name()
     } else {
         "interactive prompt"
     };

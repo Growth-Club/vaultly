@@ -1,0 +1,26 @@
+{
+  "version": "1.2.2",
+  "verifiedAt": "2026-10-24T04:30:01.195749+00:00",
+  "rustInputSha256": "48fc6075befbc0317e1261b5673b02f095bcfa395b040cdd36d88838c5d408c0",
+  "checks": {
+    "format": "passed",
+    "releaseWorkspaceTests": {
+      "cli": 17,
+      "core": 150,
+      "mcp": 11,
+      "failed": 0,
+      "ignored": 1
+    },
+    "optInLinuxSecretServiceRoundtrip": "passed",
+    "releaseCliAutoUnlock": "passed",
+    "releaseMcpAutoUnlock": "passed",
+    "releaseMcpLockThenUnlock": "passed",
+    "passwordInSmokeOutput": false
+  },
+  "credentialStoreTestScope": "Synthetic temporary-vault entries only; removed after checks. No real master password read or modified.",
+  "installedBinaries": {
+    "vaultly": "9593f4fe92a445bba3e6ad7cfd52b3ec012f9c36bb4757e67f628722b55df1e9",
+    "vaultly-mcp": "fc3f5fe4e433e498a9574e838292439916c999e35b6da0e8c07b729b42c41627"
+  },
+  "realStoreAutoUnlock": "Owner must configure the existing master password using the hidden prompt; this verification does not claim the production store is unlocked."
+}

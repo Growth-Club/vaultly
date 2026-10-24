@@ -1,10 +1,18 @@
 # Changelog
 
+## 1.2.2
+
+- Linux auto-unlock through Secret Service over an encrypted D-Bus session; no external `secret-tool` program is required. Saved keys are bound to the canonical vault-store directory. Agent reads do not trigger keyring unlock prompts, and custom stores remain opt-in.
+- Agent-mode MCP startup fails promptly when no unlock source is available; a native terminal password prompt requires explicit owner human mode.
+- CLI unlock failures distinguish missing/empty input, rejected environment or saved passwords, and unreadable vault state. Failed unlocks never recommend a macOS-only fix on Linux and never reveal a password.
+- Credential-store status and setup messages name the actual backend. Failed owner-facing key storage exits nonzero.
+
+
 All notable changes to Vaultly are documented here, grouped by release.
 Format follows [Keep a Changelog](https://keepachangelog.com/) and
 [Conventional Commits](https://www.conventionalcommits.org/). The current
 source version, per `rust/Cargo.toml` (`[workspace.package].version`), is
-**1.2.1**.
+**1.2.2**.
 
 ## [Unreleased]
 

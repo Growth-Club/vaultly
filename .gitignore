@@ -3,6 +3,7 @@
 
 # Rust build output
 rust/target/
+rust/crates/*/target/
 
 # Secrets
 .env*

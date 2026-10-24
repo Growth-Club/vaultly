@@ -65,7 +65,10 @@ impl Drop for VaultlyEnv {
 }
 
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_vaultly"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_vaultly"));
+    // Parent desktop setup must not opt isolated CLI fixtures into real keyring use.
+    command.env_remove("VAULTLY_ALLOW_KEYCHAIN");
+    command
 }
 
 fn run(args: &[&str]) -> Output {
@@ -528,4 +531,65 @@ fn inspect_shows_metadata_not_values() {
     let stdout = stdout(&out);
     assert!(!stdout.contains(SECRET), "inspect must not leak values");
     assert!(stdout.contains("TOKEN"), "inspect should list key names");
+}
+
+// Unlock errors must distinguish an absent input from a rejected password,
+// without touching a real OS credential store or printing either value.
+#[test]
+fn agent_unlock_reports_empty_rejected_and_missing_sources() {
+    let env = VaultlyEnv::new();
+    init(&env);
+    assert_ok(&run(&["add", "unlock-check", "-k", "TOKEN", "-v", SECRET]));
+    let vaults = env.dir().join("vaults");
+    let before: Vec<_> = std::fs::read_dir(&vaults)
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            (path.clone(), std::fs::read(path).unwrap())
+        })
+        .collect();
+    for (password, expected) in [
+        (Some(""), "VAULTLY_MASTER_PASSWORD is empty"),
+        (
+            Some("wrong-password-000"),
+            "VAULTLY_MASTER_PASSWORD was rejected",
+        ),
+        (None, "custom vault store has OS auto-unlock disabled"),
+    ] {
+        let mut command = bin();
+        command
+            .args(["list", "unlock-check", "--json"])
+            .env_remove("VAULTLY_HUMAN_MODE")
+            .env("VAULTLY_AGENT_MODE", "1")
+            .env_remove("VAULTLY_ALLOW_KEYCHAIN");
+        if let Some(password) = password {
+            command.env("VAULTLY_MASTER_PASSWORD", password);
+        } else {
+            command.env_remove("VAULTLY_MASTER_PASSWORD");
+        }
+        let out = command.output().unwrap();
+        assert_fails(&out);
+        let output = format!("{}{}", stdout(&out), stderr(&out));
+        assert!(
+            output.contains(expected),
+            "missing safe diagnostic: {output}"
+        );
+        for value in [PASSWORD, SECRET, "wrong-password-000"] {
+            assert!(!output.contains(value));
+        }
+        for (path, bytes) in &before {
+            assert_eq!(&std::fs::read(path).unwrap(), bytes);
+        }
+    }
+    // Valid process-only unlock still works in agent mode and returns names only.
+    let out = bin()
+        .args(["list", "unlock-check", "--json"])
+        .env_remove("VAULTLY_HUMAN_MODE")
+        .env("VAULTLY_AGENT_MODE", "1")
+        .env_remove("VAULTLY_ALLOW_KEYCHAIN")
+        .output()
+        .unwrap();
+    assert_ok(&out);
+    assert!(stdout(&out).contains("TOKEN"));
+    assert!(!stdout(&out).contains(SECRET));
 }

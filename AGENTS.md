@@ -117,13 +117,13 @@ reviewed: scoped subprocess credentials are available to that trusted code.
 
 ## Unlock and communication
 
-The human configures macOS Keychain once with:
+The human configures the OS credential store once (macOS Keychain or Linux Secret Service) with:
 
 ```bash
 VAULTLY_HUMAN_MODE=1 vaultly keychain store
 ```
 
-MCP and agent-mode CLI processes then unlock through Keychain without asking
+MCP and agent-mode CLI processes then unlock through the OS credential store without asking
 the agent for the password. In CI, `VAULTLY_MASTER_PASSWORD` may be supplied
 to the Vaultly process only. Vaultly never forwards the master password to a
 build or returns it over MCP.
@@ -131,3 +131,6 @@ build or returns it over MCP.
 Every operation is audited locally. Agents should communicate in structured
 terms: `targetId`, `provider`, `status`, `deploymentId`, `url`, and safe error
 code. Raw token values are never valid communication data.
+
+
+Linux 1.2.2 uses encrypted Secret Service sessions and a canonical-store identity. Custom stores still require explicit `VAULTLY_ALLOW_KEYCHAIN=1`. Agent reads never unlock a locked desktop keyring. Default tests must not touch real credential stores; the separately opted-in ignored Linux round-trip test uses only a synthetic key scoped to a temporary directory. Use `cargo +stable` (Linux dependencies require Rust 1.89+) and leave the user's global toolchain unchanged.

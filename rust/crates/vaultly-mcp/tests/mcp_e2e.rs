@@ -53,17 +53,15 @@ struct McpClient {
 
 impl McpClient {
     async fn start(dir: &std::path::Path) -> Self {
-        let mut child = tokio::process::Command::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../target/debug/vaultly-mcp"
-        ))
-        .env("VAULTLY_DIR", dir)
-        .env("VAULTLY_MASTER_PASSWORD", PASSWORD)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
+        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_vaultly-mcp"))
+            .env("VAULTLY_DIR", dir)
+            .env_remove("VAULTLY_ALLOW_KEYCHAIN")
+            .env("VAULTLY_MASTER_PASSWORD", PASSWORD)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
         let stderr = child.stderr.take().unwrap();
         tokio::spawn(async move {
             let mut err = BufReader::new(stderr).lines();
@@ -638,4 +636,32 @@ async fn mcp_target_exec_and_preflight_reject_unknown_targets() {
     })
     .await
     .expect("mcp_target_exec_and_preflight_reject_unknown_targets timed out");
+}
+
+#[tokio::test]
+async fn mcp_missing_unlock_fails_without_prompting_or_leaking() {
+    let dir = tempfile::tempdir().unwrap();
+    vaultly_core::vault::VaultStore::with_dir(dir.path().to_path_buf())
+        .init_vault(PASSWORD)
+        .unwrap();
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_vaultly-mcp"));
+    command
+        .env("VAULTLY_DIR", dir.path())
+        .env("VAULTLY_AGENT_MODE", "1")
+        .env_remove("VAULTLY_ALLOW_KEYCHAIN")
+        .env_remove("VAULTLY_MASTER_PASSWORD")
+        .env_remove("VAULTLY_HUMAN_MODE")
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(5), command.output())
+        .await
+        .expect("agent MCP startup must not wait for a password prompt")
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Non-interactive unlock unavailable"));
+    assert!(stderr.contains("custom vault store has OS auto-unlock disabled"));
+    assert!(!stderr.contains(PASSWORD));
+    assert!(!stderr.contains(SECRET_VALUE));
+    assert!(output.stdout.is_empty());
 }

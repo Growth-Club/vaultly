@@ -148,7 +148,7 @@ fn tools_list() -> Vec<Tool> {
         Tool { name: "vault_rotate", description: "Rotate one credential or all expired credentials without returning values.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Vault name"),"key":str_prop("Credential name"),"expired":json!({"type":"boolean"}),"length":json!({"type":"number"}),"symbols":json!({"type":"boolean"})},"required":["vaultName"]}) },
         Tool { name: "vault_status", description: "Show lock/session status and vault names.", schema: json!({"type":"object","properties":{}}) },
         Tool { name: "vault_lock", description: "Lock Vaultly and wipe the in-memory key.", schema: json!({"type":"object","properties":{}}) },
-        Tool { name: "vault_unlock", description: "Unlock through macOS Keychain; the agent never handles the password.", schema: json!({"type":"object","properties":{}}) },
+        Tool { name: "vault_unlock", description: "Unlock through the configured OS credential store; the agent never handles the password.", schema: json!({"type":"object","properties":{}}) },
         Tool { name: "vault_audit", description: "Read the tamper-evident audit trail without values.", schema: json!({"type":"object","properties":{"lines":json!({"type":"number"}),"vault":str_prop("Filter"),"caller":str_prop("human or agent"),"after":str_prop("RFC3339 timestamp")}}) },
         Tool { name: "vault_meta", description: "Inspect vault metadata and credential names without values.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Vault name")},"required":["vaultName"]}) },
         Tool { name: "cf_accounts", description: "List configured Cloudflare accounts and health, never credentials.", schema: json!({"type":"object","properties":{"health":json!({"type":"boolean"})}}) },
@@ -491,15 +491,15 @@ async fn tool_vault_lock(engine: &mut VaultEngine, ctx: &CallerContext) -> Value
 
 async fn tool_vault_unlock(engine: &mut VaultEngine) -> Value {
     if !keychain::is_keychain_available() {
-        return fail("Keychain unavailable. Restart the MCP server to unlock.");
+        return fail(keychain::unlock_setup_hint());
     }
     match keychain::get_from_keychain() {
         Some(password) => match engine.unlock(&password) {
             Ok(()) => ok("✓ Vault unlocked."),
-            Err(_) => fail("Keychain password invalid."),
+            Err(_) => fail("The saved OS credential-store password was rejected for this vault."),
         },
         None => {
-            fail("No keychain entry found. Run `vaultly keychain store` or restart the MCP server.")
+            fail("No unique unlocked credential-store entry is available. The owner must check the desktop keyring and run `vaultly keychain store` if needed.")
         }
     }
 }
@@ -1079,7 +1079,7 @@ pub async fn start_mcp_server() {
         if let Some(pw) = keychain::get_from_keychain() {
             if engine.unlock(&pw).is_ok() {
                 unlocked = true;
-                eprintln!("✓ Unlocked from macOS Keychain");
+                eprintln!("✓ Unlocked from {}", keychain::backend_name());
             } else {
                 eprintln!("⚠ Keychain password invalid, falling back...");
             }
@@ -1101,7 +1101,9 @@ pub async fn start_mcp_server() {
     }
 
     if !unlocked {
-        if std::io::stdin().is_terminal() || std::path::Path::new("/dev/tty").exists() {
+        if std::env::var("VAULTLY_HUMAN_MODE").as_deref() == Ok("1")
+            && (std::io::stdin().is_terminal() || std::path::Path::new("/dev/tty").exists())
+        {
             if let Some(pw) = read_tty_password() {
                 if engine.unlock(&pw).is_ok() {
                     unlocked = true;
@@ -1110,7 +1112,8 @@ pub async fn start_mcp_server() {
         }
         if !unlocked {
             eprintln!(
-                "No password. Set VAULTLY_MASTER_PASSWORD or run from a terminal.\n  Or run: vaultly keychain store  (saves to macOS Keychain)"
+                "Non-interactive unlock unavailable. {}",
+                keychain::unlock_setup_hint()
             );
             exit(1);
         }

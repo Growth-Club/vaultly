@@ -68,11 +68,15 @@ vaultly mcp                          # add to your tool's MCP config (see below)
 
 For setup, use the CLI help and the one-time human bootstrap above.
 
+### Linux desktop unlock
+
+Version 1.2.2 supports Linux Secret Service over encrypted D-Bus. Build with a current stable Rust toolchain (`cargo +stable build --release`, Rust 1.89 or newer for Linux dependencies). The owner stores the existing vault master password once with `VAULTLY_HUMAN_MODE=1 vaultly keychain store`. For a custom store, set `VAULTLY_DIR` and explicitly opt in with `VAULTLY_ALLOW_KEYCHAIN=1`. Agent CLI/MCP calls then auto-unlock from that store's saved key without receiving its value. See [Linux setup](docs/config.md#linux-desktop-auto-unlock). A locked desktop keyring requires owner interaction; no plaintext fallback is used.
+
 ### Human and agent unlock modes
 
 Vaultly runs in agent mode by default. Human-only commands can be enabled for
-one command with `VAULTLY_HUMAN_MODE=1`. Human commands use the stored macOS
-Keychain credential when available and otherwise prompt securely. For
+one command with `VAULTLY_HUMAN_MODE=1`. Human commands use the OS credential-store
+credential when available and otherwise prompt securely. For
 isolated CI only, provide the master password through
 `VAULTLY_MASTER_PASSWORD`:
 
@@ -136,7 +140,7 @@ Add to your AI tool's MCP config:
 }
 ```
 
-> 💡 With macOS Keychain (`vaultly keychain store`), no password is needed in config.
+> 💡 With the OS credential store (`vaultly keychain store`), no password is needed in config.
 
 The MCP interface is intentionally small: encrypted credential operations,
 Cloudflare discovery/write-only Worker secret management, and approved
@@ -184,7 +188,7 @@ builds, arbitrary agent commands, or MCP responses.
 Useful commands:
 
 ```bash
-VAULTLY_HUMAN_MODE=1 vaultly keychain store  # auto-unlock via macOS Keychain
+VAULTLY_HUMAN_MODE=1 vaultly keychain store  # auto-unlock via the OS credential store
 VAULTLY_HUMAN_MODE=1 vaultly kill            # 🚨 emergency lock
 VAULTLY_HUMAN_MODE=1 vaultly status          # session info
 ```
