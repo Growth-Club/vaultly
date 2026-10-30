@@ -148,7 +148,7 @@ defined only in a parent package are not used; expose the intended maintenance
 entry point in the target package.
 
 The approved scripts (`check:migrations`, `backup:d1`, `backup:verify`,
-`migrate:apply`, `watchdog`, `smoke`, `purge:test-accounts`) with the target's Cloudflare scope
+`migrate:apply`, `watchdog`, `smoke`, `purge:test-accounts`) run with the target's Cloudflare scope
 plus `D1_BACKUP_*` keys when the vault holds them. Mutating scripts require
 the typed confirmation (`APPLY`, `BACKUP`, `PURGE`) and fail closed on unsafe or unverifiable migration
 state. Execution is gated on the `run` policy operation (default-deny for
