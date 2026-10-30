@@ -1,0 +1,20 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Security — Vaultly</title><link rel="stylesheet" href="style.css"></head><body>
+<nav><a class="brand" href="index.html">🔐 Vaultly</a><div class="links"><a href="docs.html">Docs</a><a href="security.html">Security</a><a href="compare.html">Compare</a><a href="pricing.html">Pricing</a></div></nav>
+<div class="container">
+<section><h1>Security model</h1><p class="sub">What Vaultly protects against, and what it explicitly does not.</p>
+<div class="grid">
+<div class="card"><h3>Crypto</h3><p>AES-256-GCM with a 16-byte nonce, PBKDF2-SHA256 at 600k iterations, per-vault encrypted blobs. Master key never stored; derived on unlock and held in memory only.</p></div>
+<div class="card"><h3>Storage</h3><p>Vault files are 0600, directory 0700. Atomic writes with fsync. Inter-process write lock with stale recovery.</p></div>
+<div class="card"><h3>Agent boundary</h3><p>Agents cannot call <code>get</code>, <code>env</code>, <code>export</code>, or generic <code>run</code>. Secret values are scrubbed from all subprocess output. Only metadata and status cross the boundary.</p></div>
+<div class="card"><h3>Audit</h3><p>Every operation is appended to a hash-chained log (prevHash). Tampering breaks the chain and is detected by <code>vaultly audit --verify</code>.</p></div>
+<div class="card"><h3>Supply chain</h3><p>SHA-256 checksums, GitHub artifact attestations, immutable releases, cosign keyless signatures, SBOM per archive, pinned actions.</p></div>
+<div class="card"><h3>Threat model</h3><p>Protects against: leaked agent transcripts, prompt injection, compromised CI logs. Does not protect against: a compromised host with root access, or a malicious maintainer build.</p></div>
+</div>
+</section>
+<section><h2>Verify a download</h2><pre>gh attestation verify ./vaultly -R riverraftlabs/vaultly
+cosign verify-blob --certificate-identity-regexp 'https://github.com/riverraftlabs/.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  vaultly checksums.txt</pre></section>
+<section><h2>Disclosure</h2><p>Report vulnerabilities via GitHub private vulnerability reporting. We aim to respond within 72 hours and publish advisories with credit.</p></section>
+<footer>Vaultly — MIT licensed.</footer></div></body></html>

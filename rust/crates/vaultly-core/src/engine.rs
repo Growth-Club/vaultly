@@ -172,6 +172,8 @@ pub struct VaultEngine {
     last_activity: Instant,
     /// Cloudflare API base URL. Overridable for tests.
     pub cf_base: String,
+    /// Vercel API base URL. Overridable for tests.
+    pub vercel_base: String,
 }
 
 impl Drop for VaultEngine {
@@ -196,6 +198,7 @@ impl VaultEngine {
             auto_lock: None,
             last_activity: Instant::now(),
             cf_base: "https://api.cloudflare.com/client/v4".to_string(),
+            vercel_base: "https://api.vercel.com".to_string(),
         }
     }
 
@@ -262,6 +265,18 @@ impl VaultEngine {
         }
         self.audit("UNLOCK", "Vault unlocked", None);
         Ok(())
+    }
+
+    /// Rotate the master password: re-encrypt every vault under a new key and
+    /// keep this session alive with the new credential. Human-only at the CLI
+    /// layer; there is deliberately no MCP tool for it.
+    pub fn rekey(&mut self, old_password: &str, new_password: &str) -> Result<usize> {
+        let count = self.store.rekey(old_password, new_password)?;
+        let key = self.store.unlock(new_password)?;
+        self.key = Some(key);
+        self.unlocked_at = Some(Instant::now());
+        self.last_activity = Instant::now();
+        Ok(count)
     }
 
     /// Lock vault — wipe key from memory
@@ -655,6 +670,107 @@ impl VaultEngine {
             .collect())
     }
 
+    /// Agent-safe version history (timestamps + version index, no values).
+    pub fn secret_history(
+        &mut self,
+        vault_name: &str,
+        secret_key: &str,
+        ctx: Option<&CallerContext>,
+    ) -> Result<Vec<SecretMeta>> {
+        self.op(ctx, Operation::ReadKeys, vault_name)?;
+        let key = self.require_unlocked_copy()?;
+        let history = self
+            .store
+            .get_secret_history(vault_name, secret_key, &key)?;
+        let now = chrono::Utc::now();
+        Ok(history
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                // Reuse SecretMeta shape; key carries version index.
+                SecretMeta {
+                    key: format!("v{}", i),
+                    created_at: e.created_at.clone(),
+                    updated_at: e.updated_at.clone(),
+                    expires_at: e.expires_at.clone(),
+                    expired: e.is_expired(&now),
+                    unknown_timestamps: e.created_at.is_empty(),
+                }
+            })
+            .collect())
+    }
+
+    /// Restore a previous version (by 0-based index) as the current value.
+    /// Returns true if restored. Audited; never returns the value.
+    pub fn rollback_secret(
+        &mut self,
+        vault_name: &str,
+        secret_key: &str,
+        version: usize,
+        ctx: Option<&CallerContext>,
+    ) -> Result<bool> {
+        self.op(ctx, Operation::Write, vault_name)?;
+        let key = self.require_unlocked_copy()?;
+        let restored = self
+            .store
+            .restore_secret_version(vault_name, secret_key, version, &key)?;
+        if restored {
+            self.audit(
+                "ROLLBACK",
+                &format!("{}/{} version={}", vault_name, secret_key, version),
+                ctx,
+            );
+        }
+        Ok(restored)
+    }
+
+    /// List trashed secrets (metadata only, no values).
+    pub fn list_trash(
+        &mut self,
+        vault_name: &str,
+        ctx: Option<&CallerContext>,
+    ) -> Result<Vec<crate::vault::TrashEntry>> {
+        self.op(ctx, Operation::ReadKeys, vault_name)?;
+        let key = self.require_unlocked_copy()?;
+        let items = self.store.list_trash(vault_name, &key)?;
+        self.audit(
+            "LIST_TRASH",
+            &format!("{}: {} items", vault_name, items.len()),
+            ctx,
+        );
+        Ok(items)
+    }
+
+    /// Restore a trashed secret by key.
+    pub fn restore_trash(
+        &mut self,
+        vault_name: &str,
+        secret_key: &str,
+        ctx: Option<&CallerContext>,
+    ) -> Result<bool> {
+        self.op(ctx, Operation::Write, vault_name)?;
+        let key = self.require_unlocked_copy()?;
+        let restored = self.store.restore_trash(vault_name, secret_key, &key)?;
+        if restored {
+            self.audit(
+                "RESTORE_TRASH",
+                &format!("{}/{}", vault_name, secret_key),
+                ctx,
+            );
+        }
+        Ok(restored)
+    }
+
+    /// Purge all trashed secrets for a vault.
+    pub fn purge_trash(&mut self, vault_name: &str, ctx: Option<&CallerContext>) -> Result<bool> {
+        self.op(ctx, Operation::Delete, vault_name)?;
+        let purged = self.store.purge_trash(vault_name)?;
+        if purged {
+            self.audit("PURGE_TRASH", vault_name, ctx);
+        }
+        Ok(purged)
+    }
+
     pub fn delete_secret(
         &mut self,
         vault_name: &str,
@@ -813,10 +929,25 @@ impl VaultEngine {
             ctx,
         );
 
+        // Resolve in-vault secret references (${KEY}) so one secret can compose
+        // another, mirroring Doppler/Phase reference syntax. Resolution is
+        // single-pass and stays inside the same vault; unknown refs are left
+        // verbatim. Referenced values are already part of `secrets`, so they
+        // remain scrubbed from output.
+        let resolve = |raw: &str| -> String {
+            let mut out = raw.to_string();
+            // Replace ${KEY} (and $KEY) tokens with the referenced value.
+            for (rk, rv) in &secrets {
+                if let Some(rv) = rv.as_str() {
+                    out = out.replace(&format!("${{{}}}", rk), rv);
+                }
+            }
+            out
+        };
         let env: Vec<(String, String)> = secrets
             .iter()
             .filter(|(k, _)| allowed(k))
-            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), resolve(s))))
             .collect();
 
         let result = self
@@ -2256,14 +2387,175 @@ Run this command from the repository that owns '{}' (its root or a subdirectory)
         record_id: &str,
         ctx: Option<&CallerContext>,
     ) -> Result<ApiResult> {
+        let zone = Self::validate_resource_id(zone_id, "zone id")?;
+        let record = Self::validate_resource_id(record_id, "record id")?;
         self.cloudflare_api(
             vault_name,
             "DELETE",
-            &format!("/zones/{}/dns_records/{}", zone_id, record_id),
+            &format!(
+                "/zones/{}/dns_records/{}",
+                urlencode(&zone),
+                urlencode(&record)
+            ),
             None,
             ctx,
         )
         .await
+    }
+
+    /// List DNS records in a zone (read-only, no stored credential values).
+    pub async fn dns_list(
+        &mut self,
+        vault_name: &str,
+        zone_id: &str,
+        ctx: Option<&CallerContext>,
+    ) -> Result<ApiResult> {
+        let zone = Self::validate_resource_id(zone_id, "zone id")?;
+        self.cloudflare_api(
+            vault_name,
+            "GET",
+            &format!("/zones/{}/dns_records?per_page=100", urlencode(&zone)),
+            None,
+            ctx,
+        )
+        .await
+    }
+
+    /// Create or update one DNS record. The record is looked up by type+name
+    /// first (Cloudflare treats those as the identity for the upsert); an
+    /// existing record is replaced via PUT, otherwise a new one is POSTed.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn dns_upsert(
+        &mut self,
+        vault_name: &str,
+        zone_id: &str,
+        record_type: &str,
+        name: &str,
+        content: &str,
+        proxied: Option<bool>,
+        ttl: Option<u32>,
+        ctx: Option<&CallerContext>,
+    ) -> Result<ApiResult> {
+        let zone = Self::validate_resource_id(zone_id, "zone id")?;
+        let record_type = record_type.trim().to_ascii_uppercase();
+        const ALLOWED_TYPES: &[&str] = &[
+            "A", "AAAA", "CAA", "CNAME", "MX", "NS", "PTR", "SRV", "TXT", "TLSA", "SSHFP", "HTTPS",
+            "SVCB", "NAPTR", "DS", "DNSKEY",
+        ];
+        if !ALLOWED_TYPES.contains(&record_type.as_str()) {
+            return Err(VaultError::Policy(format!(
+                "unsupported DNS record type '{record_type}'"
+            )));
+        }
+        if name.trim().is_empty() || name.len() > 253 || name.chars().any(char::is_control) {
+            return Err(VaultError::Policy("invalid DNS record name".into()));
+        }
+        if name
+            .chars()
+            .any(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '*' | '@')))
+        {
+            return Err(VaultError::Policy(
+                "DNS record name contains unsupported characters".into(),
+            ));
+        }
+        if content.trim().is_empty()
+            || content.len() > 4096
+            || content.contains('\n')
+            || content.contains('\r')
+        {
+            return Err(VaultError::Policy("invalid DNS record content".into()));
+        }
+        if let Some(ttl) = ttl {
+            if ttl != 1 && !(30..=86_400).contains(&ttl) {
+                return Err(VaultError::Policy(
+                    "DNS TTL must be 1 (automatic) or between 30 and 86400".into(),
+                ));
+            }
+        }
+
+        let listed = self
+            .cloudflare_api(
+                vault_name,
+                "GET",
+                &format!(
+                    "/zones/{}/dns_records?type={}&name={}&per_page=50",
+                    urlencode(&zone),
+                    urlencode(&record_type),
+                    urlencode(name)
+                ),
+                None,
+                ctx,
+            )
+            .await?;
+        if !(200..300).contains(&listed.status) {
+            return Ok(listed);
+        }
+        let existing_id = listed
+            .data
+            .get("result")
+            .and_then(|r| r.as_array())
+            .and_then(|records| {
+                records.iter().find_map(|r| {
+                    let same_type = r.get("type").and_then(|v| v.as_str()) == Some(&record_type);
+                    let same_name = r.get("name").and_then(|v| v.as_str()) == Some(name);
+                    if same_type && same_name {
+                        r.get("id").and_then(|v| v.as_str()).map(str::to_string)
+                    } else {
+                        None
+                    }
+                })
+            });
+
+        let mut body = serde_json::json!({
+            "type": record_type,
+            "name": name,
+            "content": content,
+        });
+        if let Some(ttl) = ttl {
+            body["ttl"] = serde_json::json!(ttl);
+        }
+        if let Some(proxied) = proxied {
+            body["proxied"] = serde_json::json!(proxied);
+        }
+
+        match existing_id {
+            Some(id) => {
+                let id = Self::validate_resource_id(&id, "record id")?;
+                self.cloudflare_api(
+                    vault_name,
+                    "PUT",
+                    &format!("/zones/{}/dns_records/{}", urlencode(&zone), urlencode(&id)),
+                    Some(body),
+                    ctx,
+                )
+                .await
+            }
+            None => {
+                self.cloudflare_api(
+                    vault_name,
+                    "POST",
+                    &format!("/zones/{}/dns_records", urlencode(&zone)),
+                    Some(body),
+                    ctx,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Cloudflare ids are opaque but always URL-safe; reject anything else so
+    /// an agent cannot smuggle path segments into a request.
+    fn validate_resource_id(value: &str, label: &str) -> Result<String> {
+        let v = value.trim();
+        if v.is_empty()
+            || v.len() > 128
+            || !v
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(VaultError::Policy(format!("invalid {label}")));
+        }
+        Ok(v.to_string())
     }
 
     // ─── Workers List ─────────────────────────────────────
@@ -2864,12 +3156,133 @@ Run this command from the repository that owns '{}' (its root or a subdirectory)
         ))
     }
 
+    /// Copy one vault credential into a Vercel project environment variable.
+    /// The value travels vault -> Vercel only; it is never returned, logged,
+    /// or placed on a command line. The same vault must hold `VERCEL_TOKEN`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn sync_vercel_env(
+        &mut self,
+        source_vault: &str,
+        source_key: &str,
+        project: &str,
+        env_name: Option<&str>,
+        target: &str,
+        team_id: Option<&str>,
+        ctx: Option<&CallerContext>,
+    ) -> Result<String> {
+        self.op(ctx, Operation::SecretSync, source_vault)?;
+        let project = Self::validate_vercel_slug(project, "project")?;
+        let env_name = env_name.unwrap_or(source_key);
+        if env_name.is_empty()
+            || env_name.len() > 128
+            || !env_name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(VaultError::Policy("invalid Vercel environment name".into()));
+        }
+        let target = target.trim();
+        if !matches!(target, "production" | "preview" | "development") {
+            return Err(VaultError::Policy(
+                "Vercel target must be production, preview, or development".into(),
+            ));
+        }
+        if let Some(team) = team_id {
+            Self::validate_vercel_slug(team, "team id")?;
+        }
+        if source_key.trim().is_empty() || source_key.chars().any(char::is_control) {
+            return Err(VaultError::Policy("source key name is invalid".into()));
+        }
+
+        let key = self.require_unlocked_copy()?;
+        if self
+            .store
+            .get_secret_meta(source_vault, &key)?
+            .iter()
+            .any(|(name, meta)| name == source_key && meta.expired)
+        {
+            return Err(VaultError::Policy(
+                "The source credential has expired".into(),
+            ));
+        }
+        let secrets = self.read_secrets(source_vault)?;
+        let value = secrets
+            .get(source_key)
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| VaultError::SecretNotFound(source_key.into(), source_vault.into()))?;
+        let token = secrets
+            .get("VERCEL_TOKEN")
+            .and_then(|v| v.as_str())
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| {
+                VaultError::SecretNotFound("VERCEL_TOKEN".into(), source_vault.into())
+            })?;
+        if value.is_empty() {
+            return Err(VaultError::Policy("source credential is empty".into()));
+        }
+
+        self.audit(
+            "VERCEL_SYNC",
+            &format!(
+                "vault={} key={} project={} env={} target={}",
+                source_vault, source_key, project, env_name, target
+            ),
+            ctx,
+        );
+
+        let mut url = format!(
+            "{}/v10/projects/{}/env?upsert=true",
+            self.vercel_base,
+            urlencode(&project)
+        );
+        if let Some(team) = team_id {
+            url.push_str(&format!("&teamId={}", urlencode(team)));
+        }
+        let body = serde_json::json!({
+            "key": env_name,
+            "value": value,
+            "type": "encrypted",
+            "target": [target],
+        });
+        let client = reqwest::Client::new();
+        let res = send_with_retry(client.post(&url).bearer_auth(token).json(&body))
+            .await
+            .map_err(|e| VaultError::Policy(format!("Vercel request failed: {}", e)))?;
+        let status = res.status().as_u16();
+        let text = res.text().await.unwrap_or_default();
+        let scrubbed = scrub_output(&text, &[value, token]);
+        if !(200..300).contains(&status) {
+            let detail: String = scrubbed.chars().take(400).collect();
+            return Err(VaultError::Policy(format!(
+                "Vercel environment sync failed (HTTP {status}): {detail}"
+            )));
+        }
+        Ok(format!(
+            "Synced '{}' from vault '{}' to Vercel project '{}' env '{}' ({}) — value never shown",
+            source_key, source_vault, project, env_name, target
+        ))
+    }
+
+    /// Vercel project names and team ids are URL path/query components; keep
+    /// them to a conservative set so nothing can inject path segments.
+    fn validate_vercel_slug(value: &str, label: &str) -> Result<String> {
+        let v = value.trim();
+        if v.is_empty()
+            || v.len() > 100
+            || !v
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        {
+            return Err(VaultError::Policy(format!("invalid Vercel {label}")));
+        }
+        Ok(v.to_string())
+    }
+
     // ─── Backup / Restore ─────────────────────────────────
 
     pub fn get_encrypted_vaults(&self) -> Map<String, Value> {
         self.store.get_encrypted_vaults()
     }
-
     pub fn restore_encrypted_vaults(&mut self, vaults: &Map<String, Value>) -> Result<usize> {
         let count = self.store.restore_encrypted_vaults(vaults)?;
         self.audit("RESTORE", &format!("{} vaults restored", count), None);
@@ -5422,5 +5835,209 @@ mod tests {
         assert!(!posts.iter().any(|r| r.body.contains("remote-bucket")));
         assert!(!posts.iter().any(|r| r.body.contains("have-bucket")));
         let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    #[tokio::test]
+    async fn dns_list_issues_read_only_get_with_pagination() {
+        let (mut engine, _dir) = cf_setup();
+        dns_upsert_setup(&mut engine);
+        let (base, reqs) = spawn_cf_server(r#"{"success":true,"result":[]}"#).await;
+        engine.cf_base = base;
+
+        let r = engine
+            .dns_list("cf", "zone-123", Some(&agent_ctx()))
+            .await
+            .unwrap();
+        assert_eq!(r.status, 200);
+        let req = &reqs.lock().unwrap()[0];
+        assert_eq!(req.method, "GET");
+        assert!(
+            req.path
+                .ends_with("/zones/zone-123/dns_records?per_page=100"),
+            "{}",
+            req.path
+        );
+    }
+
+    #[tokio::test]
+    async fn dns_upsert_creates_when_absent_and_updates_when_present() {
+        let (mut engine, _dir) = cf_setup();
+        dns_upsert_setup(&mut engine);
+
+        // No matching record -> POST create.
+        let (base, reqs) = spawn_cf_server(r#"{"success":true,"result":[]}"#).await;
+        engine.cf_base = base;
+        engine
+            .dns_upsert(
+                "cf",
+                "zone-123",
+                "A",
+                "app.example.com",
+                "1.2.3.4",
+                Some(true),
+                Some(120),
+                Some(&agent_ctx()),
+            )
+            .await
+            .unwrap();
+        let reqs = reqs.lock().unwrap();
+        assert_eq!(reqs[0].method, "GET");
+        assert!(reqs[0].path.contains("type=A"), "{}", reqs[0].path);
+        assert!(reqs[0].path.contains("name=app.example.com"));
+        assert_eq!(reqs[1].method, "POST");
+        assert!(reqs[1].body.contains("\"proxied\":true"));
+        assert!(reqs[1].body.contains("\"ttl\":120"));
+        drop(reqs);
+
+        // Matching record -> PUT update with its id.
+        let (base2, reqs2) = spawn_cf_server(
+            r#"{"success":true,"result":[{"id":"rec-456","type":"A","name":"app.example.com","content":"1.2.3.4"}]}"#,
+        )
+        .await;
+        engine.cf_base = base2;
+        engine
+            .dns_upsert(
+                "cf",
+                "zone-123",
+                "A",
+                "app.example.com",
+                "5.6.7.8",
+                None,
+                None,
+                Some(&agent_ctx()),
+            )
+            .await
+            .unwrap();
+        let reqs2 = reqs2.lock().unwrap();
+        assert_eq!(reqs2[1].method, "PUT");
+        assert!(
+            reqs2[1].path.ends_with("/dns_records/rec-456"),
+            "{}",
+            reqs2[1].path
+        );
+        assert!(reqs2[1].body.contains("5.6.7.8"));
+    }
+
+    #[tokio::test]
+    async fn dns_upsert_rejects_path_injection_and_bad_types() {
+        let (mut engine, _dir) = cf_setup();
+        dns_upsert_setup(&mut engine);
+        let err = engine
+            .dns_upsert(
+                "cf",
+                "../accounts/x",
+                "A",
+                "app.example.com",
+                "1.2.3.4",
+                None,
+                None,
+                Some(&agent_ctx()),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("zone id"), "{err}");
+
+        let err = engine
+            .dns_upsert(
+                "cf",
+                "zone-123",
+                "NOT-A-TYPE",
+                "app.example.com",
+                "1.2.3.4",
+                None,
+                None,
+                Some(&agent_ctx()),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("record type"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn vercel_env_sync_posts_encrypted_value_without_leaking_it() {
+        let (mut engine, _dir) = setup();
+        engine
+            .add_secret(
+                "vercel",
+                "VERCEL_TOKEN",
+                "vercel-token-123456",
+                Some(&agent_ctx()),
+            )
+            .unwrap();
+        engine
+            .add_secret(
+                "vercel",
+                "DATABASE_URL",
+                "postgres://user:pw@host/db",
+                Some(&agent_ctx()),
+            )
+            .unwrap();
+        let (base, reqs) = spawn_cf_server(r#"{"created":{"id":"env_123"}}"#).await;
+        engine.vercel_base = base;
+
+        let msg = engine
+            .sync_vercel_env(
+                "vercel",
+                "DATABASE_URL",
+                "my-app",
+                None,
+                "production",
+                None,
+                Some(&agent_ctx()),
+            )
+            .await
+            .unwrap();
+        assert!(!msg.contains("postgres://"), "{msg}");
+        assert!(msg.contains("DATABASE_URL"));
+        let reqs = reqs.lock().unwrap();
+        let req = &reqs[0];
+        assert_eq!(req.method, "POST");
+        assert!(
+            req.path.starts_with("/v10/projects/my-app/env?upsert=true"),
+            "{}",
+            req.path
+        );
+        assert_eq!(
+            req.header("authorization"),
+            Some("Bearer vercel-token-123456")
+        );
+        assert!(req.body.contains("\"key\":\"DATABASE_URL\""));
+        assert!(req.body.contains("\"target\":[\"production\"]"));
+        assert!(req.body.contains("postgres://user:pw@host/db"));
+    }
+
+    #[tokio::test]
+    async fn vercel_env_sync_rejects_unknown_target_and_missing_token() {
+        let (mut engine, _dir) = setup();
+        engine
+            .add_secret("vercel", "APP_KEY", "value", Some(&agent_ctx()))
+            .unwrap();
+        let err = engine
+            .sync_vercel_env(
+                "vercel",
+                "APP_KEY",
+                "my-app",
+                None,
+                "staging",
+                None,
+                Some(&agent_ctx()),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("target"), "{err}");
+
+        let err = engine
+            .sync_vercel_env(
+                "vercel",
+                "APP_KEY",
+                "my-app",
+                None,
+                "production",
+                None,
+                Some(&agent_ctx()),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("VERCEL_TOKEN"), "{err}");
     }
 }

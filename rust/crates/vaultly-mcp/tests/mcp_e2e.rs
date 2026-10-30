@@ -11,15 +11,17 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 const PASSWORD: &str = "mcp-test-password";
 const SECRET_VALUE: &str = "sk-e2e-super-secret-token-1234567890";
 const SECRET_KEY: &str = "E2E_SECRET_KEY";
-const EXPECTED_TOOLS: [&str; 31] = [
+const EXPECTED_TOOLS: [&str; 38] = [
     "cf_account_label",
     "cf_accounts",
     "cf_d1_list",
+    "cf_dns_list",
     "cf_health",
     "cf_kv_list",
     "cf_pages_projects",
     "cf_r2_list",
     "cf_secrets",
+    "cf_worker_versions",
     "cf_workers_list",
     "cf_zones",
     "deploy_target",
@@ -34,15 +36,20 @@ const EXPECTED_TOOLS: [&str; 31] = [
     "vault_delete",
     "vault_export_encrypted",
     "vault_generate",
+    "vault_history",
     "vault_import",
     "vault_import_encrypted",
     "vault_keys",
     "vault_list",
     "vault_lock",
     "vault_meta",
+    "vault_rollback",
     "vault_rotate",
     "vault_status",
+    "vault_trash_list",
+    "vault_trash_restore",
     "vault_unlock",
+    "vercel_env_sync",
 ];
 
 struct McpClient {
@@ -664,4 +671,42 @@ async fn mcp_missing_unlock_fails_without_prompting_or_leaking() {
     assert!(!stderr.contains(PASSWORD));
     assert!(!stderr.contains(SECRET_VALUE));
     assert!(output.stdout.is_empty());
+}
+
+#[tokio::test]
+async fn mcp_resources_expose_policy_and_status_without_values() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let dir = tempfile::tempdir().unwrap();
+        let store = vaultly_core::vault::VaultStore::with_dir(dir.path().to_path_buf());
+        store.init_vault(PASSWORD).unwrap();
+        let mut mcp = McpClient::start(dir.path()).await;
+
+        let res = mcp.call(2, "resources/list", json!({})).await;
+        let resources = res["result"]["resources"].as_array().unwrap();
+        let uris: Vec<&str> = resources.iter().filter_map(|r| r["uri"].as_str()).collect();
+        assert_eq!(uris, vec!["vaultly://policy", "vaultly://status"]);
+
+        let res = mcp
+            .call(3, "resources/read", json!({ "uri": "vaultly://status" }))
+            .await;
+        let text = res["result"]["contents"][0]["text"].as_str().unwrap();
+        assert!(text.contains("\"unlocked\""), "{text}");
+        assert!(text.contains("\"killswitch\""), "{text}");
+        assert!(!text.contains(SECRET_VALUE));
+
+        let res = mcp
+            .call(4, "resources/read", json!({ "uri": "vaultly://policy" }))
+            .await;
+        let text = res["result"]["contents"][0]["text"].as_str().unwrap();
+        assert!(text.contains("allowed_operations"), "{text}");
+        assert!(!text.contains(SECRET_VALUE));
+
+        // Unknown resources are a protocol error, not an empty success.
+        let res = mcp
+            .call(5, "resources/read", json!({ "uri": "vaultly://secrets" }))
+            .await;
+        assert_eq!(res["error"]["code"], -32602, "{res}");
+    })
+    .await
+    .expect("mcp_resources test timed out");
 }

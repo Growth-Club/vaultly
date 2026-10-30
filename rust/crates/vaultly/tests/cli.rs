@@ -593,3 +593,233 @@ fn agent_unlock_reports_empty_rejected_and_missing_sources() {
     assert!(stdout(&out).contains("TOKEN"));
     assert!(!stdout(&out).contains(SECRET));
 }
+
+fn run_stdin(args: &[&str], input: &str) -> Output {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = bin()
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn vaultly binary");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    child.wait_with_output().expect("wait for vaultly")
+}
+
+#[test]
+fn audit_verify_detects_tampering() {
+    let env = VaultlyEnv::new();
+    assert_ok(&run(&["init"]));
+    assert_ok(&run(&["add", "personal", "-k", "TOKEN", "-v", SECRET]));
+
+    let out = run(&["audit", "--verify", "--json"]);
+    assert_ok(&out);
+    let value: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(value["ok"], true, "{value}");
+
+    // Flip content in the first chained line; the next line's prevHash no
+    // longer matches, so verification must fail loudly.
+    let path = env.dir().join("audit.log");
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let tampered = raw.replacen("INIT", "INIX", 1);
+    std::fs::write(&path, tampered).unwrap();
+
+    let out = run(&["audit", "--verify", "--json"]);
+    assert_fails(&out);
+    let value: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(value["ok"], false, "{value}");
+    assert!(!value["violations"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn backup_and_restore_roundtrip() {
+    let env = VaultlyEnv::new();
+    assert_ok(&run(&["init"]));
+    assert_ok(&run(&["add", "app", "-k", "TOKEN", "-v", SECRET]));
+
+    let backup = env.dir().join("backup.json");
+    let backup = backup.to_str().unwrap();
+    let out = run(&["backup", backup, "--json"]);
+    assert_ok(&out);
+    assert!(stdout(&out).contains("\"vaults\": 1"), "{}", stdout(&out));
+
+    assert_ok(&run(&["delete", "app"]));
+    assert!(run(&["list", "--json"]).status.success());
+
+    let out = run(&["restore", backup, "--yes", "--json"]);
+    assert_ok(&out);
+    assert!(stdout(&out).contains("\"restored\": 1"), "{}", stdout(&out));
+
+    let out = run(&["get", "app", "TOKEN"]);
+    assert_ok(&out);
+    assert_eq!(stdout(&out).trim(), SECRET);
+}
+
+#[test]
+fn restore_rejects_tampered_checksum() {
+    let env = VaultlyEnv::new();
+    assert_ok(&run(&["init"]));
+    assert_ok(&run(&["add", "app", "-k", "TOKEN", "-v", SECRET]));
+    let backup = env.dir().join("backup.json");
+    let backup = backup.to_str().unwrap();
+    assert_ok(&run(&["backup", backup]));
+
+    let raw = std::fs::read_to_string(backup).unwrap();
+    let tampered = raw.replace("\"checksum\": \"", "\"checksum\": \"00");
+    std::fs::write(backup, tampered).unwrap();
+    let out = run(&["restore", backup, "--yes"]);
+    assert_fails(&out);
+    assert!(
+        stderr(&out).contains("checksum mismatch"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn passwd_rotates_and_old_password_stops_working() {
+    let env = VaultlyEnv::new();
+    assert_ok(&run(&["init"]));
+    assert_ok(&run(&["add", "app", "-k", "TOKEN", "-v", SECRET]));
+
+    let new_password = "new-master-password-5678";
+    let out = run_stdin(&["passwd", "--new-password-stdin"], new_password);
+    assert_ok(&out);
+
+    // The rotated store opens with the new password ...
+    env.set_password(new_password);
+    let out = run(&["get", "app", "TOKEN"]);
+    assert_ok(&out);
+    assert_eq!(stdout(&out).trim(), SECRET);
+
+    // ... and not with the old one.
+    env.set_password(PASSWORD);
+    let out = run(&["get", "app", "TOKEN"]);
+    assert_fails(&out);
+    assert!(stderr(&out).contains("rejected"), "{}", stderr(&out));
+}
+
+#[test]
+fn policy_grant_and_revoke_update_the_owner_file() {
+    let env = VaultlyEnv::new();
+    assert_ok(&run(&["init"]));
+
+    let out = run(&[
+        "policy", "grant", "deployer", "--op", "run", "--vault", "cf-acme",
+    ]);
+    assert_ok(&out);
+
+    let path = env.dir().join("agent-policy.json");
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let ops = parsed["deployer"]["allowed_operations"].as_array().unwrap();
+    assert!(ops.iter().any(|v| v == "run"));
+    assert!(parsed["deployer"]["allowed_vaults"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v == "cf-acme"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    let out = run(&["policy", "list", "--json"]);
+    assert_ok(&out);
+    assert!(stdout(&out).contains("deployer"));
+    assert!(stdout(&out).contains("\"run\""));
+
+    assert_ok(&run(&["policy", "revoke", "deployer", "--op", "run"]));
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert!(!raw.contains("\"run\""));
+}
+
+#[test]
+fn expire_lists_expired_credentials_without_values() {
+    let _env = VaultlyEnv::new();
+    assert_ok(&run(&["init"]));
+    assert_ok(&run(&[
+        "add",
+        "app",
+        "-k",
+        "OLD",
+        "-v",
+        SECRET,
+        "--expires",
+        "2020-01-01T00:00:00Z",
+    ]));
+    let out = run(&["expire", "--json"]);
+    assert_ok(&out);
+    let rows: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert!(rows.as_array().unwrap().iter().any(|r| r["key"] == "OLD"));
+    assert!(!stdout(&out).contains(SECRET));
+}
+
+#[test]
+fn schedule_print_emits_cron_and_systemd_without_values() {
+    let _env = VaultlyEnv::new();
+    assert_ok(&run(&["init"]));
+    assert_ok(&run(&["add", "personal", "-k", "TOKEN", "-v", SECRET]));
+
+    let out = run(&["schedule", "print", "--format", "cron", "--at", "04:05"]);
+    assert_ok(&out);
+    assert!(stdout(&out).contains("5 4 * * *"), "{}", stdout(&out));
+    assert!(stdout(&out).contains("rotate personal --expired"));
+    assert!(!stdout(&out).contains(SECRET));
+
+    let out = run(&["schedule", "print", "--format", "systemd"]);
+    assert_ok(&out);
+    assert!(stdout(&out).contains("OnCalendar=*-*-* 03:15:00"));
+    assert!(stdout(&out).contains("ExecStart="));
+}
+
+#[test]
+fn mcp_install_prints_and_writes_client_config() {
+    let env = VaultlyEnv::new();
+    let out = run(&["mcp", "install", "--client", "vscode"]);
+    assert_ok(&out);
+    assert!(stdout(&out).contains("\"servers\""));
+    assert!(stdout(&out).contains("\"vaultly\""));
+
+    let path = env.dir().join("vscode-mcp.json");
+    let out = run(&[
+        "mcp",
+        "install",
+        "--client",
+        "vscode",
+        "--write",
+        "--path",
+        path.to_str().unwrap(),
+    ]);
+    assert_ok(&out);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(parsed["servers"]["vaultly"]["args"][0], "mcp");
+}
+
+#[test]
+fn doctor_fix_tightens_vault_file_permissions() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let env = VaultlyEnv::new();
+        assert_ok(&run(&["init"]));
+        assert_ok(&run(&["add", "app", "-k", "TOKEN", "-v", SECRET]));
+        let vault_file = env.dir().join("vaults/app.vault");
+        std::fs::set_permissions(&vault_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let out = run(&["doctor", "--fix"]);
+        assert_ok(&out);
+        let mode = std::fs::metadata(&vault_file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+}

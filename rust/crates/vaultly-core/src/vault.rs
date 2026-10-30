@@ -15,6 +15,15 @@ use crate::deploy::DeploymentTarget;
 use crate::error::{Result, VaultError};
 use zeroize::Zeroizing;
 
+/// A soft-deleted secret kept in the trash for recovery.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrashEntry {
+    pub key: String,
+    pub entry: crate::crypto::SecretEntry,
+    pub deleted_at: String,
+}
+
 pub struct VaultStore {
     dir: PathBuf,
 }
@@ -164,9 +173,31 @@ impl VaultStore {
         use std::os::unix::fs::PermissionsExt;
         fs::create_dir_all(&self.dir)?;
         fs::create_dir_all(self.vaults_dir())?;
+        fs::create_dir_all(self.history_dir())?;
+        fs::create_dir_all(self.trash_dir())?;
         fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o700)).ok();
         fs::set_permissions(self.vaults_dir(), fs::Permissions::from_mode(0o700)).ok();
+        fs::set_permissions(self.history_dir(), fs::Permissions::from_mode(0o700)).ok();
+        fs::set_permissions(self.trash_dir(), fs::Permissions::from_mode(0o700)).ok();
         Ok(())
+    }
+
+    fn history_dir(&self) -> PathBuf {
+        self.dir.join("history")
+    }
+
+    fn history_path(&self, name: &str) -> Result<PathBuf> {
+        let safe = Self::sanitize_name(name)?;
+        Ok(self.history_dir().join(format!("{}.vault", safe)))
+    }
+
+    fn trash_dir(&self) -> PathBuf {
+        self.dir.join("trash")
+    }
+
+    fn trash_path(&self, name: &str) -> Result<PathBuf> {
+        let safe = Self::sanitize_name(name)?;
+        Ok(self.trash_dir().join(format!("{}.vault", safe)))
     }
 
     fn sanitize_name(name: &str) -> Result<String> {
@@ -401,6 +432,115 @@ impl VaultStore {
         Ok(key)
     }
 
+    /// Re-encrypt every vault (and the stored verifier) under a new master
+    /// password. The old password must verify first. Vault names, values,
+    /// labels and per-secret expiry metadata are preserved.
+    ///
+    /// Old ciphertext is snapshotted to `.rekey-backup-<timestamp>/` before
+    /// anything is replaced; if any write fails the snapshot is restored, so a
+    /// failed rotation cannot leave the store half-encrypted. There is no
+    /// plaintext on disk at any point.
+    pub fn rekey(&self, old_password: &str, new_password: &str) -> Result<usize> {
+        if new_password.is_empty() {
+            return Err(VaultError::Policy(
+                "the new master password must not be empty".to_string(),
+            ));
+        }
+        let config = self.load_config()?;
+        let old_key = derive_key(old_password, &config.salt)?;
+        if !verify_password(&config.verifier, &old_key) {
+            return Err(VaultError::WrongPassword);
+        }
+
+        // Decrypt everything with the old key before writing anything.
+        let names = self.list_vaults();
+        let mut decoded: Vec<(String, BTreeMap<String, SecretEntry>)> =
+            Vec::with_capacity(names.len());
+        for name in &names {
+            decoded.push((name.clone(), self.get_secret_entries(name, &old_key)?));
+        }
+
+        let new_salt = generate_salt();
+        let new_key = derive_key(new_password, &new_salt)?;
+        let new_verifier = create_verifier(&new_key)?;
+        let new_config = VaultConfig {
+            version: config.version,
+            salt: new_salt,
+            verifier: new_verifier,
+            created_at: config.created_at.clone(),
+            backup: config.backup.clone(),
+            auto_lock_minutes: config.auto_lock_minutes,
+        };
+
+        let backup_dir = self.dir.join(format!(
+            ".rekey-backup-{}",
+            chrono::Utc::now().timestamp_millis()
+        ));
+        self.snapshot_to(&backup_dir)?;
+
+        let apply = |this: &Self| -> Result<()> {
+            for (name, entries) in &decoded {
+                let file = encrypt_vault(&Self::encode_entries(entries), &new_key)?;
+                this.save_vault_file(name, &file)?;
+            }
+            this.save_config(&new_config)
+        };
+
+        if let Err(e) = apply(self) {
+            let _ = self.restore_from(&backup_dir);
+            return Err(e);
+        }
+
+        // Rotation succeeded — the old ciphertext is now useless without the
+        // old password, and keeping it invites confusion. Remove it.
+        let _ = fs::remove_dir_all(&backup_dir);
+        self.audit(
+            "REKEY",
+            &format!(
+                "{} vault(s) re-encrypted under a new master password",
+                decoded.len()
+            ),
+        );
+        Ok(decoded.len())
+    }
+
+    /// Copy `config.json` and every vault file into `dir` with private modes.
+    fn snapshot_to(&self, dir: &std::path::Path) -> Result<()> {
+        fs::create_dir_all(dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        }
+        let mut files = vec![self.config_path()];
+        for name in self.list_vaults() {
+            files.push(self.vault_path(&name)?);
+        }
+        for path in files {
+            let Some(file_name) = path.file_name() else {
+                continue;
+            };
+            let raw = fs::read_to_string(&path)?;
+            Self::write_secure(&dir.join(file_name), &raw)?;
+        }
+        Ok(())
+    }
+
+    /// Restore a snapshot written by [`VaultStore::snapshot_to`]. Used only as
+    /// the rollback path for a failed rekey; best-effort by design.
+    fn restore_from(&self, dir: &std::path::Path) -> Result<()> {
+        let config_raw = fs::read_to_string(dir.join("config.json"))?;
+        for name in self.list_vaults() {
+            let src = dir.join(format!("{name}.json"));
+            if src.exists() {
+                let raw = fs::read_to_string(src)?;
+                Self::write_secure(&self.vault_path(&name)?, &raw)?;
+            }
+        }
+        Self::write_secure(&self.config_path(), &config_raw)?;
+        Ok(())
+    }
+
     // ─── Vault CRUD ───────────────────────────────────────
 
     fn load_vault_file(&self, name: &str) -> Result<Option<VaultFile>> {
@@ -560,20 +700,29 @@ impl VaultStore {
         Self::validate_value(value)?;
         let now = now_iso();
         let mut entries = self.get_secret_entries(vault_name, key)?;
-        let next = match entries.get(secret_key) {
-            Some(existing) => SecretEntry {
-                value: value.to_string(),
-                created_at: existing.created_at.clone(),
-                updated_at: now.clone(),
-                expires_at: expires_at.map(|s| s.to_string()),
-            },
-            None => SecretEntry {
-                value: value.to_string(),
-                created_at: now.clone(),
-                updated_at: now.clone(),
-                expires_at: expires_at.map(|s| s.to_string()),
-            },
+        let (next, previous) = match entries.get(secret_key) {
+            Some(existing) => (
+                SecretEntry {
+                    value: value.to_string(),
+                    created_at: existing.created_at.clone(),
+                    updated_at: now.clone(),
+                    expires_at: expires_at.map(|s| s.to_string()),
+                },
+                Some(existing.clone()),
+            ),
+            None => (
+                SecretEntry {
+                    value: value.to_string(),
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                    expires_at: expires_at.map(|s| s.to_string()),
+                },
+                None,
+            ),
         };
+        if let Some(prev) = previous {
+            let _ = self.append_secret_history(vault_name, secret_key, &prev, key);
+        }
         entries.insert(secret_key.to_string(), next);
         let file = encrypt_vault(&Self::encode_entries(&entries), key)?;
         self.save_vault_file(vault_name, &file)?;
@@ -583,12 +732,119 @@ impl VaultStore {
 
     pub fn delete_secret(&self, vault_name: &str, secret_key: &str, key: &[u8]) -> Result<bool> {
         let mut entries = self.get_secret_entries(vault_name, key)?;
-        if entries.remove(secret_key).is_none() {
-            return Ok(false);
-        }
+        let removed = match entries.remove(secret_key) {
+            Some(e) => e,
+            None => return Ok(false),
+        };
+        // Preserve the deleted value in history so it can be restored.
+        self.append_secret_history(vault_name, secret_key, &removed, key)?;
+        // Soft-delete: move into trash for recovery.
+        let trash_entry = TrashEntry {
+            key: secret_key.to_string(),
+            entry: removed.clone(),
+            deleted_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        };
+        let _ = self.trash_secret(vault_name, &trash_entry, key);
         let file = encrypt_vault(&Self::encode_entries(&entries), key)?;
         self.save_vault_file(vault_name, &file)?;
         self.audit("DELETE", &format!("{}/{}", vault_name, secret_key));
+        Ok(true)
+    }
+
+    // ─── Secret version history ───────────────────────────
+
+    /// Read the version history for one secret (oldest → newest). Empty if none.
+    pub fn get_secret_history(
+        &self,
+        vault_name: &str,
+        secret_key: &str,
+        key: &[u8],
+    ) -> Result<Vec<SecretEntry>> {
+        let p = self.history_path(vault_name)?;
+        if !p.exists() {
+            return Ok(Vec::new());
+        }
+        let raw = fs::read_to_string(&p)?;
+        let file: crate::crypto::VaultFile = serde_json::from_str(&raw)
+            .map_err(|e| VaultError::ConfigCorrupt(format!("history: {e}")))?;
+        let map = crate::crypto::decrypt_vault(&file, key)?;
+        let arr = match map.get(secret_key) {
+            Some(serde_json::Value::Array(a)) => a.clone(),
+            _ => return Ok(Vec::new()),
+        };
+        let mut out = Vec::new();
+        for v in arr {
+            if let Ok(e) = serde_json::from_value::<SecretEntry>(v) {
+                out.push(e);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Append one entry to a secret's version history.
+    pub fn append_secret_history(
+        &self,
+        vault_name: &str,
+        secret_key: &str,
+        entry: &SecretEntry,
+        key: &[u8],
+    ) -> Result<()> {
+        self.ensure_dirs()?;
+        // Load existing history map (key -> array of entries).
+        let mut map: serde_json::Map<String, serde_json::Value> =
+            if self.history_path(vault_name)?.exists() {
+                let raw = fs::read_to_string(self.history_path(vault_name)?)?;
+                let file: crate::crypto::VaultFile = serde_json::from_str(&raw)
+                    .map_err(|e| VaultError::ConfigCorrupt(format!("history: {e}")))?;
+                crate::crypto::decrypt_vault(&file, key)?
+            } else {
+                serde_json::Map::new()
+            };
+        let arr = map
+            .entry(secret_key.to_string())
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        if let serde_json::Value::Array(a) = arr {
+            a.push(entry.to_value());
+        }
+        // Cap history at 100 versions.
+        if let Some(serde_json::Value::Array(a)) = map.get_mut(secret_key) {
+            if a.len() > 100 {
+                let start = a.len() - 100;
+                *a = a[start..].to_vec();
+            }
+        }
+        let file = crate::crypto::encrypt_vault(&map, key)?;
+        self.with_write_lock(|| {
+            Self::write_secure(
+                &self.history_path(vault_name)?,
+                &serde_json::to_string_pretty(&file)?,
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Restore a previous version by index (0-based) as the current value.
+    pub fn restore_secret_version(
+        &self,
+        vault_name: &str,
+        secret_key: &str,
+        index: usize,
+        key: &[u8],
+    ) -> Result<bool> {
+        let history = self.get_secret_history(vault_name, secret_key, key)?;
+        let entry = match history.get(index) {
+            Some(e) => e.clone(),
+            None => return Ok(false),
+        };
+        // Set current value from historical entry.
+        self.set_secret_ex(
+            vault_name,
+            secret_key,
+            &entry.value,
+            entry.expires_at.as_deref(),
+            key,
+        )?;
         Ok(true)
     }
 
@@ -747,6 +1003,94 @@ impl VaultStore {
             ),
         });
         self.save_config(&config)
+    }
+
+    // ─── Trash (soft delete) ──────────────────────────────
+
+    /// Append a trashed secret entry.
+    pub fn trash_secret(&self, vault_name: &str, item: &TrashEntry, key: &[u8]) -> Result<()> {
+        self.ensure_dirs()?;
+        let mut map: serde_json::Map<String, serde_json::Value> =
+            if self.trash_path(vault_name)?.exists() {
+                let raw = fs::read_to_string(self.trash_path(vault_name)?)?;
+                let file: crate::crypto::VaultFile = serde_json::from_str(&raw)
+                    .map_err(|e| VaultError::ConfigCorrupt(format!("trash: {e}")))?;
+                crate::crypto::decrypt_vault(&file, key)?
+            } else {
+                serde_json::Map::new()
+            };
+        let arr = map
+            .entry(item.key.clone())
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        if let serde_json::Value::Array(a) = arr {
+            if let Ok(v) = serde_json::to_value(item) {
+                a.push(v);
+            }
+        }
+        let file = crate::crypto::encrypt_vault(&map, key)?;
+        self.with_write_lock(|| {
+            Self::write_secure(
+                &self.trash_path(vault_name)?,
+                &serde_json::to_string_pretty(&file)?,
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// List trashed secrets for a vault (key + deleted_at, no values).
+    pub fn list_trash(&self, vault_name: &str, key: &[u8]) -> Result<Vec<TrashEntry>> {
+        let p = self.trash_path(vault_name)?;
+        if !p.exists() {
+            return Ok(Vec::new());
+        }
+        let raw = fs::read_to_string(&p)?;
+        let file: crate::crypto::VaultFile = serde_json::from_str(&raw)
+            .map_err(|e| VaultError::ConfigCorrupt(format!("trash: {e}")))?;
+        let map = crate::crypto::decrypt_vault(&file, key)?;
+        let mut out = Vec::new();
+        for (_k, v) in map {
+            if let serde_json::Value::Array(a) = v {
+                for item in a {
+                    if let Ok(te) = serde_json::from_value::<TrashEntry>(item) {
+                        out.push(te);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Restore a trashed secret by key (most recent trash entry) back into the vault.
+    pub fn restore_trash(&self, vault_name: &str, secret_key: &str, key: &[u8]) -> Result<bool> {
+        let items = self.list_trash(vault_name, key)?;
+        let item = items.into_iter().filter(|t| t.key == secret_key).last();
+        let item = match item {
+            Some(i) => i,
+            None => return Ok(false),
+        };
+        // Restore value.
+        self.set_secret_ex(
+            vault_name,
+            secret_key,
+            &item.entry.value,
+            item.entry.expires_at.as_deref(),
+            key,
+        )?;
+        Ok(true)
+    }
+
+    /// Purge all trashed secrets for a vault.
+    pub fn purge_trash(&self, vault_name: &str) -> Result<bool> {
+        let p = self.trash_path(vault_name)?;
+        if !p.exists() {
+            return Ok(false);
+        }
+        self.with_write_lock(|| {
+            fs::remove_file(&p)?;
+            Ok(())
+        })?;
+        Ok(true)
     }
 
     pub fn get_vault_file_path(&self, name: &str) -> Result<PathBuf> {
@@ -1210,5 +1554,93 @@ mod tests {
             PathBuf::from(format!("{}.1", path.display())).exists(),
             "rotated backup file should exist"
         );
+    }
+
+    #[test]
+    fn rekey_preserves_values_labels_and_expiry() {
+        let dir = temp_dir();
+        let store = store_with(dir.clone());
+        let key = key_for(&store);
+        store
+            .set_secret("app", "TOKEN", "super-secret", &key)
+            .unwrap();
+        store
+            .set_secret_ex("app", "OLD", "expiring", Some("2099-01-01T00:00:00Z"), &key)
+            .unwrap();
+        store
+            .set_vault_label("app", Some("App credentials".into()))
+            .unwrap();
+
+        let count = store.rekey(PASSWORD, "new-master-password").unwrap();
+        assert_eq!(count, 1);
+
+        // Old password no longer opens the store.
+        assert!(matches!(
+            store.unlock(PASSWORD),
+            Err(VaultError::WrongPassword)
+        ));
+        let new_key = store.unlock("new-master-password").unwrap();
+        let secrets = store.get_secrets("app", &new_key).unwrap();
+        assert_eq!(secrets.get("TOKEN").unwrap().as_str(), Some("super-secret"));
+        assert_eq!(secrets.get("OLD").unwrap().as_str(), Some("expiring"));
+        assert_eq!(
+            store.get_vault_label("app").unwrap().as_deref(),
+            Some("App credentials")
+        );
+        let meta = store.get_secret_meta("app", &new_key).unwrap();
+        assert_eq!(
+            meta.get("OLD")
+                .and_then(|m| m.expires_at.clone())
+                .as_deref(),
+            Some("2099-01-01T00:00:00Z")
+        );
+
+        // No plaintext rollback snapshot is left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".rekey-backup-")
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "rollback snapshot must be removed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rekey_rejects_wrong_old_password_without_touching_store() {
+        let dir = temp_dir();
+        let store = store_with(dir.clone());
+        let key = key_for(&store);
+        store.set_secret("app", "TOKEN", "unchanged", &key).unwrap();
+
+        assert!(matches!(
+            store.rekey("not-the-password", "new-master-password"),
+            Err(VaultError::WrongPassword)
+        ));
+        // The original password still works and the value is intact.
+        let key = store.unlock(PASSWORD).unwrap();
+        assert_eq!(
+            store
+                .get_secrets("app", &key)
+                .unwrap()
+                .get("TOKEN")
+                .and_then(|v| v.as_str()),
+            Some("unchanged")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rekey_rejects_empty_new_password() {
+        let dir = temp_dir();
+        let store = store_with(dir.clone());
+        assert!(store.rekey(PASSWORD, "").is_err());
+        assert!(store.unlock(PASSWORD).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

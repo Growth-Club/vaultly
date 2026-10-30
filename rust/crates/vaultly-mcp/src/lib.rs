@@ -15,7 +15,9 @@ use serde_json::{json, Map, Value};
 use vaultly_core::{generate, keychain, CallerContext, VaultEngine, VaultError};
 
 pub const SERVER_NAME: &str = "vaultly";
-pub const SERVER_VERSION: &str = "1.1.0";
+/// Always report the crate version so agents see the version they are
+/// actually talking to (the hardcoded 1.1.0 drifted from the workspace).
+pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
 /// The master password, captured at startup before the env var is removed.
@@ -149,8 +151,12 @@ fn tools_list() -> Vec<Tool> {
         Tool { name: "vault_status", description: "Show lock/session status and vault names.", schema: json!({"type":"object","properties":{}}) },
         Tool { name: "vault_lock", description: "Lock Vaultly and wipe the in-memory key.", schema: json!({"type":"object","properties":{}}) },
         Tool { name: "vault_unlock", description: "Unlock through the configured OS credential store; the agent never handles the password.", schema: json!({"type":"object","properties":{}}) },
-        Tool { name: "vault_audit", description: "Read the tamper-evident audit trail without values.", schema: json!({"type":"object","properties":{"lines":json!({"type":"number"}),"vault":str_prop("Filter"),"caller":str_prop("human or agent"),"after":str_prop("RFC3339 timestamp")}}) },
+        Tool { name: "vault_audit", description: "Read the tamper-evident audit trail without values. Pass verify=true to report chain integrity only.", schema: json!({"type":"object","properties":{"lines":json!({"type":"number"}),"vault":str_prop("Filter"),"caller":str_prop("human or agent"),"after":str_prop("RFC3339 timestamp"),"verify":json!({"type":"boolean","description":"Only verify the hash chain"})}}) },
         Tool { name: "vault_meta", description: "Inspect vault metadata and credential names without values.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Vault name")},"required":["vaultName"]}) },
+        Tool { name: "vault_trash_list", description: "List soft-deleted (trashed) secrets (metadata only).", schema: json!({"type":"object","properties":{"vaultName":str_prop("Vault name")},"required":["vaultName"]}) },
+        Tool { name: "vault_trash_restore", description: "Restore a trashed secret by key.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Vault name"),"key":str_prop("Credential name")},"required":["vaultName","key"]}) },
+        Tool { name: "vault_history", description: "List version history (metadata only, no values) for one credential.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Vault name"),"key":str_prop("Credential name")},"required":["vaultName","key"]}) },
+        Tool { name: "vault_rollback", description: "Restore a previous version of a credential by index. Requires write policy.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Vault name"),"key":str_prop("Credential name"),"version":json!({"type":"number","description":"0-based version index from vault_history"})},"required":["vaultName","key","version"]}) },
         Tool { name: "cf_accounts", description: "List configured Cloudflare accounts and health, never credentials.", schema: json!({"type":"object","properties":{"health":json!({"type":"boolean"})}}) },
         Tool { name: "cf_account_label", description: "Read or set a non-secret Cloudflare account label.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault"),"label":str_prop("Label; omit to read, empty to clear")},"required":["vaultName"]}) },
         Tool { name: "cf_health", description: "Verify one Cloudflare credential set.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault")},"required":["vaultName"]}) },
@@ -160,6 +166,9 @@ fn tools_list() -> Vec<Tool> {
         Tool { name: "cf_d1_list", description: "List D1 databases (names and ids) in the vault's account. Read-only.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault")},"required":["vaultName"]}) },
         Tool { name: "cf_r2_list", description: "List R2 buckets (names) in the vault's account. Read-only.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault")},"required":["vaultName"]}) },
         Tool { name: "cf_kv_list", description: "List Workers KV namespaces (titles and ids) in the vault's account. Read-only.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault")},"required":["vaultName"]}) },
+        Tool { name: "cf_dns_list", description: "List DNS records (id, type, name, content) in one zone. Read-only; no stored credential values.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault"),"zoneId":str_prop("Cloudflare zone id")},"required":["vaultName","zoneId"]}) },
+        Tool { name: "cf_worker_versions", description: "List deployment versions of one Worker (ids and timestamps). Read-only.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault"),"scriptName":str_prop("Worker name")},"required":["vaultName","scriptName"]}) },
+        Tool { name: "vercel_env_sync", description: "Copy one vault credential into a Vercel project environment variable. The vault must hold VERCEL_TOKEN; the value is never returned.", schema: json!({"type":"object","properties":{"sourceVault":str_prop("Vault holding VERCEL_TOKEN and the source credential"),"sourceKey":str_prop("Key of the source credential"),"project":str_prop("Vercel project name or id"),"env":str_prop("Environment variable name; defaults to the source key"),"target":json!({"type":"string","enum":["production","preview","development"]}),"teamId":str_prop("Optional Vercel team id")},"required":["sourceVault","sourceKey","project"]}) },
         Tool { name: "cf_secrets", description: "List/set/delete Worker secrets. Values are write-only.", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault"),"scriptName":str_prop("Worker name"),"action":json!({"type":"string","enum":["list","set","delete"]}),"name":str_prop("Secret name"),"value":str_prop("Secret value; write-only")},"required":["vaultName","scriptName","action"]}) },
         Tool { name: "deploy_targets", description: "List deployment targets. Metadata only.", schema: json!({"type":"object","properties":{}}) },
         Tool { name: "deploy_target_adopt", description: "Discover and idempotently adopt a Pages/Worker target from a Wrangler config in the current workspace. Account and project identity are resolved from the selected Cloudflare vault and live account inventory. Pass allowCreate=true to register a target whose resource does not exist yet; it is created on first deploy (Workers via npm run deploy, D1/R2 bootstrapped from the config's own bindings).", schema: json!({"type":"object","properties":{"vaultName":str_prop("Cloudflare vault; account is resolved from this vault"),"configPath":str_prop("Wrangler JSON/JSONC/TOML config inside the current workspace"),"allowCreate":json!({"type":"boolean","description":"Register even if the Cloudflare resource does not exist yet (created on first deploy)."})},"required":["vaultName","configPath"]}) },
@@ -353,6 +362,10 @@ async fn call_tool(engine: &mut VaultEngine, name: &str, args: &Value) -> Value 
         "vault_unlock" => tool_vault_unlock(engine).await,
         "vault_audit" => tool_vault_audit(engine, args, &ctx).await,
         "vault_meta" => tool_vault_meta(engine, args, &ctx).await,
+        "vault_trash_list" => tool_vault_trash_list(engine, args, &ctx).await,
+        "vault_trash_restore" => tool_vault_trash_restore(engine, args, &ctx).await,
+        "vault_history" => tool_vault_history(engine, args, &ctx).await,
+        "vault_rollback" => tool_vault_rollback(engine, args, &ctx).await,
         "cf_accounts" => tool_cf_accounts(engine, args, &ctx).await,
         "cf_account_label" => tool_cf_account_label(engine, args, &ctx).await,
         "cf_health" => tool_cf_health(engine, args, &ctx).await,
@@ -362,6 +375,9 @@ async fn call_tool(engine: &mut VaultEngine, name: &str, args: &Value) -> Value 
         "cf_d1_list" => tool_cf_storage_list(engine, args, &ctx, StorageKind::D1).await,
         "cf_r2_list" => tool_cf_storage_list(engine, args, &ctx, StorageKind::R2).await,
         "cf_kv_list" => tool_cf_storage_list(engine, args, &ctx, StorageKind::Kv).await,
+        "cf_dns_list" => tool_cf_dns_list(engine, args, &ctx).await,
+        "cf_worker_versions" => tool_cf_worker_versions(engine, args, &ctx).await,
+        "vercel_env_sync" => tool_vercel_env_sync(engine, args, &ctx).await,
         "cf_secrets" => tool_cf_secrets(engine, args, &ctx).await,
         "deploy_targets" => tool_deploy_targets(engine, &ctx).await,
         "deploy_target_adopt" => tool_deploy_target_adopt(engine, args, &ctx).await,
@@ -563,6 +579,18 @@ async fn tool_vault_audit(engine: &mut VaultEngine, args: &Value, _ctx: &CallerC
         ),
         Err(e) => format!("⚠ could not verify audit chain: {e}"),
     };
+
+    if args
+        .get("verify")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return if chain_note.starts_with('✓') {
+            ok(chain_note)
+        } else {
+            fail(chain_note)
+        };
+    }
 
     if out.is_empty() {
         if vault.is_some() || caller.is_some() || after.is_some() {
@@ -785,6 +813,118 @@ async fn tool_cf_storage_list(
     }
 }
 
+async fn tool_cf_dns_list(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
+    require!(args, vault => "vaultName", zone => "zoneId");
+    match engine.dns_list(vault, zone, Some(ctx)).await {
+        Ok(r) => {
+            let records = r
+                .data
+                .get("result")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if records.is_empty() {
+                return ok("No DNS records returned for that zone.");
+            }
+            ok(format!(
+                "DNS records ({}):\n{}",
+                records.len(),
+                records
+                    .iter()
+                    .map(|rec| {
+                        format!(
+                            "  - {} {:<6} {} -> {}{}",
+                            rec.get("id").and_then(|v| v.as_str()).unwrap_or("?"),
+                            rec.get("type").and_then(|v| v.as_str()).unwrap_or("?"),
+                            rec.get("name").and_then(|v| v.as_str()).unwrap_or("?"),
+                            rec.get("content").and_then(|v| v.as_str()).unwrap_or(""),
+                            if rec
+                                .get("proxied")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false)
+                            {
+                                " [proxied]"
+                            } else {
+                                ""
+                            }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ))
+        }
+        Err(e) => fail_err(&e),
+    }
+}
+
+async fn tool_cf_worker_versions(
+    engine: &mut VaultEngine,
+    args: &Value,
+    ctx: &CallerContext,
+) -> Value {
+    require!(args, vault => "vaultName", script => "scriptName");
+    match engine.list_worker_versions(vault, script, Some(ctx)).await {
+        Ok(versions) => {
+            if versions.is_empty() {
+                return ok("No versions returned for that Worker.");
+            }
+            ok(format!(
+                "Worker '{}' versions ({}):\n{}",
+                script,
+                versions.len(),
+                versions
+                    .iter()
+                    .map(|v| {
+                        format!(
+                            "  - {}  {}  {}",
+                            v.get("id").and_then(|x| x.as_str()).unwrap_or("?"),
+                            v.get("created_on")
+                                .or_else(|| v.get("createdOn"))
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("-"),
+                            v.get("author_email")
+                                .or_else(|| v.get("authorEmail"))
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("-")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ))
+        }
+        Err(e) => fail_err(&e),
+    }
+}
+
+async fn tool_vercel_env_sync(
+    engine: &mut VaultEngine,
+    args: &Value,
+    ctx: &CallerContext,
+) -> Value {
+    require!(args, source_vault => "sourceVault", source_key => "sourceKey", project => "project");
+    let env = args.get("env").and_then(|v| v.as_str());
+    let target = args
+        .get("target")
+        .and_then(|v| v.as_str())
+        .unwrap_or("production");
+    let team = args.get("teamId").and_then(|v| v.as_str());
+    match engine
+        .sync_vercel_env(
+            source_vault,
+            source_key,
+            project,
+            env,
+            target,
+            team,
+            Some(ctx),
+        )
+        .await
+    {
+        Ok(status) => ok(status),
+        Err(e) => fail_err(&e),
+    }
+}
+
 async fn tool_cf_secrets(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
     require!(args, vault => "vaultName", script => "scriptName", action => "action");
     let name = args.get("name").and_then(|n| n.as_str());
@@ -896,6 +1036,82 @@ async fn tool_vault_meta(engine: &mut VaultEngine, args: &Value, ctx: &CallerCon
                 .join("\n")
         }
     ))
+}
+
+async fn tool_vault_history(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
+    require!(args, vault => "vaultName", key => "key");
+    match engine.secret_history(vault, key, Some(ctx)) {
+        Ok(list) => {
+            if list.is_empty() {
+                ok(format!("No version history for {}/{}.", vault, key))
+            } else {
+                let lines: Vec<String> = list
+                    .iter()
+                    .enumerate()
+                    .map(|(i, m)| {
+                        format!(
+                            "  [{}] created={} updated={} expired={}",
+                            i, m.created_at, m.updated_at, m.expired
+                        )
+                    })
+                    .collect();
+                ok(format!(
+                    "{} versions for {}/{}:\n{}",
+                    list.len(),
+                    vault,
+                    key,
+                    lines.join("\n")
+                ))
+            }
+        }
+        Err(e) => fail_err(&e),
+    }
+}
+
+async fn tool_vault_rollback(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
+    require!(args, vault => "vaultName", key => "key");
+    let version = match args.get("version").and_then(|v| v.as_u64()) {
+        Some(v) => v as usize,
+        None => return fail("Missing required argument 'version'."),
+    };
+    match engine.rollback_secret(vault, key, version, Some(ctx)) {
+        Ok(true) => ok(format!(
+            "Restored {}/{} to version {}.",
+            vault, key, version
+        )),
+        Ok(false) => fail(format!(
+            "Version {} not found for {}/{}.",
+            version, vault, key
+        )),
+        Err(e) => fail_err(&e),
+    }
+}
+
+async fn tool_vault_trash_list(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
+    require!(args, vault => "vaultName");
+    match engine.list_trash(vault, Some(ctx)) {
+        Ok(items) => {
+            if items.is_empty() {
+                ok(format!("Trash for '{}' is empty.", vault))
+            } else {
+                let lines: Vec<String> = items
+                    .iter()
+                    .map(|t| format!("  {}  deleted={}", t.key, t.deleted_at))
+                    .collect();
+                ok(format!("{} trashed items for '{}':\n{}", items.len(), vault, lines.join("\n")))
+            }
+        }
+        Err(e) => fail_err(&e),
+    }
+}
+
+async fn tool_vault_trash_restore(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
+    require!(args, vault => "vaultName", key => "key");
+    match engine.restore_trash(vault, key, Some(ctx)) {
+        Ok(true) => ok(format!("Restored {}/{} from trash.", vault, key)),
+        Ok(false) => fail(format!("No trashed secret {}/{}.", vault, key)),
+        Err(e) => fail_err(&e),
+    }
 }
 
 async fn tool_vault_generate(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
@@ -1227,7 +1443,7 @@ async fn handle_jsonrpc_message(
                 "id": id,
                 "result": {
                     "protocolVersion": client_version,
-                    "capabilities": { "tools": { "listChanged": false } },
+                    "capabilities": { "tools": { "listChanged": false }, "resources": { "listChanged": false } },
                     "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION }
                 }
             })
@@ -1246,6 +1462,30 @@ async fn handle_jsonrpc_message(
             let result = call_tool(engine, name, &args).await;
             json!({ "jsonrpc": "2.0", "id": id, "result": result })
         }
+        "resources/list" => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": { "resources": resource_list() }
+        }),
+        "resources/read" => {
+            let uri = msg
+                .get("params")
+                .and_then(|p| p.get("uri"))
+                .and_then(|u| u.as_str())
+                .unwrap_or("");
+            match read_resource(engine, uri) {
+                Ok(contents) => json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "contents": contents }
+                }),
+                Err(message) => json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32602, "message": message }
+                }),
+            }
+        }
         _ => json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -1256,6 +1496,44 @@ async fn handle_jsonrpc_message(
     let _ = out.write_all(response.to_string().as_bytes()).await;
     let _ = out.write_all(b"\n").await;
     let _ = out.flush().await;
+}
+
+/// Non-secret resources exposed over MCP. Both are metadata only: agent
+/// policy grants and store state. No resource ever resolves to a value.
+fn resource_list() -> Value {
+    json!([
+        {
+            "uri": "vaultly://policy",
+            "name": "Agent policy",
+            "description": "Effective per-agent operation grants and vault scopes.",
+            "mimeType": "application/json"
+        },
+        {
+            "uri": "vaultly://status",
+            "name": "Vaultly status",
+            "description": "Lock state, killswitch state, vault names, platform and version.",
+            "mimeType": "application/json"
+        }
+    ])
+}
+
+fn read_resource(engine: &mut VaultEngine, uri: &str) -> Result<Vec<Value>, String> {
+    let payload = match uri {
+        "vaultly://policy" => engine.policy_info(),
+        "vaultly://status" => json!({
+            "version": SERVER_VERSION,
+            "platform": std::env::consts::OS,
+            "unlocked": engine.is_unlocked(),
+            "killswitch": engine.store().is_killed(),
+            "vaults": engine.store().list_vaults(),
+        }),
+        _ => return Err(format!("Unknown resource: {uri}")),
+    };
+    Ok(vec![json!({
+        "uri": uri,
+        "mimeType": "application/json",
+        "text": serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".into()),
+    })])
 }
 
 /// Read a password from /dev/tty (keeps stdin free for MCP JSON-RPC).

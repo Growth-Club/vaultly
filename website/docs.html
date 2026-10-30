@@ -1,0 +1,22 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Docs — Vaultly</title><link rel="stylesheet" href="style.css"></head><body>
+<nav><a class="brand" href="index.html">🔐 Vaultly</a><div class="links"><a href="docs.html">Docs</a><a href="security.html">Security</a><a href="compare.html">Compare</a><a href="pricing.html">Pricing</a></div></nav>
+<div class="container">
+<section><h1>Documentation</h1><p class="sub">Diátaxis-shaped: tutorials, how-to, reference, explanation.</p>
+<h2>Quickstart (5 minutes)</h2><pre>vaultly init
+vaultly add prod -k DATABASE_URL -v 'postgres://...'
+vaultly list prod
+vaultly run prod -- npm run migrate
+vaultly deploy api</pre>
+<h2>Core concepts</h2><ul>
+<li><strong>Vault</strong> — an encrypted file holding a map of named credentials.</li>
+<li><strong>Agent mode</strong> — default. Blocks value reads; allows approved operations.</li>
+<li><strong>Human mode</strong> — <code>VAULTLY_HUMAN_MODE=1</code>. Full access, including value reads.</li>
+<li><strong>Deployment target</strong> — registered metadata authorizing a fixed deploy.</li>
+<li><strong>Policy</strong> — owner-managed <code>agent-policy.json</code> granting operations per agent.</li>
+</ul>
+<h2>CLI reference</h2><p>Generated from <code>vaultly --help</code>. See <code>docs/cli-reference.md</code> in the repo.</p>
+<h2>MCP server</h2><p>Start with <code>vaultly mcp</code>. Advertises 31 agent-safe tools over stdio JSON-RPC 2.0.</p>
+<h2>Threat model</h2><p>See <code>docs/threat-model.md</code> in the repository.</p>
+</section>
+<footer>Vaultly — MIT licensed.</footer></div></body></html>

@@ -6,10 +6,10 @@ license.workspace = true
 description = "Vaultly encrypted credential manager with Cloudflare integration"
 
 # cargo-binstall metadata: locates prebuilt binaries in GitHub Releases.
-# Replace OWNER with the real GitHub org/user. Artifact layout matches
-# .github/workflows/release.yml (vaultly-<target>-v<version>.tar.gz).
+# Artifact layout matches .github/workflows/release.yml
+# (vaultly-<target>-v<version>.tar.gz).
 [package.metadata.binstall]
-pkg-url = "https://github.com/OWNER/vaultly/releases/download/v{ version }/vaultly-{ target }-v{ version }.tar.gz"
+pkg-url = "https://github.com/Growth-Club/vaultly/releases/download/v{ version }/vaultly-{ target }-v{ version }.tar.gz"
 bin-dir = "vaultly-{ target }-v{ version }/{ bin }{ binary-ext }"
 
 [dependencies]

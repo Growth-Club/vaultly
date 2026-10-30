@@ -37,6 +37,8 @@ pub enum Operation {
     Run,
     CfApi,
     GithubSync,
+    /// Copy a vault credential into a non-GitHub provider (e.g. Vercel env).
+    SecretSync,
     Admin,
 }
 
@@ -53,8 +55,28 @@ impl Operation {
             Operation::Run => "run",
             Operation::CfApi => "cf_api",
             Operation::GithubSync => "github_sync",
+            Operation::SecretSync => "secret_sync",
             Operation::Admin => "admin",
         }
+    }
+
+    /// Parse an operation name from a policy grant (`vaultly policy grant`).
+    pub fn parse(name: &str) -> Option<Operation> {
+        Some(match name.trim() {
+            "list" => Operation::List,
+            "read_keys" => Operation::ReadKeys,
+            "read_value" => Operation::ReadValue,
+            "write" => Operation::Write,
+            "delete" => Operation::Delete,
+            "delete_vault" => Operation::DeleteVault,
+            "deploy" => Operation::Deploy,
+            "run" => Operation::Run,
+            "cf_api" => Operation::CfApi,
+            "github_sync" => Operation::GithubSync,
+            "secret_sync" => Operation::SecretSync,
+            "admin" => Operation::Admin,
+            _ => return None,
+        })
     }
 }
 
@@ -66,6 +88,7 @@ const DEFAULT_AGENT_OPS: &[Operation] = &[
     Operation::Deploy,
     Operation::CfApi,
     Operation::GithubSync,
+    Operation::SecretSync,
 ];
 // NOTE: read_value, delete_vault, admin are NOT in default agent ops
 
@@ -89,6 +112,7 @@ pub struct AgentPolicy {
     pub vault_roles: BTreeMap<String, String>,
     #[serde(default = "default_max_ops")]
     pub max_ops_per_minute: u32,
+    #[serde(default = "default_created_at")]
     pub created_at: String,
 }
 
@@ -139,6 +163,214 @@ fn default_max_ops() -> u32 {
         .and_then(|v| v.parse().ok())
         .filter(|n| *n > 0)
         .unwrap_or(DEFAULT_MAX_OPS_PER_MINUTE)
+}
+
+fn default_created_at() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+/// Every operation, in stable display order. Used when a `*` grant has to be
+/// narrowed into an explicit list (e.g. revoking one operation).
+pub fn all_operations() -> &'static [Operation] {
+    &[
+        Operation::List,
+        Operation::ReadKeys,
+        Operation::ReadValue,
+        Operation::Write,
+        Operation::Delete,
+        Operation::DeleteVault,
+        Operation::Deploy,
+        Operation::Run,
+        Operation::CfApi,
+        Operation::GithubSync,
+        Operation::SecretSync,
+        Operation::Admin,
+    ]
+}
+
+/// Load `agent-policy.json` as an object keyed by agent name. Both the object
+/// and array file forms are accepted; arrays are normalized to objects so the
+/// owner can grant/revoke without rewriting the file by hand. A missing file
+/// yields an empty object.
+pub fn load_policy_object(
+    path: &std::path::Path,
+) -> Result<serde_json::Map<String, serde_json::Value>> {
+    if !path.exists() {
+        return Ok(serde_json::Map::new());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)?.permissions().mode();
+        if mode & 0o022 != 0 {
+            return Err(VaultError::Policy(format!(
+                "refusing to edit group/other-writable policy file '{}' (mode {:o}); fix with `chmod 600`",
+                path.display(),
+                mode & 0o777
+            )));
+        }
+    }
+    let raw = std::fs::read_to_string(path)?;
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| VaultError::ConfigCorrupt(format!("policy file '{}': {e}", path.display())))?;
+    let mut out = serde_json::Map::new();
+    match value {
+        serde_json::Value::Object(map) => {
+            for (name, body) in map {
+                out.insert(name, body);
+            }
+        }
+        serde_json::Value::Array(entries) => {
+            for entry in entries {
+                let name = entry
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .ok_or_else(|| {
+                        VaultError::ConfigCorrupt(
+                            "policy array entries must carry a name".to_string(),
+                        )
+                    })?
+                    .to_string();
+                out.insert(name, entry);
+            }
+        }
+        _ => {
+            return Err(VaultError::ConfigCorrupt(format!(
+                "policy file '{}' must be a JSON array or object",
+                path.display()
+            )))
+        }
+    }
+    Ok(out)
+}
+
+/// Atomically replace the owner-managed policy file with private (0600)
+/// permissions. The file is written to a temporary sibling and renamed so a
+/// crash can never leave a half-written grant set.
+pub fn save_policy_object(
+    path: &std::path::Path,
+    agents: &serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(agents)?;
+    let tmp = path.with_extension("json.tmp");
+    {
+        use std::io::Write;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp)?;
+        f.write_all(json.as_bytes())?;
+        f.sync_all()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+fn agent_entry_mut<'a>(
+    agents: &'a mut serde_json::Map<String, serde_json::Value>,
+    agent: &str,
+) -> &'a mut serde_json::Map<String, serde_json::Value> {
+    let entry = agents
+        .entry(agent.to_string())
+        .or_insert_with(|| serde_json::json!({ "name": agent }));
+    if !entry.is_object() {
+        *entry = serde_json::json!({ "name": agent });
+    }
+    entry.as_object_mut().expect("entry is an object")
+}
+
+/// Add one operation to an agent's allowlist. When `vault` is given, the grant
+/// is scoped to that vault (the vault list is narrowed if it was `*`).
+pub fn grant_operation(
+    agents: &mut serde_json::Map<String, serde_json::Value>,
+    agent: &str,
+    op: Operation,
+    vault: Option<&str>,
+) -> Result<()> {
+    let entry = agent_entry_mut(agents, agent);
+    entry
+        .entry("name")
+        .or_insert_with(|| serde_json::Value::String(agent.to_string()));
+    entry
+        .entry("created_at")
+        .or_insert_with(|| serde_json::Value::String(default_created_at()));
+
+    let ops = entry.entry("allowed_operations").or_insert_with(|| {
+        serde_json::json!(DEFAULT_AGENT_OPS
+            .iter()
+            .map(|o| o.as_str())
+            .collect::<Vec<_>>())
+    });
+    if ops.as_str() != Some("*") {
+        let list = ops.as_array_mut().ok_or_else(|| {
+            VaultError::ConfigCorrupt("allowed_operations must be \"*\" or an array".into())
+        })?;
+        let name = op.as_str();
+        if !list.iter().any(|v| v.as_str() == Some(name)) {
+            list.push(serde_json::Value::String(name.to_string()));
+        }
+    }
+
+    if let Some(vault) = vault {
+        let vaults = entry
+            .entry("allowed_vaults")
+            .or_insert_with(|| serde_json::json!([vault]));
+        if vaults.as_str() != Some("*") {
+            let list = vaults.as_array_mut().ok_or_else(|| {
+                VaultError::ConfigCorrupt("allowed_vaults must be \"*\" or an array".into())
+            })?;
+            if !list.iter().any(|v| v.as_str() == Some(vault)) {
+                list.push(serde_json::Value::String(vault.to_string()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Remove one operation from an agent's allowlist. A `*` grant is narrowed to
+/// every known operation except `op` so the revocation is effective without
+/// silently dropping unrelated permissions.
+pub fn revoke_operation(
+    agents: &mut serde_json::Map<String, serde_json::Value>,
+    agent: &str,
+    op: Operation,
+) -> Result<bool> {
+    let Some(entry) = agents.get_mut(agent).and_then(|e| e.as_object_mut()) else {
+        return Ok(false);
+    };
+    let Some(ops) = entry.get_mut("allowed_operations") else {
+        return Ok(false);
+    };
+    let name = op.as_str();
+    if ops.as_str() == Some("*") {
+        let narrowed: Vec<serde_json::Value> = all_operations()
+            .iter()
+            .filter(|o| o.as_str() != name)
+            .map(|o| serde_json::Value::String(o.as_str().to_string()))
+            .collect();
+        *ops = serde_json::Value::Array(narrowed);
+        return Ok(true);
+    }
+    let Some(list) = ops.as_array_mut() else {
+        return Err(VaultError::ConfigCorrupt(
+            "allowed_operations must be \"*\" or an array".into(),
+        ));
+    };
+    let before = list.len();
+    list.retain(|v| v.as_str() != Some(name));
+    Ok(list.len() != before)
 }
 
 #[derive(Debug, Clone)]
@@ -565,5 +797,65 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("read_value"));
         assert!(err.to_string().contains("allowed") || err.to_string().contains("Allowed"));
+    }
+
+    #[test]
+    fn grant_scopes_run_to_one_vault_and_roundtrips() {
+        let dir = std::env::temp_dir().join(format!(
+            "vaultly-policy-test-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent-policy.json");
+
+        // Grant `run` scoped to one vault, starting from an empty file (the
+        // agent therefore gets the default ops plus the new grant).
+        let mut agents = load_policy_object(&path).unwrap();
+        grant_operation(&mut agents, "deployer", Operation::Run, Some("cf-acme")).unwrap();
+        save_policy_object(&path, &agents).unwrap();
+
+        let mut loaded = PolicyEngine::new();
+        let n = loaded.load(path.to_str().unwrap()).unwrap();
+        assert!(n >= 2, "default * policy plus the named agent");
+        let ctx = CallerContext {
+            caller: Caller::Agent,
+            agent_name: Some("deployer".into()),
+            session_id: None,
+        };
+        assert!(loaded.check(Some(&ctx), Operation::Run, "cf-acme").is_ok());
+        assert!(loaded
+            .check(Some(&ctx), Operation::Run, "cf-other")
+            .is_err());
+        // Default ops are preserved by the grant.
+        assert!(loaded.check(Some(&ctx), Operation::List, "cf-acme").is_ok());
+
+        // Revoke removes it again.
+        let mut agents = load_policy_object(&path).unwrap();
+        assert!(revoke_operation(&mut agents, "deployer", Operation::Run).unwrap());
+        save_policy_object(&path, &agents).unwrap();
+        let mut loaded = PolicyEngine::new();
+        loaded.load(path.to_str().unwrap()).unwrap();
+        assert!(loaded.check(Some(&ctx), Operation::Run, "cf-acme").is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn revoke_from_wildcard_narrows_instead_of_keeping_all() {
+        let mut agents = serde_json::Map::new();
+        agents.insert(
+            "a".into(),
+            serde_json::json!({
+                "name": "a",
+                "allowed_vaults": "*",
+                "allowed_operations": "*",
+                "max_ops_per_minute": 60
+            }),
+        );
+        assert!(revoke_operation(&mut agents, "a", Operation::Run).unwrap());
+        let ops = agents["a"]["allowed_operations"].as_array().unwrap();
+        assert!(!ops.iter().any(|v| v.as_str() == Some("run")));
+        assert!(ops.iter().any(|v| v.as_str() == Some("deploy")));
     }
 }
