@@ -136,6 +136,57 @@ pub fn approved_target_script(name: &str) -> Option<ApprovedTargetScript> {
         .copied()
 }
 
+/// Resolve the maintenance package and npm working directory from the
+/// registered target, keeping both inside the current workspace. In a
+/// workspace containing several repositories the workspace root may have no
+/// package.json, or may belong to a different application.
+pub(crate) fn target_script_workdir(
+    workspace: &Path,
+    project_dir: &Path,
+    script_name: &str,
+) -> Result<PathBuf, String> {
+    let root =
+        fs::canonicalize(workspace).map_err(|e| format!("cannot resolve repository root: {e}"))?;
+    let target_dir = fs::canonicalize(project_dir).map_err(|e| {
+        format!(
+            "cannot resolve deployment target directory '{}': {e}",
+            project_dir.display()
+        )
+    })?;
+    if !target_dir.starts_with(&root) {
+        return Err(format!(
+            "Agent exec target directory must be inside the current workspace: {}",
+            target_dir.display()
+        ));
+    }
+    let package_path = target_dir.join("package.json");
+    let package_raw = fs::read_to_string(&package_path).map_err(|e| {
+        format!(
+            "cannot read target package.json '{}': {e}",
+            package_path.display()
+        )
+    })?;
+    let package: Value = serde_json::from_str(&package_raw).map_err(|e| {
+        format!(
+            "invalid target package.json '{}': {e}",
+            package_path.display()
+        )
+    })?;
+    if package
+        .get("scripts")
+        .and_then(|s| s.get(script_name))
+        .and_then(Value::as_str)
+        .is_none()
+    {
+        return Err(format!(
+            "Script '{}' is not defined in target package.json '{}'",
+            script_name,
+            package_path.display()
+        ));
+    }
+    Ok(target_dir)
+}
+
 /// Credential keys Vaultly injects into target maintenance subprocesses.
 /// Cloudflare identity plus the conventional encrypted-backup keys; entries
 /// absent from the vault are skipped (never an error — the repository script
@@ -1292,6 +1343,82 @@ fn sanitize_target_id(project: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn target_script_workdir_uses_nested_target_without_workspace_package() {
+        let workspace = tempfile::tempdir().unwrap();
+        let project = workspace.path().join("trace-platform");
+        fs::create_dir(&project).unwrap();
+        fs::write(
+            project.join("package.json"),
+            r#"{"scripts":{"migrate:apply":"wrangler d1 migrations apply DB --remote"}}"#,
+        )
+        .unwrap();
+        let cwd = target_script_workdir(workspace.path(), &project, "migrate:apply").unwrap();
+        assert_eq!(cwd, fs::canonicalize(&project).unwrap());
+    }
+
+    #[test]
+    fn target_script_workdir_never_uses_another_workspace_package() {
+        let workspace = tempfile::tempdir().unwrap();
+        let project = workspace.path().join("trace-platform");
+        fs::create_dir(&project).unwrap();
+        fs::write(
+            workspace.path().join("package.json"),
+            r#"{"scripts":{"migrate:apply":"wrong-application"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            project.join("package.json"),
+            r#"{"scripts":{"smoke":"node smoke.js"}}"#,
+        )
+        .unwrap();
+        let err = target_script_workdir(workspace.path(), &project, "migrate:apply").unwrap_err();
+        assert!(err.contains("not defined in target package.json"), "{err}");
+        assert!(err.contains("trace-platform"), "{err}");
+        assert_eq!(
+            target_script_workdir(workspace.path(), &project, "smoke").unwrap(),
+            fs::canonicalize(&project).unwrap()
+        );
+    }
+
+    #[test]
+    fn target_script_workdir_rejects_outside_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let err = target_script_workdir(workspace.path(), outside.path(), "smoke").unwrap_err();
+        assert!(
+            err.contains("must be inside the current workspace"),
+            "{err}"
+        );
+        #[cfg(unix)]
+        {
+            let link = workspace.path().join("escaped-target");
+            std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+            let err = target_script_workdir(workspace.path(), &link, "smoke").unwrap_err();
+            assert!(
+                err.contains("must be inside the current workspace"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn target_script_workdir_keeps_repository_root_and_invalid_package_behavior() {
+        let workspace = tempfile::tempdir().unwrap();
+        let package = workspace.path().join("package.json");
+        fs::write(&package, r#"{"scripts":{"smoke":"node smoke.js"}}"#).unwrap();
+        assert_eq!(
+            target_script_workdir(workspace.path(), workspace.path(), "smoke").unwrap(),
+            fs::canonicalize(workspace.path()).unwrap()
+        );
+        fs::write(&package, "invalid json").unwrap();
+        assert!(
+            target_script_workdir(workspace.path(), workspace.path(), "smoke")
+                .unwrap_err()
+                .contains("invalid target package.json")
+        );
+    }
 
     fn target() -> DeploymentTarget {
         DeploymentTarget {

@@ -98,8 +98,10 @@ applied vs pending migrations with per-file safety verdicts (destructive
 statements are refused unless guarded by a `_migration_guard_abort`
 trigger, mirroring the repository migration-gate convention).
 
-`deploy_target_exec` runs one approved maintenance script from the
-repository's own `package.json` against the target (`check:migrations`,
+`deploy_target_exec` reads `package.json` and runs npm in the registered
+target's `project_dir`. A parent workspace package cannot supply a missing
+target script, and the canonical target must remain inside the MCP workspace.
+It runs one approved maintenance script against the target (`check:migrations`,
 `backup:d1`, `backup:verify`, `migrate:apply`, `watchdog`, `smoke`,
 `purge:test-accounts`). The
 agent supplies only the target ID, the script name, and — for mutating
