@@ -1,20 +1,32 @@
 <!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Security — Vaultly</title><link rel="stylesheet" href="style.css"></head><body>
-<nav><a class="brand" href="index.html">🔐 Vaultly</a><div class="links"><a href="docs.html">Docs</a><a href="security.html">Security</a><a href="compare.html">Compare</a><a href="pricing.html">Pricing</a></div></nav>
+<title>Security — Vaultly</title><link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css"></head><body>
+<nav><a class="brand" href="index.html">🔐 Vaultly</a><div class="links">
+<a href="docs.html">Docs</a><a href="security.html">Security</a><a href="compare.html">Compare</a><a href="pricing.html">Pricing</a><a href="changelog.html">Changelog</a>
+<a class="cta" href="https://github.com/Growth-Club/vaultly">GitHub</a></div></nav>
+<div class="pagehead"><h1>Security model</h1><p>What Vaultly protects against, and what it explicitly does not.</p></div>
 <div class="container">
-<section><h1>Security model</h1><p class="sub">What Vaultly protects against, and what it explicitly does not.</p>
+<section style="padding-top:1rem">
 <div class="grid">
-<div class="card"><h3>Crypto</h3><p>AES-256-GCM with a 16-byte nonce, PBKDF2-SHA256 at 600k iterations, per-vault encrypted blobs. Master key never stored; derived on unlock and held in memory only.</p></div>
-<div class="card"><h3>Storage</h3><p>Vault files are 0600, directory 0700. Atomic writes with fsync. Inter-process write lock with stale recovery.</p></div>
-<div class="card"><h3>Agent boundary</h3><p>Agents cannot call <code>get</code>, <code>env</code>, <code>export</code>, or generic <code>run</code>. Secret values are scrubbed from all subprocess output. Only metadata and status cross the boundary.</p></div>
-<div class="card"><h3>Audit</h3><p>Every operation is appended to a hash-chained log (prevHash). Tampering breaks the chain and is detected by <code>vaultly audit --verify</code>.</p></div>
-<div class="card"><h3>Supply chain</h3><p>SHA-256 checksums, GitHub artifact attestations, immutable releases, cosign keyless signatures, SBOM per archive, pinned actions.</p></div>
-<div class="card"><h3>Threat model</h3><p>Protects against: leaked agent transcripts, prompt injection, compromised CI logs. Does not protect against: a compromised host with root access, or a malicious maintainer build.</p></div>
+<div class="card"><div class="icon">🔒</div><h3>Cryptography</h3><p>AES-256-GCM with a 16-byte nonce, PBKDF2-SHA256 at 600k iterations. Master key is never stored; derived on unlock and held in memory only.</p></div>
+<div class="card"><div class="icon">📁</div><h3>Storage</h3><p>Vault files are 0600, directory 0700. Atomic writes with fsync. Inter-process write lock with stale recovery. Audit log hash-chained (prevHash).</p></div>
+<div class="card"><div class="icon">🤖</div><h3>Agent boundary</h3><p>Agents cannot call <code>get</code>, <code>env</code>, <code>export</code> or generic <code>run</code>. Secret values are scrubbed from all subprocess output. Only metadata and status cross the boundary.</p></div>
+<div class="card"><div class="icon">📋</div><h3>Audit</h3><p>Every operation is appended to a hash-chained log. Tampering breaks the chain and is detected by <code>vaultly audit --verify</code>.</p></div>
+<div class="card"><div class="icon">📦</div><h3>Supply chain</h3><p>SHA-256 checksums, GitHub artifact attestations, immutable releases, cosign keyless signatures, SBOM per archive, pinned actions, Dependabot + CodeQL.</p></div>
+<div class="card"><div class="icon">⚠️</div><h3>Threat model</h3><p>Protects against: leaked agent transcripts, prompt injection, compromised CI logs. Does not protect against: a compromised host with root access, or a malicious maintainer build.</p></div>
 </div>
 </section>
-<section><h2>Verify a download</h2><pre>gh attestation verify ./vaultly -R riverraftlabs/vaultly
-cosign verify-blob --certificate-identity-regexp 'https://github.com/riverraftlabs/.*' \
+<section>
+<h2>Verify a download</h2>
+<pre>gh attestation verify ./vaultly -R Growth-Club/vaultly
+cosign verify-blob --certificate-identity-regexp 'https://github.com/Growth-Club/.*' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  vaultly checksums.txt</pre></section>
-<section><h2>Disclosure</h2><p>Report vulnerabilities via GitHub private vulnerability reporting. We aim to respond within 72 hours and publish advisories with credit.</p></section>
-<footer>Vaultly — MIT licensed.</footer></div></body></html>
+  vaultly checksums.txt</pre>
+</section>
+<section>
+<h2>Disclosure</h2>
+<p>Report vulnerabilities via <a href="https://github.com/Growth-Club/vaultly/security/advisories/new">GitHub private vulnerability reporting</a>. We aim to respond within 72 hours and publish advisories with credit.</p>
+</section>
+</div>
+<footer><div class="container"><div class="bottom">© 2026 Vaultly · MIT licensed.</div></div></footer>
+</body></html>

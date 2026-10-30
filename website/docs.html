@@ -1,22 +1,33 @@
 <!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Docs — Vaultly</title><link rel="stylesheet" href="style.css"></head><body>
-<nav><a class="brand" href="index.html">🔐 Vaultly</a><div class="links"><a href="docs.html">Docs</a><a href="security.html">Security</a><a href="compare.html">Compare</a><a href="pricing.html">Pricing</a></div></nav>
+<title>Docs — Vaultly</title><link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css"></head><body>
+<nav><a class="brand" href="index.html">🔐 Vaultly</a><div class="links">
+<a href="docs.html">Docs</a><a href="security.html">Security</a><a href="compare.html">Compare</a><a href="pricing.html">Pricing</a><a href="changelog.html">Changelog</a>
+<a class="cta" href="https://github.com/Growth-Club/vaultly">GitHub</a></div></nav>
+<div class="pagehead"><h1>Documentation</h1><p>Diátaxis-shaped: tutorials, how-to guides, reference, explanation.</p></div>
 <div class="container">
-<section><h1>Documentation</h1><p class="sub">Diátaxis-shaped: tutorials, how-to, reference, explanation.</p>
-<h2>Quickstart (5 minutes)</h2><pre>vaultly init
+<section style="padding-top:1rem">
+<div class="grid">
+<div class="card"><div class="icon">🚀</div><h3>Quickstart</h3><p>From zero to a deployed Worker in 5 minutes.</p><pre>vaultly init
 vaultly add prod -k DATABASE_URL -v 'postgres://...'
 vaultly list prod
 vaultly run prod -- npm run migrate
-vaultly deploy api</pre>
-<h2>Core concepts</h2><ul>
-<li><strong>Vault</strong> — an encrypted file holding a map of named credentials.</li>
-<li><strong>Agent mode</strong> — default. Blocks value reads; allows approved operations.</li>
-<li><strong>Human mode</strong> — <code>VAULTLY_HUMAN_MODE=1</code>. Full access, including value reads.</li>
+vaultly deploy api</pre></div>
+<div class="card"><div class="icon">📖</div><h3>Core concepts</h3><ul>
+<li><strong>Vault</strong> — encrypted file holding a map of named credentials.</li>
+<li><strong>Agent mode</strong> — default. Blocks value reads; allows approved ops.</li>
+<li><strong>Human mode</strong> — <code>VAULTLY_HUMAN_MODE=1</code>. Full access.</li>
 <li><strong>Deployment target</strong> — registered metadata authorizing a fixed deploy.</li>
-<li><strong>Policy</strong> — owner-managed <code>agent-policy.json</code> granting operations per agent.</li>
-</ul>
-<h2>CLI reference</h2><p>Generated from <code>vaultly --help</code>. See <code>docs/cli-reference.md</code> in the repo.</p>
-<h2>MCP server</h2><p>Start with <code>vaultly mcp</code>. Advertises 31 agent-safe tools over stdio JSON-RPC 2.0.</p>
-<h2>Threat model</h2><p>See <code>docs/threat-model.md</code> in the repository.</p>
+<li><strong>Policy</strong> — owner-managed <code>agent-policy.json</code>.</li>
+<li><strong>Trash</strong> — soft-deleted secrets, recoverable.</li>
+</ul></div>
+<div class="card"><div class="icon">🤖</div><h3>MCP server</h3><p>Start with <code>vaultly mcp</code>. Advertises 38 agent-safe tools over stdio JSON-RPC 2.0. Works with Claude Code, Cursor, Codex, OpenCode.</p></div>
+<div class="card"><div class="icon">🔍</div><h3>CLI reference</h3><p>Generated from <code>vaultly --help</code>. See <code>docs/cli-reference.md</code> in the repo.</p></div>
+<div class="card"><div class="icon">☁️</div><h3>Cloudflare</h3><p>Accounts, zones, Workers, D1, R2, KV discovery. Adopt targets from a Wrangler config; bootstrap missing resources.</p></div>
+<div class="card"><div class="icon">🛡️</div><h3>Threat model</h3><p>See <code>docs/threat-model.md</code> in the repository for the full trust boundary analysis.</p></div>
+</div>
 </section>
-<footer>Vaultly — MIT licensed.</footer></div></body></html>
+<section class="ctaband"><h2>Need help?</h2><p>Open an issue or start a discussion on GitHub.</p><div class="cta"><a class="btn primary" href="https://github.com/Growth-Club/vaultly/issues">Open an issue</a><a class="btn" href="https://github.com/Growth-Club/vaultly/discussions">Discussions</a></div></section>
+</div>
+<footer><div class="container"><div class="bottom">© 2026 Vaultly · MIT licensed.</div></div></footer>
+</body></html>

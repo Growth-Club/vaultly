@@ -1,19 +1,27 @@
 <!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Compare — Vaultly</title><link rel="stylesheet" href="style.css"></head><body>
-<nav><a class="brand" href="index.html">🔐 Vaultly</a><div class="links"><a href="docs.html">Docs</a><a href="security.html">Security</a><a href="compare.html">Compare</a><a href="pricing.html">Pricing</a></div></nav>
+<title>Compare — Vaultly</title><link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css"></head><body>
+<nav><a class="brand" href="index.html">🔐 Vaultly</a><div class="links">
+<a href="docs.html">Docs</a><a href="security.html">Security</a><a href="compare.html">Compare</a><a href="pricing.html">Pricing</a><a href="changelog.html">Changelog</a>
+<a class="cta" href="https://github.com/Growth-Club/vaultly">GitHub</a></div></nav>
+<div class="pagehead"><h1>How Vaultly compares</h1><p>Capability matrix against the most common alternatives.</p></div>
 <div class="container">
-<section><h1>How Vaultly compares</h1><p class="sub">Capability matrix against common alternatives.</p>
+<section style="padding-top:1rem">
 <table>
 <tr><th>Capability</th><th>Vaultly</th><th>Doppler</th><th>Infisical</th><th>1Password</th><th>HashiCorp Vault</th></tr>
 <tr><td>Agent never receives values (default)</td><td>✓</td><td>✗</td><td>partial</td><td>✗</td><td>✗</td></tr>
-<tr><td>Policy-gated deploy/exec</td><td>✓</td><td>✗</td><td>✗</td><td>✗</td><td>policy</td></tr>
-<tr><td>MCP server</td><td>✓ 31 tools</td><td>experimental</td><td>partial</td><td>✗</td><td>✗</td></tr>
-<tr><td>Cloudflare D1/R2 bootstrap</td><td>✓</td><td>✗</td><td>✗</td><td>✗</td><td>✗</td></tr>
+<tr><td>Policy-gated deploy / exec</td><td>✓</td><td>✗</td><td>✗</td><td>✗</td><td>policy</td></tr>
+<tr><td>MCP server</td><td>✓ 38 tools</td><td>experimental</td><td>partial</td><td>✗</td><td>✗</td></tr>
+<tr><td>Cloudflare D1 / R2 bootstrap</td><td>✓</td><td>✗</td><td>✗</td><td>✗</td><td>✗</td></tr>
 <tr><td>Tamper-evident audit</td><td>✓</td><td>retention</td><td>✓</td><td>usage</td><td>audit devices</td></tr>
 <tr><td>Local encrypted dev</td><td>✓</td><td>✗</td><td>self-host</td><td>✗</td><td>self-host</td></tr>
+<tr><td>Secret versioning + rollback</td><td>✓</td><td>✓</td><td>✓</td><td>items</td><td>KV v2</td></tr>
+<tr><td>Soft delete (trash)</td><td>✓</td><td>✗</td><td>✗</td><td>trash</td><td>soft delete</td></tr>
+<tr><td>Secret references</td><td>✓</td><td>✓</td><td>✓</td><td>op://</td><td>✗</td></tr>
 <tr><td>Free &amp; open source</td><td>✓ MIT</td><td>limited</td><td>core MIT</td><td>✗</td><td>BSL</td></tr>
-<tr><td>Secret versioning</td><td>✓</td><td>✓</td><td>✓</td><td>items</td><td>KV v2</td></tr>
 </table>
-<p style="margin-top:1rem;color:var(--muted)">"in progress" marks features on the Vaultly roadmap derived from competitor research.</p>
+<p style="margin-top:1.5rem;color:var(--muted);font-size:.9rem">Vaultly is agent-first by default; competitors are human-first with agent features bolted on.</p>
 </section>
-<footer>Vaultly — MIT licensed.</footer></div></body></html>
+</div>
+<footer><div class="container"><div class="bottom">© 2026 Vaultly · MIT licensed.</div></div></footer>
+</body></html>
