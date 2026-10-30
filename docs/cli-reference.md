@@ -141,9 +141,14 @@ vaultly exec <ID> <script> [--confirm WORD] --json
 secret names, and per-D1-database applied/pending migrations with safety
 verdicts. Run it before any deploy or migration.
 
-`exec` runs one approved maintenance script from the repo's own
-`package.json` (`check:migrations`, `backup:d1`, `backup:verify`,
-`migrate:apply`, `watchdog`, `smoke`, `purge:test-accounts`) with the target's Cloudflare scope
+`exec` reads `package.json` and runs npm in the registered target's
+`project_dir`, including when the CLI starts in a parent workspace containing
+several repositories. The target must remain inside that workspace. Scripts
+defined only in a parent package are not used; expose the intended maintenance
+entry point in the target package.
+
+The approved scripts (`check:migrations`, `backup:d1`, `backup:verify`,
+`migrate:apply`, `watchdog`, `smoke`, `purge:test-accounts`) run with the target's Cloudflare scope
 plus `D1_BACKUP_*` keys when the vault holds them. Mutating scripts require
 the typed confirmation (`APPLY`, `BACKUP`, `PURGE`) and fail closed on unsafe or unverifiable migration
 state. Execution is gated on the `run` policy operation (default-deny for

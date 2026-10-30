@@ -15,9 +15,9 @@ use crate::crypto::SecretMeta;
 use crate::deploy::{
     approved_target_script, discover_deployment_spec, extract_secret_names, is_migration_file,
     migration_safety_verdict, parse_d1_migration_query, patch_d1_database_id, pending_migrations,
-    target_exec_allowed_keys, wrangler_d1_bindings, wrangler_r2_bindings, D1Preflight,
-    DeploymentProvider, DeploymentResult, DeploymentTarget, TargetExecResult, TargetPreflight,
-    APPROVED_TARGET_SCRIPTS,
+    target_exec_allowed_keys, target_script_workdir, wrangler_d1_bindings, wrangler_r2_bindings,
+    D1Preflight, DeploymentProvider, DeploymentResult, DeploymentTarget, TargetExecResult,
+    TargetPreflight, APPROVED_TARGET_SCRIPTS,
 };
 use crate::error::{Result, VaultError};
 use crate::policy::{CallerContext, Operation, PolicyEngine};
@@ -1169,35 +1169,8 @@ Run this command from the repository that owns '{}' (its root or a subdirectory)
                 .map_err(|e| VaultError::Policy(format!("cannot resolve repository root: {e}")))?,
         )
         .map_err(|e| VaultError::Policy(format!("cannot resolve repository root: {e}")))?;
-        let target_dir = fs::canonicalize(&target.project_dir).map_err(|e| {
-            VaultError::Policy(format!(
-                "cannot resolve deployment target directory '{}': {e}",
-                target.project_dir
-            ))
-        })?;
-        if !target_dir.starts_with(&root) {
-            return Err(VaultError::Policy(format!(
-                "Agent exec target directory must be inside the current workspace: {}. \
-Run this command from the repository that owns '{}' (its root or a subdirectory).",
-                target_dir.display(),
-                target.project_dir
-            )));
-        }
-        let package_raw = fs::read_to_string(root.join("package.json"))
-            .map_err(|e| VaultError::Policy(format!("cannot read repository package.json: {e}")))?;
-        let package: Value = serde_json::from_str(&package_raw)
-            .map_err(|e| VaultError::Policy(format!("invalid repository package.json: {e}")))?;
-        if package
-            .get("scripts")
-            .and_then(|s| s.get(script_name))
-            .and_then(Value::as_str)
-            .is_none()
-        {
-            return Err(VaultError::Policy(format!(
-                "Script '{}' is not defined in the repository package.json",
-                script_name
-            )));
-        }
+        let script_dir = target_script_workdir(&root, Path::new(&target.project_dir), script_name)
+            .map_err(VaultError::Policy)?;
 
         // Defense in depth for mutations: Vaultly independently refuses when
         // it can see pending destructive-but-unguarded migrations, or when it
@@ -1233,14 +1206,14 @@ Run this command from the repository that owns '{}' (its root or a subdirectory)
         }
 
         let allowed = target_exec_allowed_keys();
-        let root_str = root.to_string_lossy().to_string();
+        let script_dir_str = script_dir.to_string_lossy().to_string();
         let result = self
             .run_with_secrets(
                 &target.vault,
                 "npm",
                 &["run".to_string(), script_name.to_string()],
                 &RunOptions {
-                    cwd: Some(root_str.as_str()),
+                    cwd: Some(script_dir_str.as_str()),
                     timeout_ms: Some(1_800_000),
                     allowed_keys: Some(&allowed),
                 },

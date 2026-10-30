@@ -7,7 +7,10 @@ on:
 
 jobs:
   rust-test:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     defaults:
       run:
         working-directory: rust
@@ -21,4 +24,10 @@ jobs:
           workspaces: rust
       - run: cargo fmt --check
       - run: cargo test --workspace
+      - name: Repeat target maintenance path regressions 100 times
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 100); do
+            cargo test --locked -q -p vaultly-core target_script_workdir
+          done
       - run: cargo clippy --workspace --all-targets -- -D warnings
