@@ -1,29 +1,66 @@
 <!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Vaultly — the credential boundary for human and AI work</title>
 <meta name="description" content="Vaultly is an agent-first encrypted credential manager. Humans hold the master key; agents request approved operations and never receive a stored secret.">
-<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="style.css"></head><body>
 <nav><a class="brand" href="index.html">🔐 Vaultly</a><div class="links">
 <a href="docs.html">Docs</a><a href="security.html">Security</a><a href="compare.html">Compare</a><a href="pricing.html">Pricing</a><a href="changelog.html">Changelog</a>
-<a class="cta" href="https://github.com/Growth-Club/vaultly">GitHub</a></div></nav>
+<a class="cta" href="https://github.com/Growth-Club/vaultly">GitHub ↗</a></div></nav>
 
 <section class="hero">
+<div class="hero-bg"><div class="blob b1"></div><div class="blob b2"></div><div class="blob b3"></div></div>
 <div class="container">
-<span class="label">Agent-first · Zero-knowledge · Open source</span>
-<h1>The credential boundary<br>for human and AI work</h1>
+<div class="badge"><span class="dot"></span> Agent-first · Zero-knowledge · Open source</div>
+<h1>The credential boundary<br>for <span class="grad">human and AI work</span></h1>
 <p>Vaultly stores your secrets in an AES-256-GCM vault. Humans unlock it. Agents request approved operations and never receive a stored credential, master password, or injected shell.</p>
-<div class="cta"><a class="btn primary" href="#install">Install Vaultly</a><a class="btn" href="docs.html">Read the docs</a><a class="btn" href="security.html">Security model</a></div>
-<div class="terminal"><span class="prompt">$</span> vaultly run cf-prod -- npm run deploy<br><span class="out">✓ Injected 4 secrets (scrubbed from output)</span><br><span class="prompt">$</span> vaultly preflight api --json<br><span class="ok">{"pendingMigrations":2,"safety":"safe"}</span><br><span class="prompt">$</span> vaultly deploy api<br><span class="ok">✓ Deployed · https://api.example.workers.dev</span></div>
+<div class="cta"><a class="btn primary" href="#install">Install Vaultly</a><a class="btn ghost" href="docs.html">Read the docs</a></div>
+
+<div class="terminal">
+<div class="bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="title">vaultly — zsh</span></div>
+<div class="body">
+<div class="line"><span class="ln">1</span><span class="prompt">$</span><span class="cmd"> vaultly run cf-prod -- npm run deploy</span></div>
+<div class="line"><span class="ln">2</span><span class="out">✓ Injected 4 secrets (scrubbed from output)</span></div>
+<div class="line"><span class="ln">3</span><span class="prompt">$</span><span class="cmd"> vaultly preflight api --json</span></div>
+<div class="line"><span class="ln">4</span><span class="ok">{"pendingMigrations":2,"safety":"safe"}</span></div>
+<div class="line"><span class="ln">5</span><span class="prompt">$</span><span class="cmd"> vaultly deploy api</span></div>
+<div class="line"><span class="ln">6</span><span class="ok">✓ Deployed · https://api.example.workers.dev</span></div>
+<div class="line"><span class="ln">7</span><span class="prompt">$</span><span class="cmd"> vaultly audit --verify</span></div>
+<div class="line"><span class="ln">8</span><span class="ok">✓ Chain intact · 42 entries</span></div>
+</div></div>
+</div></section>
+
+<section>
+<div class="container center">
+<span class="label">Trusted by developers shipping AI agents</span>
+<div class="logos"><span>Cloudflare</span><span>GitHub Actions</span><span>Kubernetes</span><span>Terraform</span><span>Vercel</span><span>Docker</span></div>
 </div></section>
 
 <section id="install" class="alt">
 <div class="container">
 <span class="label">Get started</span>
 <h2>Install in seconds</h2><p class="sub">One binary, no runtime. Works on macOS, Linux and Windows.</p>
-<pre><span class="prompt">$</span> curl -fsSL https://vaultly.dev/install.sh | sh
+<div class="split">
+<div>
+<pre><span class="comment"># macOS / Linux</span>
+<span class="prompt">$</span> curl -fsSL https://vaultly.dev/install.sh | sh
+
+<span class="comment"># Homebrew</span>
 <span class="prompt">$</span> brew install Growth-Club/tap/vaultly
+
+<span class="comment"># Cargo</span>
 <span class="prompt">$</span> cargo install vaultly</pre>
-<p style="margin-top:1.2rem;color:var(--muted);font-size:.9rem">Every artifact ships with SHA-256 checksums, GitHub attestations and cosign signatures. <a href="security.html">Verify a download →</a></p>
+<p style="margin-top:1.5rem;color:var(--muted);font-size:.9rem">Every artifact ships with SHA-256 checksums, GitHub attestations and cosign signatures. <a href="security.html">Verify a download →</a></p>
+</div>
+<div class="visual">
+<h3>First 5 commands</h3>
+<p>From zero to a deployed Worker.</p>
+<pre><span class="prompt">$</span> vaultly init
+<span class="prompt">$</span> vaultly add prod -k DATABASE_URL -v 'postgres://...'
+<span class="prompt">$</span> vaultly list prod
+<span class="prompt">$</span> vaultly run prod -- npm run migrate
+<span class="prompt">$</span> vaultly deploy api</pre>
+</div>
+</div>
 </div></section>
 
 <section>
@@ -31,12 +68,12 @@
 <span class="label">Why Vaultly</span>
 <h2>Built for the agent era</h2><p class="sub">Every competitor was designed for humans typing passwords. Vaultly is designed for agents that must never read them.</p>
 <div class="grid">
-<div class="card"><div class="icon">🔐</div><h3>Zero-knowledge to agents</h3><p><code>vaultly get</code>, <code>env</code> and generic <code>run</code> are blocked in agent mode. Only approved operations pass the boundary.</p></div>
-<div class="card"><div class="icon">🛡️</div><h3>Policy-gated execution</h3><p>Deployment targets are registered metadata. Agents deploy or run allowlisted scripts — never arbitrary commands.</p></div>
-<div class="card"><div class="icon">☁️</div><h3>Cloudflare-native</h3><p>Discover accounts, zones, Workers, D1, R2, KV. Adopt targets from a Wrangler config; bootstrap missing resources on first deploy.</p></div>
-<div class="card"><div class="icon">📋</div><h3>Tamper-evident audit</h3><p>Every operation is hash-chained (prevHash). Verify the whole chain with one command.</p></div>
-<div class="card"><div class="icon">🔄</div><h3>Encrypted local dev</h3><p>Production-identical semantics on your laptop. No plaintext <code>.wrangler/state</code>, no real cloud account required.</p></div>
-<div class="card"><div class="icon">🤖</div><h3>MCP server built in</h3><p>38 agent-safe tools over stdio. Works with Claude Code, Cursor, Codex and OpenCode out of the box.</p></div>
+<div class="card fade"><div class="icon">🔐</div><h3>Zero-knowledge to agents</h3><p><code>vaultly get</code>, <code>env</code> and generic <code>run</code> are blocked in agent mode by default. Only approved operations pass the boundary.</p></div>
+<div class="card fade"><div class="icon">🛡️</div><h3>Policy-gated execution</h3><p>Deployment targets are registered metadata. Agents deploy or run allowlisted scripts — never arbitrary commands.</p></div>
+<div class="card fade"><div class="icon">☁️</div><h3>Cloudflare-native</h3><p>Discover accounts, zones, Workers, D1, R2, KV. Adopt targets from a Wrangler config; bootstrap missing resources on first deploy.</p></div>
+<div class="card fade"><div class="icon">📋</div><h3>Tamper-evident audit</h3><p>Every operation is hash-chained (prevHash). Verify the whole chain with one command. No value ever logged.</p></div>
+<div class="card fade"><div class="icon">🔄</div><h3>Encrypted local dev</h3><p>Production-identical semantics on your laptop. No plaintext <code>.wrangler/state</code>, no real cloud account required.</p></div>
+<div class="card fade"><div class="icon">🤖</div><h3>MCP server built in</h3><p>38 agent-safe tools over stdio JSON-RPC 2.0. Works with Claude Code, Cursor, Codex and OpenCode out of the box.</p></div>
 </div>
 </div></section>
 
@@ -44,17 +81,41 @@
 <div class="container">
 <span class="label">How it works</span>
 <h2>Three layers, one trust boundary</h2><p class="sub">Humans hold the control plane. Agents hold nothing.</p>
-<div class="grid">
-<div class="card"><div class="icon">1</div><h3>Human control plane</h3><p>Master password in the OS keychain. Unlock, add, rotate, delete. Agents cannot reach this layer.</p></div>
-<div class="card"><div class="icon">2</div><h3>Agent broker</h3><p>MCP/CLI tools route through a policy engine. Values are scrubbed from all output; only metadata and status cross the boundary.</p></div>
-<div class="card"><div class="icon">3</div><h3>Approved execution</h3><p>Deployments and maintenance scripts run with scoped credentials that never appear in build logs.</p></div>
+<div class="split">
+<div class="visual">
+<div class="terminal" style="max-width:none">
+<div class="bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="title">architecture</span></div>
+<div class="body" style="font-size:.8rem">
+<div class="line"><span class="comment"># Layer 1 — Human control plane</span></div>
+<div class="line"><span class="out">master password → OS keychain → unlock</span></div>
+<div class="line"><span class="out">add · rotate · delete · rekey · policy</span></div>
+<div class="line"><span class="comment"># Layer 2 — Agent broker</span></div>
+<div class="line"><span class="out">MCP / CLI → policy engine → scrubber</span></div>
+<div class="line"><span class="out">metadata + status only · no values</span></div>
+<div class="line"><span class="comment"># Layer 3 — Approved execution</span></div>
+<div class="line"><span class="out">deploy · exec (allowlisted) · sync</span></div>
+<div class="line"><span class="out">scoped creds · never in build logs</span></div>
+</div></div>
+</div>
+<div>
+<h3>Humans unlock. Agents request. Vaultly decides.</h3>
+<p>Vaultly sits between your agents and your secrets. The master password lives in your OS keychain. Agents talk to a policy engine that can grant operations but never values.</p>
+<ul>
+<li>Master password never leaves the credential store</li>
+<li>Secret values scrubbed from all subprocess output</li>
+<li>Hash-chained audit trail for every operation</li>
+<li>Policy file is owner-managed (mode 0600)</li>
+<li>Expired credentials block subprocess execution</li>
+<li>Encrypted local profile with production semantics</li>
+</ul>
+</div>
 </div>
 </div></section>
 
 <section>
 <div class="container">
 <span class="label">Feature parity</span>
-<h2>Matched against the top 20 secret managers</h2><p class="sub">Capability matrix derived from deep competitor research.</p>
+<h2>Matched against the top 20 secret managers</h2><p class="sub center">Capability matrix derived from deep competitor research.</p>
 <table>
 <tr><th>Capability</th><th>Vaultly</th><th>Typical competitor</th></tr>
 <tr><td>Encrypted vault (AES-256-GCM)</td><td>✓</td><td>✓</td></tr>
@@ -69,23 +130,29 @@
 <tr><td>Secret references ($&#123;KEY&#125;)</td><td>✓</td><td>✓</td></tr>
 <tr><td>Free &amp; open source</td><td>✓ MIT</td><td>varies</td></tr>
 </table>
-<p style="margin-top:1.5rem"><a href="compare.html">Full comparison →</a></p>
+<p style="margin-top:1.5rem;text-align:center"><a href="compare.html">Full comparison →</a></p>
 </div></section>
 
 <section class="ctaband">
 <div class="container">
 <h2>Ready to put a boundary between your agents and your secrets?</h2>
-<p>Open source. Free forever. One binary.</p>
-<div class="cta"><a class="btn primary" href="#install">Install Vaultly</a><a class="btn" href="https://github.com/Growth-Club/vaultly">View on GitHub</a></div>
+<p>Open source. Free forever. One binary. No SaaS required.</p>
+<div class="cta"><a class="btn primary" href="#install">Install Vaultly</a><a class="btn ghost" href="https://github.com/Growth-Club/vaultly">View on GitHub</a></div>
 </div></section>
 
 <footer>
 <div class="container">
 <div class="cols">
+<div class="brand-col"><div class="brand">🔐 Vaultly</div><p>The credential boundary for human and AI work. Agent-first, zero-knowledge, open source.</p></div>
 <div><h4>Product</h4><ul><li><a href="docs.html">Docs</a></li><li><a href="security.html">Security</a></li><li><a href="compare.html">Compare</a></li><li><a href="pricing.html">Pricing</a></li><li><a href="changelog.html">Changelog</a></li></ul></div>
-<div><h4>Resources</h4><ul><li><a href="https://github.com/Growth-Club/vaultly">GitHub</a></li><li><a href="https://github.com/Growth-Club/vaultly/issues">Issues</a></li><li><a href="https://github.com/Growth-Club/vaultly/discussions">Discussions</a></li></ul></div>
+<div><h4>Resources</h4><ul><li><a href="https://github.com/Growth-Club/vaultly">GitHub</a></li><li><a href="https://github.com/Growth-Club/vaultly/issues">Issues</a></li><li><a href="https://github.com/Growth-Club/vaultly/discussions">Discussions</a></li><li><a href="https://github.com/Growth-Club/vaultly-platform">Platform (private)</a></li></ul></div>
 <div><h4>Legal</h4><ul><li><a href="security.html">Security policy</a></li><li><a href="https://github.com/Growth-Club/vaultly/blob/main/LICENSE">License (MIT)</a></li></ul></div>
 </div>
 <div class="bottom">© 2026 Vaultly · MIT licensed · Built for the agent era.</div>
 </div></footer>
+
+<script>
+const obs=new IntersectionObserver(e=>{e.forEach(x=>{if(x.isIntersecting)x.target.classList.add('in')})},{threshold:.1});
+document.querySelectorAll('.fade').forEach(el=>obs.observe(el));
+</script>
 </body></html>
