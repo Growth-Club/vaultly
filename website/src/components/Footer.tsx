@@ -4,7 +4,7 @@ export default function Footer() {
       <div className="container">
         <div className="grid grid-cols-1 md:grid-cols-4 gap-10 mb-12">
           <div>
-            <div className="font-extrabold text-xl mb-3">🔐 Vaultly</div>
+            <div className="font-extrabold text-xl mb-3 flex items-center gap-2"><img src="/logo.svg" alt="Vaultly" className="w-7 h-7" /> Vaultly</div>
             <p className="text-muted text-sm leading-relaxed">The credential boundary for human and AI work. Agent-first, zero-knowledge, open source.</p>
           </div>
           <div>

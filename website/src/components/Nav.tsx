@@ -1,7 +1,10 @@
 export default function Nav() {
   return (
     <nav className="sticky top-0 z-50 flex items-center justify-between px-6 md:px-10 py-4 bg-black/70 backdrop-blur-xl border-b border-white/8">
-      <a href="/" className="font-extrabold text-lg tracking-tight">🔐 Vaultly</a>
+      <a href="/" className="font-extrabold text-lg tracking-tight flex items-center gap-2">
+        <img src="/logo.svg" alt="Vaultly" className="w-7 h-7" />
+        <span>Vaultly</span>
+      </a>
       <div className="hidden md:flex items-center gap-8 text-sm font-medium text-muted">
         <a href="/docs" className="hover:text-fg transition">Docs</a>
         <a href="/security" className="hover:text-fg transition">Security</a>

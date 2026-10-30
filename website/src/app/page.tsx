@@ -3,7 +3,10 @@ export default function Home() {
     <main className="min-h-screen bg-bg text-fg">
       {/* Nav */}
       <nav className="sticky top-0 z-50 flex items-center justify-between px-6 md:px-10 py-4 bg-black/70 backdrop-blur-xl border-b border-white/8">
-        <a href="/" className="font-extrabold text-lg tracking-tight">🔐 Vaultly</a>
+        <a href="/" className="font-extrabold text-lg tracking-tight flex items-center gap-2">
+          <img src="/logo.svg" alt="Vaultly" className="w-7 h-7" />
+          <span>Vaultly</span>
+        </a>
         <div className="hidden md:flex items-center gap-8 text-sm font-medium text-muted">
           <a href="/docs" className="hover:text-fg transition">Docs</a>
           <a href="/security" className="hover:text-fg transition">Security</a>
@@ -222,7 +225,7 @@ export default function Home() {
         <div className="container">
           <div className="grid grid-cols-1 md:grid-cols-4 gap-10 mb-12">
             <div>
-              <div className="font-extrabold text-xl mb-3">🔐 Vaultly</div>
+              <div className="font-extrabold text-xl mb-3 flex items-center gap-2"><img src="/logo.svg" alt="Vaultly" className="w-7 h-7" /> Vaultly</div>
               <p className="text-muted text-sm leading-relaxed">The credential boundary for human and AI work. Agent-first, zero-knowledge, open source.</p>
             </div>
             <div>
