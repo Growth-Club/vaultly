@@ -1,3 +1,5 @@
+import { Lock, Shield, Cloud, FileText, RefreshCw, Bot, KeyRound, Server, GitBranch, Terminal, Globe, Scale, Check } from "lucide-react";
+
 export default function Home() {
   return (
     <main className="min-h-screen bg-bg text-fg">
@@ -109,15 +111,17 @@ export default function Home() {
           </div>
           <div className="grid md:grid-cols-3 gap-5">
             {[
-              { icon: "🔐", title: "Zero-knowledge to agents", desc: "vaultly get, env and generic run are blocked in agent mode by default. Only approved operations pass the boundary." },
-              { icon: "🛡️", title: "Policy-gated execution", desc: "Deployment targets are registered metadata. Agents deploy or run allowlisted scripts — never arbitrary commands." },
-              { icon: "☁️", title: "Cloudflare-native", desc: "Discover accounts, zones, Workers, D1, R2, KV. Adopt targets from a Wrangler config." },
-              { icon: "📋", title: "Tamper-evident audit", desc: "Every operation is hash-chained (prevHash). Verify the whole chain with one command. No value ever logged." },
-              { icon: "🔄", title: "Encrypted local dev", desc: "Production-identical semantics on your laptop. No plaintext .wrangler/state, no real cloud account required." },
-              { icon: "🤖", title: "MCP server built in", desc: "38 agent-safe tools over stdio JSON-RPC 2.0. Works with Claude Code, Cursor, Codex and OpenCode." },
+              { Icon: Lock, title: "Zero-knowledge to agents", desc: "vaultly get, env and generic run are blocked in agent mode by default. Only approved operations pass the boundary." },
+              { Icon: Shield, title: "Policy-gated execution", desc: "Deployment targets are registered metadata. Agents deploy or run allowlisted scripts — never arbitrary commands." },
+              { Icon: Cloud, title: "Cloudflare-native", desc: "Discover accounts, zones, Workers, D1, R2, KV. Adopt targets from a Wrangler config." },
+              { Icon: FileText, title: "Tamper-evident audit", desc: "Every operation is hash-chained (prevHash). Verify the whole chain with one command. No value ever logged." },
+              { Icon: RefreshCw, title: "Encrypted local dev", desc: "Production-identical semantics on your laptop. No plaintext .wrangler/state, no real cloud account required." },
+              { Icon: Bot, title: "MCP server built in", desc: "38 agent-safe tools over stdio JSON-RPC 2.0. Works with Claude Code, Cursor, Codex and OpenCode." },
             ].map((f) => (
               <div key={f.title} className="glass rounded-2xl p-7 hover:border-emerald-500/30 transition hover:-translate-y-1">
-                <div className="w-12 h-12 rounded-xl bg-gradient-to-br from-emerald-400 to-indigo-500 flex items-center justify-center text-2xl mb-4 text-black shadow-lg shadow-emerald-500/20">{f.icon}</div>
+                <div className="w-12 h-12 rounded-xl bg-gradient-to-br from-emerald-400 to-indigo-500 flex items-center justify-center mb-4 text-black shadow-lg shadow-emerald-500/20">
+                  <f.Icon className="w-6 h-6" />
+                </div>
                 <h3 className="text-xl font-bold mb-2 tracking-tight">{f.title}</h3>
                 <p className="text-muted text-sm leading-relaxed">{f.desc}</p>
               </div>

@@ -1,5 +1,6 @@
 import Nav from "@/components/Nav";
 import Footer from "@/components/Footer";
+import { Lock, FolderLock, Bot, FileText, Package, AlertTriangle } from "lucide-react";
 
 export default function Security() {
   return (
@@ -9,15 +10,15 @@ export default function Security() {
       <div className="container py-12">
         <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-6">
           {[
-            { icon: "🔒", title: "Cryptography", desc: "AES-256-GCM with a 16-byte nonce, PBKDF2-SHA256 at 600k iterations. Master key is never stored." },
-            { icon: "📁", title: "Storage", desc: "Vault files are 0600, directory 0700. Atomic writes with fsync. Inter-process write lock. Hash-chained audit log." },
-            { icon: "🤖", title: "Agent boundary", desc: "Agents cannot call get, env, export or generic run. Values scrubbed from all subprocess output." },
-            { icon: "📋", title: "Audit", desc: "Every operation appended to a hash-chained log. Tampering detected by vaultly audit --verify." },
-            { icon: "📦", title: "Supply chain", desc: "SHA-256 checksums, GitHub attestations, immutable releases, cosign signatures, SBOM, pinned actions." },
-            { icon: "⚠️", title: "Threat model", desc: "Protects against leaked transcripts, prompt injection, compromised CI logs. Not a compromised host." },
+            { Icon: Lock, title: "Cryptography", desc: "AES-256-GCM with a 16-byte nonce, PBKDF2-SHA256 at 600k iterations. Master key is never stored." },
+            { Icon: FolderLock, title: "Storage", desc: "Vault files are 0600, directory 0700. Atomic writes with fsync. Inter-process write lock. Hash-chained audit log." },
+            { Icon: Bot, title: "Agent boundary", desc: "Agents cannot call get, env, export or generic run. Values scrubbed from all subprocess output." },
+            { Icon: FileText, title: "Audit", desc: "Every operation appended to a hash-chained log. Tampering detected by vaultly audit --verify." },
+            { Icon: Package, title: "Supply chain", desc: "SHA-256 checksums, GitHub attestations, immutable releases, cosign signatures, SBOM, pinned actions." },
+            { Icon: AlertTriangle, title: "Threat model", desc: "Protects against leaked transcripts, prompt injection, compromised CI logs. Not a compromised host." },
           ].map((c) => (
             <div key={c.title} className="glass rounded-2xl p-7">
-              <div className="text-3xl mb-3">{c.icon}</div>
+              <div className="w-10 h-10 rounded-lg bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center mb-3 text-emerald-400"><c.Icon className="w-5 h-5" /></div>
               <h3 className="text-xl font-bold mb-2">{c.title}</h3>
               <p className="text-muted text-sm">{c.desc}</p>
             </div>

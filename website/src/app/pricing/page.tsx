@@ -1,5 +1,6 @@
 import Nav from "@/components/Nav";
 import Footer from "@/components/Footer";
+import { Sprout, Users, Building2 } from "lucide-react";
 
 export default function Pricing() {
   const tiers = [
