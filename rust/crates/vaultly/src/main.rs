@@ -198,6 +198,11 @@ enum Command {
         #[command(subcommand)]
         sub: TrashCommand,
     },
+    /// Connect to the Vaultly platform (vaultly-platform)
+    Platform {
+        #[command(subcommand)]
+        sub: PlatformCommand,
+    },
     /// Show version history for a credential (metadata only; no values)
     History {
         vault_name: String,
@@ -641,6 +646,24 @@ enum TrashCommand {
 }
 
 #[derive(Subcommand)]
+enum PlatformCommand {
+    /// Store platform URL and token (connects this CLI to vaultly-platform)
+    Login {
+        #[arg(long, help = "Platform base URL, e.g. https://api.vaultly.dev")]
+        url: String,
+        #[arg(long, help = "Platform API token")]
+        token: String,
+    },
+    /// Show connection status and platform health
+    Status {
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
+    /// Remove stored platform credentials
+    Logout,
+}
+
+#[derive(Subcommand)]
 enum McpCommand {
     /// Print or write the MCP client configuration
     Install {
@@ -935,6 +958,11 @@ async fn main() {
                 }
                 cmd_trash_purge(&vault_name)
             }
+        },
+        Some(Command::Platform { sub }) => match sub {
+            PlatformCommand::Login { url, token } => cmd_platform_login(&url, &token),
+            PlatformCommand::Status { json } => cmd_platform_status(json),
+            PlatformCommand::Logout => cmd_platform_logout(),
         },
         Some(Command::Deploy { target, json }) => cmd_deploy_target(&target, json).await,
         Some(Command::Exec {
@@ -3283,6 +3311,98 @@ fn cmd_rollback(vault_name: &str, secret_key: &str, version: usize) {
         }
         Err(e) => {
             eprintln!("{} {}", "✗".red(), e);
+            exit(1);
+        }
+    }
+}
+
+// ─── platform ───────────────────────────────────────────────
+
+fn platform_config_path() -> std::path::PathBuf {
+    let base = std::env::var("VAULTLY_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from(".")).join(".vaultly")
+        });
+    base.join("platform.json")
+}
+
+fn cmd_platform_login(url: &str, token: &str) {
+    let path = platform_config_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let cfg = serde_json::json!({ "url": url.trim_end_matches('/'), "token": token });
+    match std::fs::write(&path, serde_json::to_string_pretty(&cfg).unwrap()) {
+        Ok(_) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            }
+            println!("{} Connected to {}", "✓".green(), url);
+        }
+        Err(e) => {
+            eprintln!("{} Failed to save platform config: {}", "✗".red(), e);
+            exit(1);
+        }
+    }
+}
+
+fn cmd_platform_logout() {
+    let path = platform_config_path();
+    if path.exists() {
+        let _ = std::fs::remove_file(&path);
+    }
+    println!("{} Logged out from platform.", "✓".green());
+}
+
+fn cmd_platform_status(json: bool) {
+    let path = platform_config_path();
+    if !path.exists() {
+        eprintln!("{} Not connected. Run: vaultly platform login --url ... --token ...", "✗".red());
+        exit(1);
+    }
+    let raw = std::fs::read_to_string(&path).unwrap_or_default();
+    let cfg: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+    let url = cfg.get("url").and_then(|v| v.as_str()).unwrap_or("");
+    let token = cfg.get("token").and_then(|v| v.as_str()).unwrap_or("");
+    if url.is_empty() {
+        eprintln!("{} Invalid platform config.", "✗".red());
+        exit(1);
+    }
+    // Call platform health endpoint via curl.
+    let output = std::process::Command::new("curl")
+        .args([
+            "-sS",
+            "-m",
+            "5",
+            "-H",
+            &format!("Authorization: Bearer {}", token),
+            &format!("{}/health", url),
+        ])
+        .output();
+    match output {
+        Ok(o) if o.status.success() => {
+            let body = String::from_utf8_lossy(&o.stdout);
+            if json {
+                println!("{}", body);
+            } else {
+                println!("{} Platform: {}", "✓".green(), url);
+                println!("  Health: {}", body.trim());
+            }
+        }
+        Ok(o) => {
+            eprintln!(
+                "{} Platform unreachable (HTTP {}). {}",
+                "✗".red(),
+                o.status,
+                String::from_utf8_lossy(&o.stderr)
+            );
+            exit(1);
+        }
+        Err(e) => {
+            eprintln!("{} Failed to call platform: {}", "✗".red(), e);
             exit(1);
         }
     }
