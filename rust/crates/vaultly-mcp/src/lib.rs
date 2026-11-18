@@ -1087,7 +1087,11 @@ async fn tool_vault_rollback(engine: &mut VaultEngine, args: &Value, ctx: &Calle
     }
 }
 
-async fn tool_vault_trash_list(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
+async fn tool_vault_trash_list(
+    engine: &mut VaultEngine,
+    args: &Value,
+    ctx: &CallerContext,
+) -> Value {
     require!(args, vault => "vaultName");
     match engine.list_trash(vault, Some(ctx)) {
         Ok(items) => {
@@ -1098,14 +1102,23 @@ async fn tool_vault_trash_list(engine: &mut VaultEngine, args: &Value, ctx: &Cal
                     .iter()
                     .map(|t| format!("  {}  deleted={}", t.key, t.deleted_at))
                     .collect();
-                ok(format!("{} trashed items for '{}':\n{}", items.len(), vault, lines.join("\n")))
+                ok(format!(
+                    "{} trashed items for '{}':\n{}",
+                    items.len(),
+                    vault,
+                    lines.join("\n")
+                ))
             }
         }
         Err(e) => fail_err(&e),
     }
 }
 
-async fn tool_vault_trash_restore(engine: &mut VaultEngine, args: &Value, ctx: &CallerContext) -> Value {
+async fn tool_vault_trash_restore(
+    engine: &mut VaultEngine,
+    args: &Value,
+    ctx: &CallerContext,
+) -> Value {
     require!(args, vault => "vaultName", key => "key");
     match engine.restore_trash(vault, key, Some(ctx)) {
         Ok(true) => ok(format!("Restored {}/{} from trash.", vault, key)),

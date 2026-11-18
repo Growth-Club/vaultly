@@ -5,6 +5,10 @@ members = ["crates/vaultly-core", "crates/vaultly", "crates/vaultly-mcp"]
 [workspace.package]
 version = "1.2.2"
 edition = "2021"
+# Locked deps (aes 0.9.3 via secret-service 5.2.0, uuid 1.29.0 via zbus 5.19.0)
+# require rustc >= 1.89. Match CI (dtolnay/rust-toolchain@stable) so local
+# builds fail with a clear message instead of a cryptic MSRV error.
+rust-version = "1.89"
 license = "MIT"
 
 [workspace.dependencies]

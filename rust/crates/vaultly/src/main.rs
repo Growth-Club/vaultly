@@ -3322,7 +3322,9 @@ fn platform_config_path() -> std::path::PathBuf {
     let base = std::env::var("VAULTLY_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| {
-            dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from(".")).join(".vaultly")
+            dirs::home_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join(".vaultly")
         });
     base.join("platform.json")
 }
@@ -3360,7 +3362,10 @@ fn cmd_platform_logout() {
 fn cmd_platform_status(json: bool) {
     let path = platform_config_path();
     if !path.exists() {
-        eprintln!("{} Not connected. Run: vaultly platform login --url ... --token ...", "✗".red());
+        eprintln!(
+            "{} Not connected. Run: vaultly platform login --url ... --token ...",
+            "✗".red()
+        );
         exit(1);
     }
     let raw = std::fs::read_to_string(&path).unwrap_or_default();
