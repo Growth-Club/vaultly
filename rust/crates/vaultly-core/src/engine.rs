@@ -1837,6 +1837,8 @@ Run this command from the repository that owns '{}' (its root or a subdirectory)
             output_dir: spec.output_dir,
             branch: None,
             worker_package_deploy: spec.worker_package_deploy,
+            compatibility_date: spec.compatibility_date,
+            compatibility_flags: spec.compatibility_flags,
             created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         };
         target.validate().map_err(VaultError::Policy)?;
@@ -1889,6 +1891,9 @@ Run this command from the repository that owns '{}' (its root or a subdirectory)
                 target.id
             )));
         }
+        // Advanced-mode Pages workers (e.g. Nitro's API) live outside the
+        // static asset manifest and must be attached to the deployment call.
+        let worker_js = collect_pages_worker(output_dir)?;
         if files.len() > 20_000 {
             return Err(VaultError::Policy(
                 "Pages deployment exceeds 20,000 files".into(),
@@ -2060,6 +2065,27 @@ Run this command from the repository that owns '{}' (its root or a subdirectory)
             form = form.text("branch", branch.clone());
         }
         form = form.text("pages_build_output_dir", target.output_dir.clone());
+        if let Some(js) = &worker_js {
+            let (boundary, bundle) = build_pages_worker_bundle(
+                js,
+                target.compatibility_date.as_deref(),
+                &target.compatibility_flags,
+            )?;
+            let mime = format!("multipart/form-data; boundary={}", boundary);
+            form = form.part(
+                "_worker.bundle",
+                reqwest::multipart::Part::bytes(bundle)
+                    .file_name("worker.bundle")
+                    .mime_str(&mime)
+                    .map_err(|e| VaultError::Policy(format!("invalid worker bundle MIME: {e}")))?,
+            );
+        }
+        for name in ["_routes.json", "_headers", "_redirects"] {
+            let path = output_dir.join(name);
+            if path.is_file() {
+                form = form.text(name, fs::read_to_string(&path)?);
+            }
+        }
         // Deployment creation is a multipart POST and reqwest cannot clone
         // multipart request bodies for retry. It also creates a new remote
         // deployment, so retrying it automatically could create duplicates.
@@ -3286,6 +3312,15 @@ Run this command from the repository that owns '{}' (its root or a subdirectory)
     pub fn get_encrypted_vaults(&self) -> Map<String, Value> {
         self.store.get_encrypted_vaults()
     }
+    /// KDF material (salt/verifier) for a backup, so the backup can be restored
+    /// into a fresh VAULTLY_DIR with only the master password.
+    pub fn get_config_for_backup(&self) -> Result<crate::crypto::VaultConfig> {
+        self.store.get_config_for_backup()
+    }
+    /// Install backup KDF material into an uninitialized store.
+    pub fn restore_config(&self, config: &crate::crypto::VaultConfig) -> Result<()> {
+        self.store.restore_config(config)
+    }
     pub fn restore_encrypted_vaults(&mut self, vaults: &Map<String, Value>) -> Result<usize> {
         let count = self.store.restore_encrypted_vaults(vaults)?;
         self.audit("RESTORE", &format!("{} vaults restored", count), None);
@@ -3501,6 +3536,91 @@ fn pages_asset_hash(relative: &str, bytes: &[u8]) -> String {
     hex::encode(blake3::hash(input.as_bytes()).as_bytes())[..32].to_string()
 }
 
+/// Paths Wrangler excludes from the Pages static asset manifest.
+fn pages_asset_ignored(rel: &str) -> bool {
+    matches!(
+        rel,
+        "_worker.js"
+            | "_worker.js/index.js"
+            | "_headers"
+            | "_redirects"
+            | "_routes.json"
+            | "functions"
+            | ".DS_Store"
+            | "node_modules"
+            | ".git"
+    ) || rel.starts_with("_worker.js/")
+        || rel.starts_with("functions/")
+        || rel.starts_with("node_modules/")
+        || rel.starts_with(".git/")
+}
+
+/// Build the multipart blob Cloudflare expects in the `_worker.bundle` field
+/// of a Pages deployment: a `metadata` part describing the ES module entry
+/// and a file part with the bundled JavaScript.
+fn build_pages_worker_bundle(
+    js: &[u8],
+    compatibility_date: Option<&str>,
+    compatibility_flags: &[String],
+) -> Result<(String, Vec<u8>)> {
+    let boundary = format!(
+        "----vaultly-worker-{}",
+        hex::encode(&blake3::hash(js).as_bytes()[..8])
+    );
+    let metadata = serde_json::json!({
+        "main_module": "index.js",
+        "compatibility_date": compatibility_date.unwrap_or("2024-01-01"),
+        "compatibility_flags": compatibility_flags,
+    });
+    let mut body = Vec::with_capacity(js.len() + 512);
+    body.extend_from_slice(
+        format!(
+            "--{b}\r\nContent-Disposition: form-data; name=\"metadata\"\r\nContent-Type: application/json\r\n\r\n{}\r\n",
+            metadata,
+            b = boundary
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(
+        format!(
+            "--{b}\r\nContent-Disposition: form-data; name=\"index.js\"; filename=\"index.js\"\r\nContent-Type: application/javascript\r\n\r\n",
+            b = boundary
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(js);
+    body.extend_from_slice(format!("\r\n--{}--\r\n", boundary).as_bytes());
+    Ok((boundary, body))
+}
+
+/// Locate a Pages worker bundle in the build output: the pre-bundled single
+/// file emitted by `scripts/bundle-worker.mjs`, or a plain `_worker.js` file.
+fn collect_pages_worker(output_dir: &Path) -> Result<Option<Vec<u8>>> {
+    for candidate in ["worker.bundle.js", "_worker.js"] {
+        let path = output_dir.join(candidate);
+        if path.is_file() {
+            let bytes = fs::read(&path)?;
+            if bytes.len() > 25 * 1024 * 1024 {
+                return Err(VaultError::Policy(format!(
+                    "Pages worker '{}' exceeds the 25 MiB file limit",
+                    candidate
+                )));
+            }
+            return Ok(Some(bytes));
+        }
+    }
+    // A `_worker.js/` directory without a pre-bundled file cannot be uploaded
+    // safely: bundling Nitro's chunk graph would require reimplementing esbuild.
+    if output_dir.join("_worker.js").is_dir() {
+        return Err(VaultError::Policy(
+            "Pages output contains a _worker.js/ directory but no dist/worker.bundle.js. \
+             Add a build step that bundles the Nitro worker into a single ESM file."
+                .into(),
+        ));
+    }
+    Ok(None)
+}
+
 fn collect_deploy_paths(
     root: &Path,
     current: &Path,
@@ -3510,6 +3630,18 @@ fn collect_deploy_paths(
         let entry = entry?;
         let path = entry.path();
         let meta = fs::symlink_metadata(&path)?;
+        let rel = path
+            .strip_prefix(root)
+            .map_err(|e| VaultError::Policy(e.to_string()))?
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        // Wrangler excludes these from the static asset manifest: they are
+        // configuration/worker inputs, not assets. Uploading them as assets
+        // (as older Vaultly versions did) is inert at best and leaks the
+        // Nitro worker source at worst.
+        if pages_asset_ignored(&rel) {
+            continue;
+        }
         if meta.file_type().is_symlink() {
             return Err(VaultError::Policy(format!(
                 "Pages output contains unsupported symlink '{}'",
@@ -3519,11 +3651,6 @@ fn collect_deploy_paths(
         if meta.is_dir() {
             collect_deploy_paths(root, &path, out)?;
         } else if meta.is_file() {
-            let rel = path
-                .strip_prefix(root)
-                .map_err(|e| VaultError::Policy(e.to_string()))?
-                .to_string_lossy()
-                .replace(std::path::MAIN_SEPARATOR, "/");
             out.push((rel, path));
         }
     }
@@ -4108,6 +4235,8 @@ mod tests {
             output_dir: ".".into(),
             branch: None,
             worker_package_deploy: true,
+            compatibility_date: None,
+            compatibility_flags: Vec::new(),
             created_at: "2026-01-01T00:00:00Z".into(),
         };
         engine
@@ -5550,6 +5679,8 @@ mod tests {
             output_dir: ".".into(),
             branch: None,
             worker_package_deploy: true,
+            compatibility_date: None,
+            compatibility_flags: Vec::new(),
             created_at: "2026-01-01T00:00:00Z".into(),
         }
     }
@@ -5812,6 +5943,8 @@ mod tests {
             output_dir: ".".to_string(),
             branch: None,
             worker_package_deploy: true,
+            compatibility_date: None,
+            compatibility_flags: Vec::new(),
             created_at: "2026-01-01T00:00:00.000Z".to_string(),
         };
         engine
@@ -6045,5 +6178,88 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("VERCEL_TOKEN"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod pages_deploy_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn pages_asset_ignore_list_matches_wrangler() {
+        for path in [
+            "_worker.js",
+            "_worker.js/index.js",
+            "_worker.js/chunks/a.mjs",
+            "_headers",
+            "_redirects",
+            "_routes.json",
+            "functions/api/[[path]].ts",
+            "node_modules/pkg/index.js",
+            ".git/config",
+        ] {
+            assert!(pages_asset_ignored(path), "{path} should be ignored");
+        }
+        for path in ["index.html", "assets/app.js", "manifest.json"] {
+            assert!(!pages_asset_ignored(path), "{path} must stay an asset");
+        }
+    }
+
+    #[test]
+    fn collect_deploy_paths_excludes_worker_and_config() {
+        let dir = tempfile::tempdir().unwrap();
+        for path in [
+            "index.html",
+            "_worker.js/index.js",
+            "_headers",
+            "_routes.json",
+            "assets/app.js",
+        ] {
+            let full = dir.path().join(path);
+            fs::create_dir_all(full.parent().unwrap()).unwrap();
+            fs::write(&full, b"x").unwrap();
+        }
+        let mut paths = Vec::new();
+        collect_deploy_paths(dir.path(), dir.path(), &mut paths).unwrap();
+        let names: Vec<&str> = paths.iter().map(|(rel, _)| rel.as_str()).collect();
+        assert_eq!(names, vec!["assets/app.js", "index.html"]);
+    }
+
+    #[test]
+    fn collect_pages_worker_reads_single_file_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("worker.bundle.js"), b"export default {}").unwrap();
+        assert_eq!(
+            collect_pages_worker(dir.path()).unwrap(),
+            Some(b"export default {}".to_vec())
+        );
+    }
+
+    #[test]
+    fn collect_pages_worker_rejects_unbundled_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("_worker.js")).unwrap();
+        fs::write(dir.path().join("_worker.js/index.js"), b"export default {}").unwrap();
+        let err = collect_pages_worker(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("worker.bundle.js"), "{err}");
+    }
+
+    #[test]
+    fn worker_bundle_has_metadata_and_js_parts() {
+        let (boundary, bytes) = build_pages_worker_bundle(
+            b"export default {}",
+            Some("2025-07-15"),
+            &["nodejs_compat".into()],
+        )
+        .unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains(&format!("--{}", boundary)));
+        assert!(text.contains("name=\"metadata\""));
+        assert!(text.contains("\"main_module\":\"index.js\""));
+        assert!(text.contains("\"compatibility_date\":\"2025-07-15\""));
+        assert!(text.contains("nodejs_compat"));
+        assert!(text.contains("name=\"index.js\""));
+        assert!(text.contains("export default {}"));
     }
 }

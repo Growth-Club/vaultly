@@ -39,6 +39,13 @@ pub struct DeploymentTarget {
     /// `false` preserves compatibility with older manually registered targets.
     #[serde(default)]
     pub worker_package_deploy: bool,
+    /// Pages advanced-mode compatibility settings, read from wrangler.toml at
+    /// adopt time and attached to the Pages worker bundle at deploy time.
+    /// Nodejs_compat is required by Nitro-generated Pages workers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compatibility_flags: Vec<String>,
     pub created_at: String,
 }
 
@@ -381,6 +388,8 @@ pub struct DiscoveredDeploymentSpec {
     pub build_command: String,
     pub output_dir: String,
     pub worker_package_deploy: bool,
+    pub compatibility_date: Option<String>,
+    pub compatibility_flags: Vec<String>,
 }
 
 impl DiscoveredDeploymentSpec {
@@ -475,6 +484,22 @@ pub fn discover_deployment_spec(config_path: &Path) -> Result<DiscoveredDeployme
         DeploymentProvider::Pages => false,
     };
 
+    let compatibility_date = config
+        .get("compatibility_date")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let compatibility_flags = config
+        .get("compatibility_flags")
+        .and_then(Value::as_array)
+        .map(|flags| {
+            flags
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
     Ok(DiscoveredDeploymentSpec {
         provider,
         project,
@@ -482,6 +507,8 @@ pub fn discover_deployment_spec(config_path: &Path) -> Result<DiscoveredDeployme
         build_command,
         output_dir: pages_output.unwrap_or(".").to_string(),
         worker_package_deploy,
+        compatibility_date,
+        compatibility_flags,
     })
 }
 
@@ -533,7 +560,25 @@ fn parse_simple_toml(raw: &str, path: &Path) -> Result<Value, String> {
             )
         })?;
         let key = key.trim();
-        if key != "name" && key != "main" && key != "pages_build_output_dir" {
+        if key == "compatibility_flags" {
+            let flags = parse_toml_string_array(raw_value.trim()).ok_or_else(|| {
+                format!(
+                    "invalid Wrangler TOML '{}' line {}: compatibility_flags must be a string array",
+                    path.display(),
+                    line_number + 1
+                )
+            })?;
+            value.insert(
+                key.to_string(),
+                Value::Array(flags.into_iter().map(Value::String).collect()),
+            );
+            continue;
+        }
+        if key != "name"
+            && key != "main"
+            && key != "pages_build_output_dir"
+            && key != "compatibility_date"
+        {
             continue;
         }
         let parsed = parse_toml_string(raw_value.trim()).ok_or_else(|| {
@@ -613,6 +658,20 @@ fn parse_toml_string(raw: &str) -> Option<String> {
             Some(result)
         }
     }
+}
+
+/// Parse a simple inline TOML string array such as `["nodejs_compat"]`.
+/// Only string elements are supported — that covers Wrangler compatibility
+/// flags and keeps the parser deliberately small.
+fn parse_toml_string_array(raw: &str) -> Option<Vec<String>> {
+    let trimmed = raw.trim();
+    let body = trimmed.strip_prefix('[')?.strip_suffix(']')?;
+    if body.trim().is_empty() {
+        return Some(Vec::new());
+    }
+    body.split(',')
+        .map(|part| parse_toml_string(part.trim()))
+        .collect()
 }
 
 fn strip_json_comments(raw: &str) -> Result<String, String> {
@@ -1432,6 +1491,8 @@ mod tests {
             output_dir: "dist".into(),
             branch: Some("main".into()),
             worker_package_deploy: false,
+            compatibility_date: None,
+            compatibility_flags: Vec::new(),
             created_at: "2026-01-01T00:00:00Z".into(),
         }
     }
@@ -1501,6 +1562,8 @@ IGNORED = "value"
             build_command: "npm run build".into(),
             output_dir: ".".into(),
             worker_package_deploy: true,
+            compatibility_date: None,
+            compatibility_flags: Vec::new(),
         };
         assert_ne!(
             spec.target_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
@@ -1795,5 +1858,18 @@ IGNORED = "value"
         assert!(patch_d1_database_id(raw, "a; DROP", "c").is_err());
         assert!(patch_d1_database_id("{\"name\": \"x\"}", "a", "c").is_err());
         assert!(patch_d1_database_id("name = 'x'\n", "a", "c").is_err());
+    }
+
+    #[test]
+    fn parse_toml_string_array_reads_compatibility_flags() {
+        assert_eq!(
+            parse_toml_string_array(r#"["nodejs_compat"]"#).unwrap(),
+            vec!["nodejs_compat".to_string()]
+        );
+        assert_eq!(
+            parse_toml_string_array(r#"[]"#).unwrap(),
+            Vec::<String>::new()
+        );
+        assert!(parse_toml_string_array("nodejs_compat").is_none());
     }
 }

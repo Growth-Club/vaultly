@@ -1008,6 +1008,18 @@ impl VaultStore {
         self.load_config()
     }
 
+    /// Install the KDF material (salt/verifier) carried by a backup into an
+    /// uninitialized store. Restoring encrypted vault blobs into a fresh
+    /// VAULTLY_DIR is impossible without this: a new `init` would generate a
+    /// different salt and could never derive the key that encrypted them.
+    /// An existing config is never overwritten — that would orphan its vaults.
+    pub fn restore_config(&self, config: &VaultConfig) -> Result<()> {
+        if self.is_initialized() {
+            return Ok(());
+        }
+        self.save_config(config)
+    }
+
     pub fn update_backup_meta(&self, worker_url: &str) -> Result<()> {
         let mut config = self.load_config()?;
         config.backup = Some(BackupMeta {
@@ -1290,6 +1302,44 @@ mod tests {
                 .as_deref(),
             Some("v1")
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_config_into_fresh_dir_enables_unlock() {
+        let dir = temp_dir();
+        let store = store_with(dir.clone());
+        let key = key_for(&store);
+        store.set_secret("github", "TOKEN", "v1", &key).unwrap();
+        let config = store.get_config_for_backup().unwrap();
+        let vaults = store.get_encrypted_vaults();
+
+        // Simulate a fresh VAULTLY_DIR with no config.json at all.
+        let fresh_dir = dir.join("fresh");
+        // with_dir does NOT initialize — that is exactly the fresh-directory
+        // case the backup must support (init would generate a new salt).
+        let fresh = VaultStore::with_dir(fresh_dir.clone());
+        assert!(!fresh.is_initialized());
+        fresh.restore_config(&config).unwrap();
+        assert!(fresh.is_initialized());
+        fresh.restore_encrypted_vaults(&vaults).unwrap();
+
+        // The password used in the original store derives the key from the
+        // restored salt, so the restored ciphertext decrypts successfully.
+        let fresh_key = key_for(&fresh);
+        assert_eq!(
+            fresh
+                .get_secret("github", "TOKEN", &fresh_key)
+                .unwrap()
+                .as_deref(),
+            Some("v1")
+        );
+
+        // Installing again must not overwrite an existing config.
+        let mut changed = config.clone();
+        changed.salt = "tampered".to_string();
+        fresh.restore_config(&changed).unwrap();
+        assert_eq!(fresh.load_config().unwrap().salt, config.salt);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

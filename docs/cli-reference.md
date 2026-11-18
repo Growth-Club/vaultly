@@ -15,7 +15,7 @@ VAULTLY_HUMAN_MODE=1 vaultly add personal -k EXAMPLE_TOKEN -v 'value'
 Human-only operations include initialization, plaintext reads/exports,
 deletion, Cloudflare account registration, and legacy explicit target
 registration. Agents manage credentials through the write-only MCP tools and
-use dynamic target adoption. The macOS Keychain is the preferred unlock bridge
+use dynamic target adoption. The The OS credential store is preferred unlock bridge
 for agents.
 
 ## Core commands

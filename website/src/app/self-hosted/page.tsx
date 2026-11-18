@@ -16,8 +16,8 @@ export default function SelfHosted() {
           </div>
           <div className="glass rounded-2xl p-6">
             <h3 className="text-2xl font-bold mb-3">Docker</h3>
-            <p className="text-muted mb-4">Run Vaultly in a container for CI/CD or isolated environments.</p>
-            <pre className="text-sm"><span className="text-emerald-400">$</span> docker run -v ~/.vaultly:/data \{"\n"}  -e VAULTLY_MASTER_PASSWORD=... \{"\n"}  ghcr.io/growth-club/vaultly:latest \{"\n"}  vaultly status</pre>
+            <p className="text-muted mb-4">Build the CLI into a container locally for CI/CD or isolated environments.</p>
+            <pre className="text-sm"><span className="text-emerald-400">$</span> docker build -t vaultly . \{"\n"}  &amp;&amp; docker run -v ~/.vaultly:/root/.vaultly vaultly status</pre>
             <p className="mt-4 text-sm text-muted2">Mount a volume for persistent vault storage.</p>
           </div>
         </div>

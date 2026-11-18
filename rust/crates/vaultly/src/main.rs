@@ -2052,6 +2052,8 @@ fn cmd_target_add(
         output_dir: output_dir.to_string(),
         branch: branch.map(str::to_string),
         worker_package_deploy: false,
+        compatibility_date: None,
+        compatibility_flags: Vec::new(),
         created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
     };
     if let Err(e) = target.validate() {
@@ -3723,10 +3725,18 @@ fn cmd_backup(file: &str, json: bool) {
             exit(1);
         }
     };
+    // The KDF material (salt + verifier) is required to restore the encrypted
+    // blobs into a fresh VAULTLY_DIR. Without it the master password cannot
+    // derive the key that encrypted them, so the backup is unusable there.
+    let config = engine.get_config_for_backup().unwrap_or_else(|e| {
+        eprintln!("{} {}", "✗".red(), e);
+        exit(1);
+    });
     let payload = serde_json::json!({
         "version": 1,
         "createdAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         "checksum": checksum,
+        "config": config,
         "vaults": vaults,
     });
     let pretty = serde_json::to_string_pretty(&payload).unwrap();
@@ -3793,6 +3803,19 @@ fn cmd_restore(file: &str, yes: bool, json: bool) {
             }
         }
     }
+    // Parse config up front: a malformed payload must fail before any write.
+    // Older backups have no `config` field and remain restorable into an
+    // already-initialized store exactly as before.
+    let restore_cfg = match payload.get("config") {
+        Some(v) => match serde_json::from_value::<vaultly_core::crypto::VaultConfig>(v.clone()) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("{} Invalid backup config: {}", "✗".red(), e);
+                exit(1);
+            }
+        },
+        None => None,
+    };
     if !yes
         && !prompt::prompt_confirm(
             &format!(
@@ -3808,6 +3831,15 @@ fn cmd_restore(file: &str, yes: bool, json: bool) {
         return;
     }
     let mut engine = engine();
+    // Install KDF material first so the store is initialized with the salt
+    // that actually encrypted these blobs. `restore_config` is a no-op when a
+    // config already exists, so restoring over an initialized vault is safe.
+    if let Some(cfg) = &restore_cfg {
+        if let Err(e) = engine.restore_config(cfg) {
+            eprintln!("{} {}", "✗".red(), e);
+            exit(1);
+        }
+    }
     match engine.restore_encrypted_vaults(&vaults) {
         Ok(count) => {
             if json {
