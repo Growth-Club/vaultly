@@ -44,7 +44,7 @@ export default function Home() {
             <a href="https://github.com/Growth-Club/vaultly" className="btn btn-outline">Star on GitHub</a>
           </div>
           <p className="text-sm text-muted2">Or ask your coding agent to install the Vaultly CLI.</p>
-          <pre className="max-w-md mx-auto mt-4 text-left">$ brew install Growth-Club/tap/vaultly</pre>
+          <pre className="max-w-md mx-auto mt-4 text-left">$ cargo install vaultly</pre>
 
           <div className="mt-16 max-w-4xl mx-auto glass rounded-2xl overflow-hidden shadow-2xl">
             <div className="flex items-center gap-2 px-4 py-3 border-b border-white/8 bg-white/[0.02]">
@@ -85,12 +85,12 @@ export default function Home() {
           <div className="text-center mb-12">
             <span className="inline-flex items-center gap-2 px-3 py-1 rounded-full text-xs font-semibold bg-white/4 border border-white/8 text-emerald-400 mb-4">Get started</span>
             <h2 className="text-4xl md:text-5xl font-extrabold tracking-tight mb-4">Install in seconds</h2>
-            <p className="text-muted text-lg max-w-xl mx-auto">One binary, no runtime. Works on macOS, Linux and Windows.</p>
+            <p className="text-muted text-lg max-w-xl mx-auto">One binary, no runtime. Available for macOS and Linux.</p>
           </div>
           <div className="grid md:grid-cols-2 gap-8 items-start">
             <div>
-              <pre className="text-sm"><span className="text-muted2"># macOS / Linux</span>{"\n"}<span className="text-emerald-400">$</span> curl -fsSL https://vaultly.dev/install.sh | sh{"\n\n"}<span className="text-muted2"># Homebrew</span>{"\n"}<span className="text-emerald-400">$</span> brew install Growth-Club/tap/vaultly{"\n\n"}<span className="text-muted2"># Cargo</span>{"\n"}<span className="text-emerald-400">$</span> cargo install vaultly</pre>
-              <p className="mt-6 text-sm text-muted2">Every artifact ships with SHA-256 checksums, GitHub attestations and cosign signatures. <a href="/security" className="text-emerald-400">Verify a download →</a></p>
+              <pre className="text-sm"><span className="text-muted2"># macOS / Linux</span>{"\n"}<span className="text-emerald-400">$</span> curl -fsSL https://vaultly.dev/install.sh | sh{"\n\n"}<span className="text-muted2"># Cargo</span>{"\n"}<span className="text-emerald-400">$</span> cargo install vaultly</pre>
+              <p className="mt-6 text-sm text-muted2">Release tarballs are published on GitHub Releases. <a href="/security" className="text-emerald-400">Verify a download →</a></p>
             </div>
             <div className="glass rounded-2xl p-6">
               <h3 className="text-xl font-bold mb-2">First 5 commands</h3>

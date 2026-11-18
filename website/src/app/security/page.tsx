@@ -14,7 +14,7 @@ export default function Security() {
             { Icon: FolderLock, title: "Storage", desc: "Vault files are 0600, directory 0700. Atomic writes with fsync. Inter-process write lock. Hash-chained audit log." },
             { Icon: Bot, title: "Agent boundary", desc: "Agents cannot call get, env, export or generic run. Values scrubbed from all subprocess output." },
             { Icon: FileText, title: "Audit", desc: "Every operation appended to a hash-chained log. Tampering detected by vaultly audit --verify." },
-            { Icon: Package, title: "Supply chain", desc: "SHA-256 checksums, GitHub attestations, immutable releases, cosign signatures, SBOM, pinned actions." },
+            { Icon: Package, title: "Supply chain", desc: "Source-built releases, locked dependencies, minimal GitHub Actions permissions." },
             { Icon: AlertTriangle, title: "Threat model", desc: "Protects against leaked transcripts, prompt injection, compromised CI logs. Not a compromised host." },
           ].map((c) => (
             <div key={c.title} className="glass rounded-2xl p-7">
@@ -26,7 +26,8 @@ export default function Security() {
         </div>
         <div className="mt-16">
           <h2 className="text-3xl font-bold mb-4">Verify a download</h2>
-          <pre className="text-sm">gh attestation verify ./vaultly -R Growth-Club/vaultly{"\n"}cosign verify-blob --certificate-identity-regexp &apos;https://github.com/Growth-Club/.*&apos; \{"\n"}  --certificate-oidc-issuer https://token.actions.githubusercontent.com \{"\n"}  vaultly checksums.txt</pre>
+          <pre className="text-sm">sha256sum vaultly-*.tar.gz
+# Compare the digest with the one published on the GitHub Release page.</pre>
         </div>
         <div className="mt-12">
           <h2 className="text-3xl font-bold mb-4">Disclosure</h2>

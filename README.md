@@ -6,9 +6,9 @@
 
 **AI agents can _use_ your secrets. They can never _read_ them.**
 
-[![Rust](https://img.shields.io/badge/Rust-1.96-000000?logo=rust&logoColor=white)](https://rust-lang.org)
+[![Rust](https://img.shields.io/badge/Rust-1.89-000000?logo=rust&logoColor=white)](https://rust-lang.org)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![MCP](https://img.shields.io/badge/MCP-25_tools-8A2BE2)](#ai-agent-integration-mcp)
+[![MCP](https://img.shields.io/badge/MCP-38_tools-8A2BE2)](#ai-agent-integration-mcp)
 [![Cloudflare](https://img.shields.io/badge/Cloudflare-Workers-F38020?logo=cloudflare&logoColor=white)](https://workers.cloudflare.com)
 [![Security](https://img.shields.io/badge/encryption-AES--256--GCM-red)](#security)
 
@@ -118,7 +118,7 @@ vaultly gen [-l LENGTH] [-s]              Generate a random secret
 vaultly rotate <vault> <key> [--expired]  Rotate a secret (or all expired) to a new random value
 vaultly doctor [--json]                   Environment diagnostics + health checks
 vaultly cf add|list|remove|zones|pages|secrets  Cloudflare credentials/discovery
-vaultly mcp                               Start the MCP server (25 agent tools)
+vaultly mcp                               Start the MCP server (38 agent tools)
 vaultly keychain store|remove             Manage Keychain auto-unlock
 vaultly kill                              Emergency lock + clear Keychain
 vaultly status                            Session and vault info
@@ -208,7 +208,7 @@ for an annotated `config.json`.
 
 ## 🏗️ Documentation
 
-- [docs/config.md](docs/config.md) — configuration, environment variables, TUI theme, validation
+- [docs/config.md](docs/config.md) — configuration, environment variables, theme, validation
 - [docs/example-config.json](docs/example-config.json) — annotated `config.json` example
 - [ARCHITECTURE.md](ARCHITECTURE.md) — system design and diagrams
 - [CONTRIBUTING.md](CONTRIBUTING.md) — developer setup and PR checklist

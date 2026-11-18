@@ -1,14 +1,14 @@
 # Vaultly MCP tools
 
 `vaultly mcp` exposes a deliberately small, agent-safe interface over stdio.
-It supports 31 tools: encrypted personal credentials, Cloudflare discovery,
+It supports 38 tools: encrypted personal credentials, Cloudflare discovery,
 write-only Worker secrets, value-blind GitHub secret sync, validated
 deployment targets, read-only target preflight, and approved target
 maintenance execution.
 
 No tool returns a raw credential. Agents never receive the master password,
 Cloudflare token, or any other stored secret. A human unlocks Vaultly once via
-macOS Keychain; the MCP process performs the approved operation locally.
+OS credential store (macOS Keychain or Linux Secret Service); the MCP process performs the approved operation locally.
 
 ## Credential tools
 
@@ -26,7 +26,7 @@ macOS Keychain; the MCP process performs the approved operation locally.
 | `vault_export_encrypted` | Export an encrypted portable blob |
 | `vault_import_encrypted` | Import an encrypted portable blob |
 | `vault_lock` | Wipe the in-memory encryption key |
-| `vault_unlock` | Unlock through macOS Keychain |
+| `vault_unlock` | Unlock through OS credential store (macOS Keychain or Linux Secret Service) |
 | `vault_audit` | Read the hash-chained audit trail without values |
 
 All credential names and values are validated before storage. Expiry may be

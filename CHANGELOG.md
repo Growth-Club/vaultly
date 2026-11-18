@@ -1,5 +1,10 @@
 # Changelog
 
+> Current implementation (v1.2.2): 38 MCP tools, 36 CLI commands, 203 tests.
+> Earlier entries describe the original TypeScript design (TUI, HTTP/REST
+> server, 14 templates); those components were not part of the Rust port and
+> ARCHITECTURE.md now documents the code that actually ships.
+
 ## 1.2.2
 
 - Linux auto-unlock through Secret Service over an encrypted D-Bus session; no external `secret-tool` program is required. Saved keys are bound to the canonical vault-store directory. Agent reads do not trigger keyring unlock prompts, and custom stores remain opt-in.
