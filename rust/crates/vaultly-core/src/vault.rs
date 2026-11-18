@@ -1064,7 +1064,10 @@ impl VaultStore {
     /// Restore a trashed secret by key (most recent trash entry) back into the vault.
     pub fn restore_trash(&self, vault_name: &str, secret_key: &str, key: &[u8]) -> Result<bool> {
         let items = self.list_trash(vault_name, key)?;
-        let item = items.into_iter().filter(|t| t.key == secret_key).last();
+        let item = items
+            .into_iter()
+            .filter(|t| t.key == secret_key)
+            .next_back();
         let item = match item {
             Some(i) => i,
             None => return Ok(false),
