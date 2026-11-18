@@ -931,13 +931,15 @@ impl VaultEngine {
 
         // Resolve in-vault secret references (${KEY}) so one secret can compose
         // another, mirroring Doppler/Phase reference syntax. Resolution is
-        // single-pass and stays inside the same vault; unknown refs are left
-        // verbatim. Referenced values are already part of `secrets`, so they
-        // remain scrubbed from output.
+        // single-pass, stays inside the same vault, and - critically - only
+        // uses APPROVED keys. A disallowed key must never be injected into the
+        // child or escape output scrubbing; unknown refs are left verbatim.
         let resolve = |raw: &str| -> String {
             let mut out = raw.to_string();
-            // Replace ${KEY} (and $KEY) tokens with the referenced value.
             for (rk, rv) in &secrets {
+                if !allowed(rk) {
+                    continue;
+                }
                 if let Some(rv) = rv.as_str() {
                     out = out.replace(&format!("${{{}}}", rk), rv);
                 }
@@ -3095,13 +3097,14 @@ Run this command from the repository that owns '{}' (its root or a subdirectory)
             ctx,
         );
         // Fixed script: names travel via env (no shell parsing of agent
-        // input), the value travels via a dedicated env var into `gh` stdin.
-        // Nothing agent-controlled appears on the command line. The optional
-        // environment flag is interpolated only after strict validation
-        // (no quotes, spaces, or shell metacharacters possible).
+        // input), and the secret value is piped on STDIN. It must never be
+        // passed via `--body`, which would expose it in `gh`'s argv (visible
+        // to any local process via `ps`). Nothing agent-controlled appears on
+        // the command line. The optional environment flag is interpolated only
+        // after strict validation (no quotes, spaces, or shell metacharacters).
         let env_flag = env.map(|e| format!(" --env \"{e}\"")).unwrap_or_default();
         let script = format!(
-            "gh secret set \"$VAULTLY_SYNC_SECRET\" --repo \"$VAULTLY_SYNC_REPO\"{env_flag} --body \"$VAULTLY_SYNC_BODY\""
+            "printf '%s' \"$VAULTLY_SYNC_BODY\" | gh secret set \"$VAULTLY_SYNC_SECRET\" --repo \"$VAULTLY_SYNC_REPO\"{env_flag}"
         );
         let mut child_env = vec![
             ("VAULTLY_SYNC_SECRET".to_string(), secret_name.to_string()),
