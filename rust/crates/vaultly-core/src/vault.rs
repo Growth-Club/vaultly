@@ -487,8 +487,14 @@ impl VaultStore {
         };
 
         if let Err(e) = apply(self) {
-            let _ = self.restore_from(&backup_dir);
-            return Err(e);
+            // Never discard a failed rollback: a half-rekeyed store is a
+            // data-loss incident and the caller needs to know both failures.
+            return match self.restore_from(&backup_dir) {
+                Ok(()) => Err(e),
+                Err(restore_err) => Err(VaultError::Policy(format!(
+                    "rekey failed ({e}); rollback ALSO failed ({restore_err})"
+                ))),
+            };
         }
 
         // Rotation succeeded — the old ciphertext is now useless without the
@@ -531,7 +537,15 @@ impl VaultStore {
     fn restore_from(&self, dir: &std::path::Path) -> Result<()> {
         let config_raw = fs::read_to_string(dir.join("config.json"))?;
         for name in self.list_vaults() {
-            let src = dir.join(format!("{name}.json"));
+            // snapshot_to stores each vault under its real file name
+            // (`<sanitized-name>.vault`), not `<name>.json`. Use the same path
+            // helper so rollback actually finds the snapshot.
+            let file_name = self
+                .vault_path(&name)?
+                .file_name()
+                .ok_or_else(|| VaultError::Policy("invalid vault path in snapshot".into()))?
+                .to_os_string();
+            let src = dir.join(file_name);
             if src.exists() {
                 let raw = fs::read_to_string(src)?;
                 Self::write_secure(&self.vault_path(&name)?, &raw)?;
