@@ -5880,14 +5880,17 @@ mod tests {
             )
             .await
             .unwrap();
-        let reqs = reqs.lock().unwrap();
-        assert_eq!(reqs[0].method, "GET");
-        assert!(reqs[0].path.contains("type=A"), "{}", reqs[0].path);
-        assert!(reqs[0].path.contains("name=app.example.com"));
-        assert_eq!(reqs[1].method, "POST");
-        assert!(reqs[1].body.contains("\"proxied\":true"));
-        assert!(reqs[1].body.contains("\"ttl\":120"));
-        drop(reqs);
+        {
+            // Scope the guard lexically so it is unambiguously released before
+            // the awaits below (clippy::await_holding_lock).
+            let reqs = reqs.lock().unwrap();
+            assert_eq!(reqs[0].method, "GET");
+            assert!(reqs[0].path.contains("type=A"), "{}", reqs[0].path);
+            assert!(reqs[0].path.contains("name=app.example.com"));
+            assert_eq!(reqs[1].method, "POST");
+            assert!(reqs[1].body.contains("\"proxied\":true"));
+            assert!(reqs[1].body.contains("\"ttl\":120"));
+        }
 
         // Matching record -> PUT update with its id.
         let (base2, reqs2) = spawn_cf_server(
